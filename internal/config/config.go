@@ -52,6 +52,10 @@ type Config struct {
 	// and pool GC while in serve mode. Accepts the same format as SnapshotSchedule.
 	// Empty string or "0" disables automatic cleanup.
 	CleanupSchedule string `yaml:"cleanup_schedule"`
+	// MetricsAddr is the listen address for the Prometheus metrics endpoint
+	// (e.g. ":9090"). The endpoint is exposed at /metrics on this address.
+	// Leave empty to disable metrics.
+	MetricsAddr string `yaml:"metrics_addr"`
 
 	ResolvedLayouts []model.Layout `yaml:"-"`
 }

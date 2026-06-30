@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/ingest"
 	"github.com/debproxy/debproxy/internal/metadata"
+	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/publish"
 	"github.com/debproxy/debproxy/internal/signing"
@@ -84,7 +86,7 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 	}
 }
 
-// Handler returns the HTTP handler with logging and response compression.
+// Handler returns the HTTP handler with logging, response compression, and metrics.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -96,7 +98,43 @@ func (s *Server) Handler() http.Handler {
 	var h http.Handler = mux
 	h = compress(h)
 	h = logging(h)
+	h = metricsMiddleware(h)
 	return h
+}
+
+// selectorType returns "live", "current", or "snapshot" from the first URL path segment.
+// r.URL.Path is already cleaned by net/http before reaching ServeHTTP.
+func selectorType(urlPath string) string {
+	s := strings.TrimPrefix(urlPath, "/")
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	switch s {
+	case "live":
+		return "live"
+	case "current":
+		return "current"
+	default:
+		return "snapshot"
+	}
+}
+
+// metricsMiddleware records per-request counters and latency histograms.
+// It skips /healthz to avoid polluting metrics with health-check noise.
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		sel := selectorType(r.URL.Path)
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(sw, r)
+		elapsed := time.Since(start).Seconds()
+		metrics.HTTPRequestsTotal.WithLabelValues(sel, strconv.Itoa(sw.status)).Inc()
+		metrics.HTTPRequestDuration.WithLabelValues(sel).Observe(elapsed)
+	})
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
@@ -144,12 +182,16 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, parts []
 	}
 
 	if remainder[0] == "pool" {
-		s.servePool(w, r, strings.Join(remainder, "/"), false)
+		// remainder: [pool, os, codename, upstream, ...]
+		cn, up := segAt(remainder, 2), segAt(remainder, 3)
+		s.servePool(w, r, strings.Join(remainder, "/"), false, osName, cn, up)
 		return
 	}
 	if remainder[0] == "src" {
 		// Source files under snapshots are served directly from storage (no pull-through).
-		s.servePool(w, r, strings.Join(remainder, "/"), false)
+		// remainder: [src, codename, upstream, ...]
+		cn, up := segAt(remainder, 1), segAt(remainder, 2)
+		s.servePool(w, r, strings.Join(remainder, "/"), false, osName, cn, up)
 		return
 	}
 	rel := path.Join(snapshotID, osName, path.Join(remainder...))
@@ -167,11 +209,17 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 	remainder := rest[1:]
 
 	if remainder[0] == "pool" {
-		s.servePool(w, r, strings.Join(remainder, "/"), true)
+		// remainder: [pool, os, codename, upstream, ...]
+		cn, up := segAt(remainder, 2), segAt(remainder, 3)
+		s.servePool(w, r, strings.Join(remainder, "/"), true, osName, cn, up)
 		return
 	}
 	if remainder[0] == "src" {
-		s.serveSrc(w, r, osName, strings.Join(remainder, "/"))
+		codename := ""
+		if len(remainder) > 1 {
+			codename = remainder[1]
+		}
+		s.serveSrc(w, r, osName, codename, strings.Join(remainder, "/"))
 		return
 	}
 	if remainder[0] == "dists" {
@@ -251,9 +299,19 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 	serveSeekable(w, r, relPath, rc, info.Size, info.ModTime)
 }
 
+// segAt returns segs[i] or "" if i is out of range.
+func segAt(segs []string, i int) string {
+	if i < len(segs) {
+		return segs[i]
+	}
+	return ""
+}
+
 // servePool serves a pool .deb, pulling it (and its dependency closure) through
 // from upstream on first request when allowPullThrough is set.
-func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath string, allowPullThrough bool) {
+// osLabel, cnLabel, upLabel are the metric label values passed by the caller
+// from already-parsed URL segments — no re-parsing needed.
+func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath string, allowPullThrough bool, osLabel, cnLabel, upLabel string) {
 	exists, err := s.store.Exists(r.Context(), poolPath)
 	if err != nil {
 		slog.Error("pool exists check", "path", poolPath, "err", err)
@@ -268,8 +326,12 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 		if err := s.pullThrough(r.Context(), poolPath); err != nil {
 			slog.Error("pull-through", "path", poolPath, "err", err)
 			http.Error(w, "pull-through failed", http.StatusBadGateway)
+			metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "error").Inc()
 			return
 		}
+		metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "success").Inc()
+	} else {
+		metrics.PoolHitsTotal.WithLabelValues(osLabel, cnLabel, upLabel).Inc()
 	}
 
 	info, err := s.store.Stat(r.Context(), poolPath)
@@ -298,7 +360,7 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 
 // serveSrc serves a source package file from src/, pulling it through from
 // upstream on first request when called from the live path.
-func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, srcPath string) {
+func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codename, srcPath string) {
 	// Ensure the file exists locally, pulling through from upstream if needed.
 	exists, err := s.store.Exists(r.Context(), srcPath)
 	if err != nil {
@@ -311,8 +373,10 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, srcPat
 		if err := s.pullThroughSource(r.Context(), osName, srcPath); err != nil {
 			slog.Error("source pull-through failed", "path", srcPath, "err", err)
 			http.Error(w, "source pull-through failed", http.StatusBadGateway)
+			metrics.SourcePullThroughsTotal.WithLabelValues(osName, codename, "error").Inc()
 			return
 		}
+		metrics.SourcePullThroughsTotal.WithLabelValues(osName, codename, "success").Inc()
 	}
 
 	info, err := s.store.Stat(r.Context(), srcPath)

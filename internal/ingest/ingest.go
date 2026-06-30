@@ -11,6 +11,7 @@ import (
 
 	"github.com/debproxy/debproxy/internal/avail"
 	"github.com/debproxy/debproxy/internal/metadata"
+	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/upstream"
@@ -67,6 +68,9 @@ func (in *Ingestor) Cache(ctx context.Context, osName, codename string, p avail.
 				return err
 			}
 			slog.Info("cached package", "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name, "path", p.PoolPath)
+			if p.Upstream.AutoUpdate {
+				metrics.AutoUpdateFilesTotal.WithLabelValues(osName, codename, p.Upstream.Name).Inc()
+			}
 			in.notifier.Fire(webhook.Event{
 				Package:   p.Name,
 				Version:   p.Version,
@@ -123,11 +127,17 @@ func (in *Ingestor) CacheSourceFile(ctx context.Context, entry model.SourceEntry
 
 	filePath := model.SourceFilePath(entry.OS, entry.Codename, entry.Upstream, entry.Component, entry.Package, filename)
 
+	if in.exists != nil && in.exists.Has(filePath) {
+		return nil
+	}
 	exists, err := in.store.Exists(ctx, filePath)
 	if err != nil {
 		return err
 	}
 	if exists {
+		if in.exists != nil {
+			in.exists.Add(filePath)
+		}
 		return nil
 	}
 
@@ -141,5 +151,11 @@ func (in *Ingestor) CacheSourceFile(ctx context.Context, entry model.SourceEntry
 		return err
 	}
 	slog.Info("cached source file", "package", entry.Package, "version", entry.Version, "file", filename, "upstream", entry.Upstream)
+	if in.exists != nil {
+		in.exists.Add(filePath)
+	}
+	if us.AutoUpdate {
+		metrics.AutoUpdateSourceFilesTotal.WithLabelValues(entry.OS, entry.Codename, entry.Upstream).Inc()
+	}
 	return nil
 }

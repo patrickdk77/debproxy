@@ -225,7 +225,7 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			go func(i int, j srcWork) {
 				defer srcWg.Done()
 				slog.Debug("fetching upstream Sources", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
-				f := upstream.NewFetcher(j.src, client)
+				f := upstream.NewFetcherWithCache(j.src, client, cache)
 				raws, err := f.FetchSources(ctx)
 				if err != nil {
 					slog.Warn("upstream Sources unavailable, skipping",

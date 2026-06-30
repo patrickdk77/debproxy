@@ -82,34 +82,50 @@ func parsePDiffList(raw string) [][3]string {
 
 // ---- Ed-script application ------------------------------------------------
 
-// lineIdx is a read-only scaffold built from []RawPkg to support ed-patch
-// application. It is never mutated and is discarded after all ops are applied.
+// lineIdx is a read-only line scaffold built from stanza slices to support
+// ed-patch application. It is never mutated and is discarded after all ops are applied.
 type lineIdx struct {
 	lines       []string
 	stanzaOf    []int // 0-based line → stanza index; -1 for blank separator lines
 	stanzaFirst []int // stanza index → first 0-based line of that stanza
 }
 
-func buildLineIdx(pkgs []RawPkg) lineIdx {
+func buildLineIdxRaws(raws []string) lineIdx {
 	total := 0
-	for _, p := range pkgs {
-		total += strings.Count(p.Raw, "\n") + 2
+	for _, r := range raws {
+		total += strings.Count(r, "\n") + 2
 	}
 	lines := make([]string, 0, total)
 	stanzaOf := make([]int, 0, total)
-	stanzaFirst := make([]int, len(pkgs))
+	stanzaFirst := make([]int, len(raws))
 
-	for i, p := range pkgs {
+	for i, r := range raws {
 		stanzaFirst[i] = len(lines)
-		raw := strings.TrimRight(p.Raw, "\n")
+		raw := strings.TrimRight(r, "\n")
 		for _, l := range strings.Split(raw, "\n") {
 			lines = append(lines, l)
 			stanzaOf = append(stanzaOf, i)
 		}
-		lines = append(lines, "")  // blank separator
+		lines = append(lines, "") // blank separator
 		stanzaOf = append(stanzaOf, -1)
 	}
 	return lineIdx{lines: lines, stanzaOf: stanzaOf, stanzaFirst: stanzaFirst}
+}
+
+func buildLineIdx(pkgs []RawPkg) lineIdx {
+	raws := make([]string, len(pkgs))
+	for i, p := range pkgs {
+		raws[i] = p.Raw
+	}
+	return buildLineIdxRaws(raws)
+}
+
+func buildLineIdxSrc(srcs []RawSrc) lineIdx {
+	raws := make([]string, len(srcs))
+	for i, s := range srcs {
+		raws[i] = s.Raw
+	}
+	return buildLineIdxRaws(raws)
 }
 
 // stanzaAt converts a 1-based ed line number to a stanza index (-1 = separator).
@@ -208,18 +224,54 @@ func SerializeRawPkgs(pkgs []RawPkg) []byte {
 	return buf
 }
 
-func sliceInsert(pkgs []RawPkg, pos int, newPkgs []RawPkg) []RawPkg {
+func sliceInsert[T any](s []T, pos int, items []T) []T {
 	if pos < 0 {
 		pos = 0
 	}
-	if pos > len(pkgs) {
-		pos = len(pkgs)
+	if pos > len(s) {
+		pos = len(s)
 	}
-	out := make([]RawPkg, 0, len(pkgs)+len(newPkgs))
-	out = append(out, pkgs[:pos]...)
-	out = append(out, newPkgs...)
-	out = append(out, pkgs[pos:]...)
+	out := make([]T, 0, len(s)+len(items))
+	out = append(out, s[:pos]...)
+	out = append(out, items...)
+	out = append(out, s[pos:]...)
 	return out
+}
+
+// SerializeRawSrcs reconstructs the verbatim Sources file bytes from a
+// []RawSrc slice. Each Raw field already ends with '\n'; one additional '\n'
+// is appended to form the blank-line separator between stanzas.
+func SerializeRawSrcs(srcs []RawSrc) []byte {
+	total := 0
+	for _, s := range srcs {
+		total += len(s.Raw) + 1
+	}
+	buf := make([]byte, 0, total)
+	for _, s := range srcs {
+		buf = append(buf, s.Raw...)
+		buf = append(buf, '\n')
+	}
+	return buf
+}
+
+// ApplyEdPatchSrc applies one decompressed ed-script patch to srcs and returns
+// the updated slice.
+func ApplyEdPatchSrc(srcs []RawSrc, patchData []byte) ([]RawSrc, error) {
+	ops, err := parseEdOps(patchData)
+	if err != nil {
+		return nil, err
+	}
+	if len(ops) == 0 {
+		return srcs, nil
+	}
+	li := buildLineIdxSrc(srcs)
+	for _, op := range ops {
+		srcs, err = applyEdOpGeneric(srcs, &li, op, ParseSourceRaws)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return srcs, nil
 }
 
 // ---- Ed-script parsing -----------------------------------------------------
@@ -242,8 +294,7 @@ func ApplyEdPatch(pkgs []RawPkg, patchData []byte) ([]RawPkg, error) {
 	}
 	li := buildLineIdx(pkgs)
 	for _, op := range ops {
-		var err error
-		pkgs, err = applyEdOp(pkgs, &li, op)
+		pkgs, err = applyEdOpGeneric(pkgs, &li, op, ParsePackageRaws)
 		if err != nil {
 			return nil, err
 		}
@@ -308,54 +359,56 @@ func parseEdCmd(line string) (edOp, error) {
 	return edOp{addr1: addr1, addr2: addr2, cmd: cmd}, nil
 }
 
-func applyEdOp(pkgs []RawPkg, li *lineIdx, op edOp) ([]RawPkg, error) {
+// applyEdOpGeneric applies a single ed op to items using parse to decode
+// replacement text. T is RawPkg or RawSrc.
+func applyEdOpGeneric[T any](items []T, li *lineIdx, op edOp, parse func(io.Reader) ([]T, error)) ([]T, error) {
 	switch op.cmd {
 	case 'd':
 		s1, s2 := stanzaRange(li, op.addr1, op.addr2)
 		if s1 < 0 {
-			return pkgs, nil
+			return items, nil
 		}
-		out := make([]RawPkg, 0, len(pkgs)-(s2-s1+1))
-		out = append(out, pkgs[:s1]...)
-		return append(out, pkgs[s2+1:]...), nil
+		out := make([]T, 0, len(items)-(s2-s1+1))
+		out = append(out, items[:s1]...)
+		return append(out, items[s2+1:]...), nil
 
 	case 'a':
-		newPkgs, err := ParsePackageRaws(strings.NewReader(op.text))
+		newItems, err := parse(strings.NewReader(op.text))
 		if err != nil {
 			return nil, fmt.Errorf("ed append at %d: %w", op.addr1, err)
 		}
 		ins := insertionStanza(li, op.addr1)
-		return sliceInsert(pkgs, ins+1, newPkgs), nil
+		return sliceInsert(items, ins+1, newItems), nil
 
 	case 'c':
 		s1, s2 := stanzaRange(li, op.addr1, op.addr2)
 		if s1 < 0 {
-			return pkgs, nil
+			return items, nil
 		}
 		if s1 == s2 {
 			// Change within one stanza — reconstruct from surrounding unchanged
 			// lines in the read-only index, then parse the result.
 			rebuilt := rebuildStanza(li, s1, op.addr1, op.addr2, op.text)
-			newPkgs, err := ParsePackageRaws(strings.NewReader(rebuilt))
+			newItems, err := parse(strings.NewReader(rebuilt))
 			if err != nil {
 				return nil, fmt.Errorf("ed change at %d,%d: %w", op.addr1, op.addr2, err)
 			}
-			if len(newPkgs) == 0 {
+			if len(newItems) == 0 {
 				return nil, fmt.Errorf("ed change at %d,%d: empty result", op.addr1, op.addr2)
 			}
-			out := make([]RawPkg, 0, len(pkgs)-1+len(newPkgs))
-			out = append(out, pkgs[:s1]...)
-			out = append(out, newPkgs...)
-			return append(out, pkgs[s1+1:]...), nil
+			out := make([]T, 0, len(items)-1+len(newItems))
+			out = append(out, items[:s1]...)
+			out = append(out, newItems...)
+			return append(out, items[s1+1:]...), nil
 		}
-		newPkgs, err := ParsePackageRaws(strings.NewReader(op.text))
+		newItems, err := parse(strings.NewReader(op.text))
 		if err != nil {
 			return nil, fmt.Errorf("ed change at %d,%d: %w", op.addr1, op.addr2, err)
 		}
-		out := make([]RawPkg, 0, len(pkgs)-(s2-s1+1)+len(newPkgs))
-		out = append(out, pkgs[:s1]...)
-		out = append(out, newPkgs...)
-		return append(out, pkgs[s2+1:]...), nil
+		out := make([]T, 0, len(items)-(s2-s1+1)+len(newItems))
+		out = append(out, items[:s1]...)
+		out = append(out, newItems...)
+		return append(out, items[s2+1:]...), nil
 	}
-	return pkgs, nil
+	return items, nil
 }

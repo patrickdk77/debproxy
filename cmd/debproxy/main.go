@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/metadata"
 	"github.com/debproxy/debproxy/internal/metadatafactory"
@@ -504,6 +506,16 @@ func runServe(args []string) int {
 	stopRefresher := startIndexRefresher(cfg, httpClient, indexCache, refreshInterval, syncr)
 	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched)
 	stopCleaner := startPeriodicCleanup(syncr, cleanupSched, cfg)
+
+	if cfg.MetricsAddr != "" {
+		metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: promhttp.Handler()}
+		go func() {
+			slog.Info("metrics listening", "addr", cfg.MetricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("metrics serve", "err", err)
+			}
+		}()
+	}
 
 	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier).Handler()}
 	go func() {

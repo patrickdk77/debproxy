@@ -27,6 +27,10 @@ type indexCacheEntry struct {
 	// Parsed content (already GPG-verified and SHA256-verified)
 	release  *apt.Release
 	archPkgs map[string][]apt.RawPkg // arch -> verified+parsed Packages stanzas
+
+	// Sources index cache
+	srcsRelease *apt.Release // InRelease from last successful Sources fetch
+	srcs        []apt.RawSrc // parsed Sources stanzas from that fetch
 }
 
 // NewIndexCache creates an empty cache.
@@ -42,10 +46,19 @@ func (c *IndexCache) get(inReleaseURL string) (*indexCacheEntry, bool) {
 	return e, ok
 }
 
-// store saves a cache entry.
-func (c *IndexCache) store(inReleaseURL string, e *indexCacheEntry) {
+// store saves a cache entry. Any srcsRelease/srcs already in the cache for this
+// key are preserved so a FetchIndex call cannot clobber Sources data written by
+// a concurrent or prior FetchSources call.
+func (c *IndexCache) store(key string, e *indexCacheEntry) {
 	c.mu.Lock()
-	c.entries[inReleaseURL] = e
+	if old, ok := c.entries[key]; ok && (old.srcsRelease != nil || old.srcs != nil) {
+		merged := *e
+		merged.srcsRelease = old.srcsRelease
+		merged.srcs = old.srcs
+		c.entries[key] = &merged
+	} else {
+		c.entries[key] = e
+	}
 	c.mu.Unlock()
 }
 
@@ -60,6 +73,37 @@ func (c *IndexCache) expire(key string) {
 		c.entries[key] = &expired
 	}
 	c.mu.Unlock()
+}
+
+// ExpireAll marks every entry as immediately expired so the next FetchIndex
+// calls perform real upstream requests. Cached archPkgs are retained so they
+// remain available for PDiff comparison and stale-fallback on the next fetch.
+func (c *IndexCache) ExpireAll() {
+	c.mu.Lock()
+	for k, e := range c.entries {
+		expired := *e
+		expired.expires = time.Time{}
+		c.entries[k] = &expired
+	}
+	c.mu.Unlock()
+}
+
+// updateSrcs stores srcsRelease and srcs into the cache entry for key.
+// If no entry exists for key, a minimal entry is created.
+func (c *IndexCache) updateSrcs(key string, rel *apt.Release, srcs []apt.RawSrc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[key]; ok {
+		updated := *e
+		updated.srcsRelease = rel
+		updated.srcs = srcs
+		c.entries[key] = &updated
+	} else {
+		c.entries[key] = &indexCacheEntry{
+			srcsRelease: rel,
+			srcs:        srcs,
+		}
+	}
 }
 
 // parseExpiry derives an absolute expiry time from a response's cache headers.

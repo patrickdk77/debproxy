@@ -33,6 +33,10 @@
 # Omit or set to "0" to disable — use `debproxy cleanup` to run manually.
 # cleanup_schedule: "sunday@04:00"
 
+# metrics_addr is the listen address for the Prometheus /metrics endpoint.
+# Leave commented out (or set to "") to disable metrics entirely.
+# metrics_addr: ":9090"
+
 storage:
   backend: filesystem   # filesystem | s3
   filesystem:

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 )
 
@@ -26,18 +27,21 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 		return err
 	}
 	slog.Info("cleanup: snapshots pruned", "deleted", deleted)
+	metrics.SnapshotsPrunedTotal.Add(float64(deleted))
 
 	gcDeleted, err := s.gcPool(ctx)
 	if err != nil {
 		return err
 	}
 	slog.Info("cleanup: pool GC complete", "orphaned_files_deleted", gcDeleted)
+	metrics.GCFilesDeletedTotal.Add(float64(gcDeleted))
 
 	srcDeleted, err := s.gcSrc(ctx)
 	if err != nil {
 		return err
 	}
 	slog.Info("cleanup: src GC complete", "orphaned_files_deleted", srcDeleted)
+	metrics.GCFilesDeletedTotal.Add(float64(srcDeleted))
 	return nil
 }
 

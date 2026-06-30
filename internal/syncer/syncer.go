@@ -14,6 +14,7 @@ import (
 	"github.com/debproxy/debproxy/internal/debversion"
 	"github.com/debproxy/debproxy/internal/ingest"
 	"github.com/debproxy/debproxy/internal/metadata"
+	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/publish"
 	"github.com/debproxy/debproxy/internal/signing"
@@ -99,9 +100,10 @@ func (s *Syncer) Prime(ctx context.Context, osName, codename, component string, 
 // Update fetches fresh upstream data and updates any auto_update packages,
 // then publishes a new snapshot.
 func (s *Syncer) Update(ctx context.Context) error {
-	// Use a fresh cache so each manual update does at least a conditional GET
-	// against upstream rather than serving a still-fresh entry from the server cache.
-	return s.runUpdate(ctx, upstream.NewIndexCache())
+	// Expire all entries so this call always re-validates against upstream, but
+	// keep the cached archPkgs so FetchIndex can use PDiff when packages change.
+	s.indexCache.ExpireAll()
+	return s.runUpdate(ctx, s.indexCache)
 }
 
 // UpdateWithCache runs the same update logic as Update but reuses an already-
@@ -119,6 +121,33 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 
 	for k := range s.layoutsByOSCodename() {
 		av := avail.Build(ctx, s.cfg, s.client, cache, k.osName, k.codename)
+
+		// Snapshot current source versions only when at least one source has
+		// auto_update enabled — otherwise the map is unused and the index query wasted.
+		hasAutoUpdateSrc := false
+		for _, srcMap := range av.Srcs {
+			for _, sp := range srcMap {
+				if sp.Upstream.AutoUpdate {
+					hasAutoUpdateSrc = true
+					break
+				}
+			}
+			if hasAutoUpdateSrc {
+				break
+			}
+		}
+		var prevSrcVersion map[string]string
+		if hasAutoUpdateSrc {
+			prevSrcEntries, err := s.index.ListSourceEntries(ctx, model.Selector{OS: k.osName, Codename: k.codename})
+			if err != nil {
+				return err
+			}
+			prevSrcVersion = make(map[string]string, len(prevSrcEntries))
+			for _, e := range prevSrcEntries {
+				prevSrcVersion[e.Component+"/"+e.Package] = e.Version
+			}
+		}
+		var srcUpdated int
 
 		// Record source entries from upstream Sources indices.
 		for comp, srcMap := range av.Srcs {
@@ -146,8 +175,21 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 				if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
 					slog.Warn("upsert source entry", "package", sp.Package, "version", sp.Version, "err", err)
 				}
+				if sp.Upstream.AutoUpdate && prevSrcVersion != nil {
+					if prevVer, wasSeen := prevSrcVersion[comp+"/"+sp.Package]; wasSeen && debversion.Compare(sp.Version, prevVer) > 0 {
+						for _, sf := range files {
+							if err := in.CacheSourceFile(ctx, entry, sp.Upstream, sf.Filename); err != nil {
+								slog.Warn("auto-update source: cache file",
+									"package", sp.Package, "version", sp.Version,
+									"file", sf.Filename, "err", err)
+							}
+						}
+						srcUpdated++
+					}
+				}
 			}
 		}
+		slog.Info("source update job", "os", k.osName, "codename", k.codename, "updated", srcUpdated)
 
 		entries, err := s.index.ListEntries(ctx, model.Selector{OS: k.osName, Codename: k.codename})
 		if err != nil {
@@ -227,6 +269,7 @@ func (s *Syncer) Snapshot(ctx context.Context, now time.Time) error {
 			}
 		}
 		slog.Info("published snapshot", "os", osName, "snapshot", snapshotID)
+		metrics.SnapshotPublishesTotal.WithLabelValues(osName).Inc()
 	}
 	return nil
 }

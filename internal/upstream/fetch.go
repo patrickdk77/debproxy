@@ -481,9 +481,86 @@ var srcVariants = []pkgVariant{
 	}},
 }
 
+// tryPDiffSrc attempts to update cachedSrcs using PDiff patches from upstream.
+// Returns (updatedSrcs, true) on success, (nil, false) if PDiff is unavailable
+// or the patch chain cannot be applied (caller should fall back to full fetch).
+func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cachedSHA256 string, cachedSrcs []apt.RawSrc) ([]apt.RawSrc, bool) {
+	diffRelPath := base + "Sources.diff/Index"
+	if _, ok := rel.Files[diffRelPath]; !ok {
+		return nil, false
+	}
+
+	data, resp, err := f.getConditional(ctx, f.distsURL(diffRelPath), "", "")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+
+	idx, err := apt.ParsePDiffIndex(bytes.NewReader(data))
+	if err != nil {
+		slog.Warn("pdiff: parse sources index failed", "upstream", f.src.Name, "component", f.src.Component, "err", err)
+		return nil, false
+	}
+
+	chain := idx.PatchChain(cachedSHA256)
+	if chain == nil {
+		return nil, false // cached version not in history; need full fetch
+	}
+	if len(chain) == 0 {
+		return cachedSrcs, true // already current
+	}
+
+	srcs := make([]apt.RawSrc, len(cachedSrcs))
+	copy(srcs, cachedSrcs)
+
+	for _, name := range chain {
+		patchRelPath := base + "Sources.diff/" + name + ".gz"
+		pdata, presp, perr := f.getConditional(ctx, f.distsURL(patchRelPath), "", "")
+		if perr != nil || presp.StatusCode != http.StatusOK {
+			slog.Warn("pdiff: fetch sources patch failed", "upstream", f.src.Name, "component", f.src.Component, "name", name)
+			return nil, false
+		}
+		entry, ok := rel.Files[patchRelPath]
+		if !ok {
+			slog.Warn("pdiff: sources patch not listed in Release", "upstream", f.src.Name, "component", f.src.Component, "name", name)
+			return nil, false
+		}
+		if err := verifyDigest(pdata, entry.SHA256); err != nil {
+			slog.Warn("pdiff: sources patch digest mismatch", "upstream", f.src.Name, "component", f.src.Component, "name", name, "err", err)
+			return nil, false
+		}
+		gr, gerr := gzip.NewReader(bytes.NewReader(pdata))
+		if gerr != nil {
+			return nil, false
+		}
+		decompressed, derr := io.ReadAll(gr)
+		gr.Close()
+		if derr != nil {
+			return nil, false
+		}
+		srcs, err = apt.ApplyEdPatchSrc(srcs, decompressed)
+		if err != nil {
+			slog.Warn("pdiff: apply sources patch failed", "upstream", f.src.Name, "component", f.src.Component, "name", name, "err", err)
+			return nil, false
+		}
+	}
+
+	// Verify final result matches expected SHA256 from the PDiff Index.
+	if err := verifyDigest(apt.SerializeRawSrcs(srcs), idx.CurrentSHA256); err != nil {
+		slog.Warn("pdiff: final Sources SHA256 mismatch after applying patches — falling back to full fetch",
+			"upstream", f.src.Name, "component", f.src.Component, "err", err)
+		return nil, false
+	}
+
+	slog.Debug("pdiff: updated Sources index incrementally", "upstream", f.src.Name, "component", f.src.Component, "patches", len(chain))
+	return srcs, true
+}
+
 // FetchSources downloads and parses the upstream Sources index for the configured
 // component. Returns nil, nil when no Sources index is listed in the Release.
 func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
+	inReleaseURL := f.distsURL("InRelease")
+	cacheKey := inReleaseURL + "\x00" + f.src.Component
+
 	releaseBody, _, err := f.fetchVerifiedRelease(ctx)
 	if err != nil {
 		return nil, err
@@ -493,6 +570,35 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 		return nil, fmt.Errorf("parse Release for sources: %w", err)
 	}
 	base := f.src.Component + "/source/"
+
+	// Get cached entry for Sources reuse / PDiff.
+	var cachedEntry *indexCacheEntry
+	if f.cache != nil {
+		cachedEntry, _ = f.cache.get(cacheKey)
+	}
+
+	// Cache hit: if SHA256 unchanged, return cached srcs immediately.
+	if cachedEntry != nil && cachedEntry.srcsRelease != nil && cachedEntry.srcs != nil {
+		for _, v := range srcVariants {
+			relPath := base + v.ext
+			newEntry, inNew := rel.Files[relPath]
+			oldEntry, inOld := cachedEntry.srcsRelease.Files[relPath]
+			if inNew && inOld && newEntry.SHA256 == oldEntry.SHA256 {
+				return cachedEntry.srcs, nil
+			}
+		}
+
+		// SHA256 changed — try PDiff.
+		if cachedSHA256 := cachedEntry.srcsRelease.Files[base+"Sources"].SHA256; cachedSHA256 != "" {
+			if updated, ok := f.tryPDiffSrc(ctx, rel, base, cachedSHA256, cachedEntry.srcs); ok {
+				if f.cache != nil {
+					f.cache.updateSrcs(cacheKey, rel, updated)
+				}
+				return updated, nil
+			}
+		}
+	}
+
 	byHash := acquireByHash(rel)
 	for _, v := range srcVariants {
 		relPath := base + v.ext
@@ -528,7 +634,14 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 		if rc, ok := r.(io.Closer); ok {
 			defer rc.Close()
 		}
-		return apt.ParseSourceRaws(r)
+		srcs, err := apt.ParseSourceRaws(r)
+		if err != nil {
+			return nil, err
+		}
+		if srcs != nil && f.cache != nil {
+			f.cache.updateSrcs(cacheKey, rel, srcs)
+		}
+		return srcs, nil
 	}
 	return nil, nil
 }
