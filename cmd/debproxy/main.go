@@ -23,7 +23,7 @@ import (
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/storagefactory"
-	"github.com/debproxy/debproxy/internal/syncer"
+	syncerpkg "github.com/debproxy/debproxy/internal/syncer"
 	"github.com/debproxy/debproxy/internal/upstream"
 	"github.com/debproxy/debproxy/internal/webhook"
 )
@@ -208,7 +208,10 @@ func runUpdate(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
-	s := syncer.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, notifier)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, notifier)
+	if err := s.PreloadExistsCache(ctx); err != nil {
+		slog.Warn("preload pool exists cache", "err", err)
+	}
 	if err := s.Update(ctx); err != nil {
 		slog.Error("update", "err", err)
 		return 1
@@ -235,7 +238,7 @@ func runSnapshot(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	s := syncer.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
 	if err := s.Snapshot(ctx, time.Now()); err != nil {
 		slog.Error("snapshot", "err", err)
 		return 1
@@ -281,7 +284,10 @@ func runPrime(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
 	defer cancel()
-	s := syncer.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, notifier)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, notifier)
+	if err := s.PreloadExistsCache(ctx); err != nil {
+		slog.Warn("preload pool exists cache", "err", err)
+	}
 	names := splitCSV(*pkgs)
 	if err := s.Prime(ctx, *osName, *codename, *component, names); err != nil {
 		slog.Error("prime", "err", err)
@@ -414,12 +420,18 @@ func runServe(args []string) int {
 		refreshInterval = d
 	}
 
+	syncr := syncerpkg.New(cfg, store, index, key, httpClient, indexCache, notifier)
+	if err := syncr.PreloadExistsCache(context.Background()); err != nil {
+		slog.Warn("preload pool exists cache", "err", err)
+	}
+
 	// Flush dirty metadata every 5 minutes. On graceful shutdown the stop func
 	// does one final flush. SIGKILL cannot be caught; the 5-minute interval
-	// limits how much metadata is lost in that case (metadata is disposable and
-	// can be rebuilt with `debproxy rebuild`).
+	// limits how much index data is lost in that case (it can be rebuilt with
+	// `debproxy rebuild` if needed).
 	stopFlush := startPeriodicFlush(index, 5*time.Minute)
-	stopRefresher := startIndexRefresher(cfg, httpClient, indexCache, refreshInterval)
+	stopMerge := startPeriodicMerge(index, time.Hour)
+	stopRefresher := startIndexRefresher(cfg, httpClient, indexCache, refreshInterval, syncr)
 
 	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier).Handler()}
 	go func() {
@@ -444,16 +456,18 @@ func runServe(args []string) int {
 	}
 
 	stopRefresher()
+	stopMerge()
 	stopFlush()
 	return 0
 }
 
 // startIndexRefresher pre-warms the upstream index cache shortly after startup,
-// then re-fetches all upstream indices every interval (if > 0).
+// then re-fetches all upstream indices every interval (if > 0). After each
+// refresh it calls syncr.UpdateWithCache to pull any newer auto_update packages.
 // Initial delay is 2 minutes plus up to 60 seconds of random jitter.
 // Each periodic refresh adds up to 5 minutes of random jitter.
 // Returns a stop function that cancels any in-progress refresh and waits for it to finish.
-func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstream.IndexCache, interval time.Duration) func() {
+func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstream.IndexCache, interval time.Duration, syncr *syncerpkg.Syncer) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -466,7 +480,7 @@ func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstrea
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() { <-stop; cancel() }()
-		refreshIndexes(ctx, cfg, client, cache)
+		refreshIndexes(ctx, cfg, client, cache, syncr)
 		if interval <= 0 {
 			return
 		}
@@ -474,7 +488,7 @@ func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstrea
 			jitter := time.Duration(rand.Intn(301)) * time.Second
 			select {
 			case <-time.After(interval + jitter):
-				refreshIndexes(ctx, cfg, client, cache)
+				refreshIndexes(ctx, cfg, client, cache, syncr)
 			case <-stop:
 				return
 			}
@@ -486,9 +500,10 @@ func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstrea
 	}
 }
 
-// refreshIndexes sequentially fetches each unique upstream index into the cache.
+// refreshIndexes sequentially fetches each unique upstream index into the cache,
+// then runs the auto-update check against the freshly-fetched data.
 // Sources are deduplicated by (URL, suite, component) — the same key the cache uses.
-func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client, cache *upstream.IndexCache) {
+func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client, cache *upstream.IndexCache, syncr *syncerpkg.Syncer) {
 	seen := map[string]bool{}
 	for _, layout := range cfg.ResolvedLayouts {
 		for _, src := range layout.Upstreams {
@@ -497,7 +512,7 @@ func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client
 				continue
 			}
 			seen[key] = true
-			if err := ctx.Err(); err != nil {
+			if ctx.Err() != nil {
 				return
 			}
 			slog.Info("refreshing upstream index", "upstream", src.Name, "suite", src.Suite, "component", src.Component)
@@ -508,6 +523,42 @@ func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client
 		}
 	}
 	slog.Info("upstream index refresh complete", "sources", len(seen))
+
+	if ctx.Err() != nil {
+		return
+	}
+	if err := syncr.UpdateWithCache(ctx, cache); err != nil {
+		slog.Warn("post-refresh update failed", "err", err)
+	}
+}
+
+// startPeriodicMerge calls index.Refresh approximately every interval, merging
+// any changes written by other instances into the in-memory state. Up to 10
+// minutes of jitter is added per cycle so concurrent instances don't all LIST
+// the backend at the same moment. Unlike startPeriodicFlush, this never writes —
+// dirty entries are left to the flush goroutine, satisfying the invariant that
+// we don't write when we have no changes of our own.
+func startPeriodicMerge(index metadata.MetadataIndex, interval time.Duration) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			jitter := time.Duration(rand.Intn(601)) * time.Second
+			select {
+			case <-time.After(interval + jitter):
+				if err := index.Refresh(context.Background()); err != nil {
+					slog.Warn("periodic metadata merge", "err", err)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
 }
 
 // startPeriodicFlush calls index.Flush every interval. The returned stop

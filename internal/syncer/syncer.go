@@ -34,6 +34,7 @@ type Syncer struct {
 	client     *http.Client
 	indexCache *upstream.IndexCache
 	notifier   *webhook.Notifier
+	exists     *ingest.ExistsCache
 }
 
 // New constructs a Syncer. notifier may be nil.
@@ -44,7 +45,22 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 	if indexCache == nil {
 		indexCache = upstream.NewIndexCache()
 	}
-	return &Syncer{cfg: cfg, store: store, index: index, key: key, client: client, indexCache: indexCache, notifier: notifier}
+	return &Syncer{cfg: cfg, store: store, index: index, key: key, client: client, indexCache: indexCache, notifier: notifier, exists: &ingest.ExistsCache{}}
+}
+
+// PreloadExistsCache populates the in-memory pool-exists cache from the current
+// metadata index so that Cache calls skip redundant storage Exists checks for
+// files already known to be present.
+func (s *Syncer) PreloadExistsCache(ctx context.Context) error {
+	entries, err := s.index.ListEntries(ctx, model.Selector{})
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		s.exists.Add(e.PoolPath)
+	}
+	slog.Info("pool exists cache preloaded", "entries", len(entries))
+	return nil
 }
 
 // codenameSet maps os -> codename -> components -> arches from resolved layouts.
@@ -68,7 +84,7 @@ func (s *Syncer) Prime(ctx context.Context, osName, codename, component string, 
 		return fmt.Errorf("refresh index: %w", err)
 	}
 	av := avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
-	in := ingest.New(s.store, s.index, s.client, s.notifier)
+	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
 	for _, arch := range av.Arches {
 		closure := av.DepClosure(component, arch, names)
 		for _, p := range closure {
@@ -80,21 +96,29 @@ func (s *Syncer) Prime(ctx context.Context, osName, codename, component string, 
 	return nil
 }
 
-// Update refreshes packages whose newest available version comes from an
-// auto_update upstream, pulling the updated package and its dependency closure,
-// then publishes a fresh snapshot.
+// Update fetches fresh upstream data and updates any auto_update packages,
+// then publishes a new snapshot.
 func (s *Syncer) Update(ctx context.Context) error {
+	// Use a fresh cache so each manual update does at least a conditional GET
+	// against upstream rather than serving a still-fresh entry from the server cache.
+	return s.runUpdate(ctx, upstream.NewIndexCache())
+}
+
+// UpdateWithCache runs the same update logic as Update but reuses an already-
+// populated index cache (e.g. from a background refresh) instead of fetching
+// from scratch.
+func (s *Syncer) UpdateWithCache(ctx context.Context, cache *upstream.IndexCache) error {
+	return s.runUpdate(ctx, cache)
+}
+
+func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) error {
 	if err := s.index.Refresh(ctx); err != nil {
 		return fmt.Errorf("refresh index: %w", err)
 	}
-	in := ingest.New(s.store, s.index, s.client, s.notifier)
-	// Use a fresh per-run cache so each Update always does at least a
-	// conditional GET against upstream  --  the shared s.indexCache may hold a
-	// still-fresh entry from a recent Prime or server request.
-	updateCache := upstream.NewIndexCache()
+	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
 
 	for k := range s.layoutsByOSCodename() {
-		av := avail.Build(ctx, s.cfg, s.client, updateCache, k.osName, k.codename)
+		av := avail.Build(ctx, s.cfg, s.client, cache, k.osName, k.codename)
 		entries, err := s.index.ListEntries(ctx, model.Selector{OS: k.osName, Codename: k.codename})
 		if err != nil {
 			return err
@@ -171,9 +195,6 @@ func (s *Syncer) Snapshot(ctx context.Context, now time.Time) error {
 			if err := s.publishSuite(ctx, s.store, "current/"+osName, k.osName, k.codename, now); err != nil {
 				return err
 			}
-		}
-		if err := s.index.CommitSnapshot(ctx, osName); err != nil {
-			slog.Warn("commit snapshot metadata", "os", osName, "err", err)
 		}
 		slog.Info("published snapshot", "os", osName, "snapshot", snapshotID)
 	}

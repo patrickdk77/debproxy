@@ -10,7 +10,8 @@ import (
 
 var ErrNotImplemented = errors.New("metadata backend not implemented")
 
-// MetadataIndex is the disposable package and upstream-state index.
+// MetadataIndex is the persistent package and upstream-state index.
+// It is the authoritative record of what is in the pool and must survive restarts.
 type MetadataIndex interface {
 	Ping(ctx context.Context) error
 	Migrate(ctx context.Context) error
@@ -22,9 +23,6 @@ type MetadataIndex interface {
 	// Flush writes all dirty in-memory state to the backing store. No-op for
 	// backends that write through on every mutation.
 	Flush(ctx context.Context) error
-	// CommitSnapshot removes staging metadata files for osName after a snapshot
-	// has been published. No-op for backends without staged metadata files.
-	CommitSnapshot(ctx context.Context, osName string) error
 
 	// UpsertEntry inserts or updates a package placement.
 	UpsertEntry(ctx context.Context, entry model.IndexEntry) error

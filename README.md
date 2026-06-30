@@ -102,16 +102,23 @@ docker compose run --rm update
 
 ## Kubernetes
 
-Example manifests are under `deploy/k8s/`. Apply in order:
+Example manifests are under `deploy/k8s/`. Public keyrings live in the
+ConfigMap; only the private signing key is in the Secret.
+
+Fill in the placeholder values before applying:
 
 ```bash
-kubectl apply -f deploy/k8s/namespace.yaml
-kubectl apply -f deploy/k8s/configmap.yaml
-kubectl apply -f deploy/k8s/secret.example.yaml   # edit first
-kubectl apply -f deploy/k8s/pvc.yaml
-kubectl apply -f deploy/k8s/deployment.yaml
-kubectl apply -f deploy/k8s/service.yaml
-kubectl apply -f deploy/k8s/ingress.yaml
+# 1. Add public keyrings (armor with: gpg --armor --export ...)
+#    Edit deploy/k8s/keyrings.yaml — replace REPLACE_ME under
+#    debian-archive-keyring.gpg and ubuntu-archive-keyring.gpg
+
+# 2. Create the Secret from the example (private signing key only)
+cp deploy/k8s/secret.example.yaml secret.yaml
+# edit secret.yaml — fill in debproxy-signing.asc
+kubectl apply -f secret.yaml
+
+# 3. Apply everything else
+kubectl apply -k deploy/k8s/
 ```
 
 ## apt client setup

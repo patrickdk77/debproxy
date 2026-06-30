@@ -9,22 +9,65 @@ data:
       backend: filesystem
       filesystem:
         root: /var/lib/debproxy
-    metadata:
-      backend: mysql
-      mysql:
-        dsn: "debproxy:debproxy@tcp(mysql:3306)/debproxy?parseTime=true"
+
     upstreams:
+      # --- Debian ---
       debian-main:
         url: http://deb.debian.org/debian
         keys:
-          - /etc/debproxy/keys/debian-archive.asc
+          - /etc/debproxy/keys/debian-archive-keyring.gpg
         auto_update: false
       debian-security:
         url: http://security.debian.org/debian-security
         suite: "{codename}-security"
         keys:
-          - /etc/debproxy/keys/debian-archive.asc
+          - /etc/debproxy/keys/debian-archive-keyring.gpg
         auto_update: true
+
+      # --- Ubuntu x86 (amd64/i386) ---
+      ubuntu-main:
+        url: http://archive.ubuntu.com/ubuntu
+        architectures: [amd64, i386, all]
+        keys:
+          - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
+        auto_update: false
+      ubuntu-updates:
+        url: http://archive.ubuntu.com/ubuntu
+        suite: "{codename}-updates"
+        architectures: [amd64, i386, all]
+        keys:
+          - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
+        auto_update: true
+      ubuntu-security:
+        url: http://security.ubuntu.com/ubuntu
+        suite: "{codename}-security"
+        architectures: [amd64, i386, all]
+        keys:
+          - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
+        auto_update: true
+
+      # --- Ubuntu ports (arm64 and other non-x86 architectures) ---
+      ubuntu-ports-main:
+        url: http://ports.ubuntu.com/ubuntu-ports
+        architectures: [arm64, all]
+        keys:
+          - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
+        auto_update: false
+      ubuntu-ports-updates:
+        url: http://ports.ubuntu.com/ubuntu-ports
+        suite: "{codename}-updates"
+        architectures: [arm64, all]
+        keys:
+          - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
+        auto_update: true
+      ubuntu-ports-security:
+        url: http://ports.ubuntu.com/ubuntu-ports
+        suite: "{codename}-security"
+        architectures: [arm64, all]
+        keys:
+          - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
+        auto_update: true
+
     layouts:
       - os: debian
         architectures: [amd64, arm64, i386, all]
@@ -33,5 +76,83 @@ data:
             components:
               - component: main
                 upstreams: [debian-main, debian-security]
+          - codename: bookworm
+            components:
+              - component: main
+                upstreams: [debian-main, debian-security]
+
+      - os: ubuntu
+        architectures: [amd64, arm64, i386, all]
+        codenames:
+          - codename: noble
+            components:
+              - component: main
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+              - component: universe
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+              - component: restricted
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+              - component: multiverse
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+          - codename: jammy
+            components:
+              - component: main
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+              - component: universe
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+              - component: restricted
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+              - component: multiverse
+                upstreams:
+                  - ubuntu-main
+                  - ubuntu-updates
+                  - ubuntu-security
+                  - ubuntu-ports-main
+                  - ubuntu-ports-updates
+                  - ubuntu-ports-security
+
     signing:
-      private_key: /etc/debproxy/keys/debproxy.asc
+      private_key: /etc/debproxy/signing/debproxy-signing.asc
+

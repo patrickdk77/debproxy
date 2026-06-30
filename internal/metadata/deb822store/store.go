@@ -92,15 +92,17 @@ func (s *Store) loadAll(ctx context.Context) error {
 	return nil
 }
 
-// Refresh reloads any metadata files that have been written since the last load
-// and evicts entries for files that no longer exist. Safe to call concurrently.
+// Refresh merges any metadata files that have been written since the last load
+// into the in-memory state, and evicts entries for files that no longer exist.
+// Uses merge semantics (our in-memory version wins on conflict) so it is safe
+// to call with dirty in-memory state — no pending writes are lost.
 func (s *Store) Refresh(ctx context.Context) error {
 	paths, err := s.backend.ListPublished(ctx, "metadata/")
 	if err != nil {
 		return err
 	}
 
-	// Stat all relevant files without holding the lock; collect what needs reloading.
+	// Stat all relevant files without holding the lock.
 	type pendingLoad struct {
 		relPath string
 		modTime time.Time
@@ -141,26 +143,24 @@ func (s *Store) Refresh(ctx context.Context) error {
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	// Merge each changed file. mergeFromDisk does its own locking so no I/O
+	// is performed while holding the write lock.
 	for _, pl := range toLoad {
-		switch {
-		case strings.HasPrefix(pl.relPath, indexPrefix):
-			if err := s.loadIndexFile(ctx, pl.relPath); err != nil {
-				return fmt.Errorf("refresh %s: %w", pl.relPath, err)
-			}
-		case strings.HasPrefix(pl.relPath, upstreamPrefix):
-			if err := s.loadStateFile(ctx, pl.relPath); err != nil {
-				return fmt.Errorf("refresh %s: %w", pl.relPath, err)
-			}
+		if err := s.mergeFromDisk(ctx, pl.relPath); err != nil {
+			return fmt.Errorf("refresh %s: %w", pl.relPath, err)
 		}
+		s.mu.Lock()
 		s.fileModTimes[pl.relPath] = pl.modTime
+		s.mu.Unlock()
 	}
 
-	for _, p := range toEvict {
-		s.evictFile(p)
-		delete(s.fileModTimes, p)
+	if len(toEvict) > 0 {
+		s.mu.Lock()
+		for _, p := range toEvict {
+			s.evictFile(p)
+			delete(s.fileModTimes, p)
+		}
+		s.mu.Unlock()
 	}
 
 	return nil
@@ -179,66 +179,74 @@ func (s *Store) evictFile(relPath string) {
 }
 
 func (s *Store) loadIndexFile(ctx context.Context, relPath string) error {
-	inner := strings.TrimPrefix(relPath, indexPrefix)
-	inner = strings.TrimSuffix(inner, ".packages.zst")
+	inner := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), ".packages.zst")
 	parts := strings.SplitN(inner, "/", 4)
 	if len(parts) != 4 {
 		return fmt.Errorf("unexpected index path: %s", relPath)
 	}
 	osName, codename, component, arch := parts[0], parts[1], parts[2], parts[3]
-
-	rc, err := s.backend.OpenPublished(ctx, relPath)
+	entries, err := readIndexEntries(ctx, s.backend, relPath, osName, codename, component, arch)
 	if err != nil {
 		return err
-	}
-	defer rc.Close()
-
-	zr, err := zstd.NewReader(rc)
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-
-	paras, err := apt.ParseParagraphs(zr)
-	if err != nil {
-		return err
-	}
-
-	entries := make([]model.IndexEntry, 0, len(paras))
-	for _, p := range paras {
-		entries = append(entries, entryFromParagraph(osName, codename, component, arch, p))
 	}
 	s.entries[entryKey(osName, codename, component, arch)] = entries
 	return nil
 }
 
 func (s *Store) loadStateFile(ctx context.Context, relPath string) error {
-	upstreamName := strings.TrimPrefix(relPath, upstreamPrefix)
-	upstreamName = strings.TrimSuffix(upstreamName, ".state.zst")
-
-	rc, err := s.backend.OpenPublished(ctx, relPath)
+	upstreamName := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
+	states, err := readUpstreamStates(ctx, s.backend, relPath, upstreamName)
 	if err != nil {
 		return err
+	}
+	s.states[upstreamName] = states
+	return nil
+}
+
+// readIndexEntries reads and parses an index file without touching Store state.
+func readIndexEntries(ctx context.Context, backend storage.Storage, relPath, osName, codename, component, arch string) ([]model.IndexEntry, error) {
+	rc, err := backend.OpenPublished(ctx, relPath)
+	if err != nil {
+		return nil, err
 	}
 	defer rc.Close()
-
 	zr, err := zstd.NewReader(rc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer zr.Close()
-
 	paras, err := apt.ParseParagraphs(zr)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	entries := make([]model.IndexEntry, 0, len(paras))
+	for _, p := range paras {
+		entries = append(entries, entryFromParagraph(osName, codename, component, arch, p))
+	}
+	return entries, nil
+}
 
+// readUpstreamStates reads and parses an upstream state file without touching Store state.
+func readUpstreamStates(ctx context.Context, backend storage.Storage, relPath, upstreamName string) ([]model.UpstreamPackageState, error) {
+	rc, err := backend.OpenPublished(ctx, relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	zr, err := zstd.NewReader(rc)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	paras, err := apt.ParseParagraphs(zr)
+	if err != nil {
+		return nil, err
+	}
 	states := make([]model.UpstreamPackageState, 0, len(paras))
 	for _, p := range paras {
 		states = append(states, stateFromParagraph(upstreamName, p))
 	}
-	s.states[upstreamName] = states
-	return nil
+	return states, nil
 }
 
 func (s *Store) Ping(context.Context) error    { return nil }
@@ -433,9 +441,37 @@ func (s *Store) Flush(ctx context.Context) error {
 }
 
 func (s *Store) flushRelPath(ctx context.Context, relPath string) error {
+	// If the on-disk file is newer than when we last read it, another instance
+	// may have written changes we don't have in memory. Merge before overwriting
+	// so no data is lost when running multiple servers or a cronjob alongside.
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	knownModTime := s.fileModTimes[relPath]
+	s.mu.RUnlock()
 
+	if fi, err := s.backend.StatPublished(ctx, relPath); err == nil && fi.ModTime.After(knownModTime) {
+		if err := s.mergeFromDisk(ctx, relPath); err != nil {
+			slog.Warn("pre-flush merge from disk", "path", relPath, "err", err)
+			// Non-fatal: proceed with our own in-memory state rather than blocking.
+		}
+	}
+
+	if err := s.writeRelPath(ctx, relPath); err != nil {
+		return err
+	}
+
+	// Update fileModTimes so the next flush won't re-merge unnecessarily.
+	if fi, err := s.backend.StatPublished(ctx, relPath); err == nil {
+		s.mu.Lock()
+		s.fileModTimes[relPath] = fi.ModTime
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+// writeRelPath serializes and writes the current in-memory state for relPath.
+// It copies the slice under the read lock then writes to the backend without
+// holding any lock, so slow storage calls don't block mutations.
+func (s *Store) writeRelPath(ctx context.Context, relPath string) error {
 	switch {
 	case strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, ".packages.zst"):
 		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), ".packages.zst")
@@ -443,12 +479,99 @@ func (s *Store) flushRelPath(ctx context.Context, relPath string) error {
 		if len(parts) != 4 {
 			return fmt.Errorf("invalid index key %q", key)
 		}
-		return s.flushEntries(ctx, parts[0], parts[1], parts[2], parts[3], s.entries[key])
+		s.mu.RLock()
+		entries := append([]model.IndexEntry(nil), s.entries[key]...)
+		s.mu.RUnlock()
+		return s.flushEntries(ctx, parts[0], parts[1], parts[2], parts[3], entries)
 	case strings.HasPrefix(relPath, upstreamPrefix) && strings.HasSuffix(relPath, ".state.zst"):
 		up := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
-		return s.flushStates(ctx, up, s.states[up])
+		s.mu.RLock()
+		states := append([]model.UpstreamPackageState(nil), s.states[up]...)
+		s.mu.RUnlock()
+		return s.flushStates(ctx, up, states)
 	}
 	return nil
+}
+
+// mergeFromDisk reads relPath from the backend and merges its contents into the
+// in-memory state. For any entry with the same key in both sources, our
+// in-memory version wins (it represents more recent work by this instance).
+func (s *Store) mergeFromDisk(ctx context.Context, relPath string) error {
+	switch {
+	case strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, ".packages.zst"):
+		inner := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), ".packages.zst")
+		parts := strings.SplitN(inner, "/", 4)
+		if len(parts) != 4 {
+			return fmt.Errorf("unexpected path: %s", relPath)
+		}
+		osName, codename, component, arch := parts[0], parts[1], parts[2], parts[3]
+		disk, err := readIndexEntries(ctx, s.backend, relPath, osName, codename, component, arch)
+		if err != nil {
+			return err
+		}
+		key := entryKey(osName, codename, component, arch)
+		s.mu.Lock()
+		s.entries[key] = mergeIndexEntries(disk, s.entries[key])
+		s.mu.Unlock()
+	case strings.HasPrefix(relPath, upstreamPrefix) && strings.HasSuffix(relPath, ".state.zst"):
+		upstreamName := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
+		disk, err := readUpstreamStates(ctx, s.backend, relPath, upstreamName)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.states[upstreamName] = mergeUpstreamStates(disk, s.states[upstreamName])
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+// mergeIndexEntries returns the union of disk and memory entries.
+// For the same (Package, Version), the memory entry wins.
+func mergeIndexEntries(disk, memory []model.IndexEntry) []model.IndexEntry {
+	type pk struct{ pkg, ver string }
+	mem := make(map[pk]model.IndexEntry, len(memory))
+	for _, e := range memory {
+		mem[pk{e.Package, e.Version}] = e
+	}
+	out := make([]model.IndexEntry, 0, len(disk)+len(memory))
+	for _, e := range disk {
+		k := pk{e.Package, e.Version}
+		if m, ok := mem[k]; ok {
+			out = append(out, m)
+			delete(mem, k)
+		} else {
+			out = append(out, e)
+		}
+	}
+	for _, e := range mem {
+		out = append(out, e)
+	}
+	return out
+}
+
+// mergeUpstreamStates returns the union of disk and memory states.
+// For the same (PackageName, Arch), the memory state wins.
+func mergeUpstreamStates(disk, memory []model.UpstreamPackageState) []model.UpstreamPackageState {
+	type pk struct{ name, arch string }
+	mem := make(map[pk]model.UpstreamPackageState, len(memory))
+	for _, st := range memory {
+		mem[pk{st.PackageName, st.Arch}] = st
+	}
+	out := make([]model.UpstreamPackageState, 0, len(disk)+len(memory))
+	for _, st := range disk {
+		k := pk{st.PackageName, st.Arch}
+		if m, ok := mem[k]; ok {
+			out = append(out, m)
+			delete(mem, k)
+		} else {
+			out = append(out, st)
+		}
+	}
+	for _, st := range mem {
+		out = append(out, st)
+	}
+	return out
 }
 
 // StartPeriodicFlush launches a background goroutine that calls Flush every
@@ -481,30 +604,6 @@ func (s *Store) StartPeriodicFlush(ctx context.Context, interval time.Duration) 
 	}
 }
 
-// CommitSnapshot deletes the staging metadata files for osName now that a
-// snapshot has been published for it. The in-memory state is preserved so the
-// current process can continue serving /live and running Update jobs.
-// On the next startup the index will be empty for this OS until a pull-through
-// or Update repopulates it (or a rebuild is run).
-func (s *Store) CommitSnapshot(ctx context.Context, osName string) error {
-	paths, err := s.backend.ListPublished(ctx, indexPrefix+osName+"/")
-	if err != nil {
-		return err
-	}
-	for _, p := range paths {
-		if !strings.HasSuffix(p, ".packages.zst") {
-			continue
-		}
-		if err := s.backend.DeletePublished(ctx, p); err != nil {
-			return fmt.Errorf("delete staging %s: %w", p, err)
-		}
-		s.mu.Lock()
-		delete(s.dirty, p)
-		delete(s.fileModTimes, p)
-		s.mu.Unlock()
-	}
-	return nil
-}
 
 func (s *Store) flushEntries(ctx context.Context, osName, codename, component, arch string, entries []model.IndexEntry) error {
 	relPath := path.Join(indexPrefix, osName, codename, component, arch+".packages.zst")

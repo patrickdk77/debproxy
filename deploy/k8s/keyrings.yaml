@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: debproxy-keyrings
+  namespace: debproxy
+data:
+  # Content must be ASCII-armored (gpg --armor --export ...).
+  # Extract from a Debian host: gpg --armor --export < /usr/share/keyrings/debian-archive-keyring.gpg
+  debian-archive-keyring.gpg: |
+    -----BEGIN PGP PUBLIC KEY BLOCK-----
+    REPLACE_ME
+    -----END PGP PUBLIC KEY BLOCK-----
+  # Extract from an Ubuntu host: gpg --armor --export < /usr/share/keyrings/ubuntu-archive-keyring.gpg
+  ubuntu-archive-keyring.gpg: |
+    -----BEGIN PGP PUBLIC KEY BLOCK-----
+    REPLACE_ME
+    -----END PGP PUBLIC KEY BLOCK-----

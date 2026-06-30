@@ -23,12 +23,13 @@ spec:
           args: ["serve", "--config", "/etc/debproxy/config.yaml"]
           ports:
             - containerPort: 8080
-          env:
-            - name: DEBPROXY_METADATA_MYSQL_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: debproxy-keys
-                  key: mysql-dsn
+          resources:
+            requests:
+              cpu: 100m
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 7Gi
           livenessProbe:
             httpGet:
               path: /healthz
@@ -39,9 +40,13 @@ spec:
               port: 8080
           volumeMounts:
             - name: config
-              mountPath: /etc/debproxy
+              mountPath: /etc/debproxy/config.yaml
+              subPath: config.yaml
             - name: keys
               mountPath: /etc/debproxy/keys
+              readOnly: true
+            - name: signing
+              mountPath: /etc/debproxy/signing
               readOnly: true
             - name: pool
               mountPath: /var/lib/debproxy
@@ -50,8 +55,11 @@ spec:
           configMap:
             name: debproxy-config
         - name: keys
+          configMap:
+            name: debproxy-keyrings
+        - name: signing
           secret:
-            secretName: debproxy-keys
+            secretName: debproxy-secret
         - name: pool
           persistentVolumeClaim:
             claimName: debproxy-pool

@@ -291,44 +291,6 @@ func TestRefreshDetectsNewFiles(t *testing.T) {
 	}
 }
 
-func TestCommitSnapshot(t *testing.T) {
-	root := t.TempDir()
-	fs, err := filesystem.New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-
-	s, err := deb822store.New(ctx, fs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := s.UpsertEntry(ctx, entry("dpkg", "1.22", "amd64")); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// After CommitSnapshot the staging files are gone; a fresh Store should
-	// load nothing for that OS.
-	if err := s.CommitSnapshot(ctx, "debian"); err != nil {
-		t.Fatal(err)
-	}
-
-	s2, err := deb822store.New(ctx, fs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entries, err := s2.ListEntries(ctx, model.Selector{OS: "debian"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected empty index after CommitSnapshot, got %d entries", len(entries))
-	}
-}
 
 func TestUpstreamStateRoundTrip(t *testing.T) {
 	s, _ := newStore(t)
