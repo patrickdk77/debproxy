@@ -125,7 +125,7 @@ func (s *Syncer) gcPool(ctx context.Context) (int, error) {
 		if err := s.store.Delete(ctx, p); err != nil {
 			slog.Warn("cleanup: delete orphaned file failed", "path", p, "err", err)
 		} else {
-			slog.Info("cleanup: deleted orphaned pool file", "path", p)
+			slog.Debug("cleanup: deleted orphaned pool file", "path", p)
 		}
 	}
 	return len(toDelete), nil
@@ -231,7 +231,7 @@ func (s *Syncer) gcSrc(ctx context.Context) (int, error) {
 		if err := s.store.Delete(ctx, p); err != nil {
 			slog.Warn("cleanup: delete orphaned src file failed", "path", p, "err", err)
 		} else {
-			slog.Info("cleanup: deleted orphaned src file", "path", p)
+			slog.Debug("cleanup: deleted orphaned src file", "path", p)
 		}
 	}
 	return len(toDelete), nil

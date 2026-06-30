@@ -224,6 +224,7 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			srcWg.Add(1)
 			go func(i int, j srcWork) {
 				defer srcWg.Done()
+				slog.Debug("fetching upstream Sources", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
 				f := upstream.NewFetcher(j.src, client)
 				raws, err := f.FetchSources(ctx)
 				if err != nil {

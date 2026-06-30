@@ -307,8 +307,9 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, srcPat
 		return
 	}
 	if !exists {
+		slog.Debug("source pull-through", "path", srcPath)
 		if err := s.pullThroughSource(r.Context(), osName, srcPath); err != nil {
-			slog.Error("source pull-through", "path", srcPath, "err", err)
+			slog.Error("source pull-through failed", "path", srcPath, "err", err)
 			http.Error(w, "source pull-through failed", http.StatusBadGateway)
 			return
 		}

@@ -318,6 +318,9 @@ var pkgVariants = []pkgVariant{
 func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release, arch string, cached *indexCacheEntry) ([]apt.RawPkg, error) {
 	base := fmt.Sprintf("%s/binary-%s/", f.src.Component, arch)
 	byHash := acquireByHash(rel)
+	if byHash {
+		slog.Debug("upstream supports by-hash index fetching", "upstream", f.src.Name, "arch", arch)
+	}
 
 	// Check if the Release hash matches the cached version  --  if so, skip the fetch.
 	if cached != nil && cached.release != nil {
@@ -456,7 +459,7 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 		return nil, false
 	}
 
-	slog.Debug("pdiff: applied patches", "upstream", f.src.Name, "arch", arch, "count", len(chain))
+	slog.Debug("pdiff: updated Packages index incrementally", "upstream", f.src.Name, "arch", arch, "patches", len(chain))
 	return pkgs, true
 }
 
