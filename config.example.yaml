@@ -10,6 +10,14 @@
 # Use a Go duration string (e.g. "6h", "12h", "24h"). Omit or set to "0" to disable.
 # refresh_interval: "6h"
 
+# snapshot_schedule controls when the server automatically publishes snapshots
+# while running in serve mode. Three formats are accepted:
+#   "daily@HH:MM"    every day at a fixed UTC time           e.g. "daily@03:00"
+#   "day@HH:MM"      every week on that day at a fixed time  e.g. "sunday@03:00"
+#   Go duration      every N hours with up to 5 min jitter   e.g. "24h"
+# Omit or set to "0" to disable — use `debproxy snapshot` to publish manually.
+# snapshot_schedule: "sunday@03:00"
+
 storage:
   backend: filesystem   # filesystem | s3
   filesystem:

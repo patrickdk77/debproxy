@@ -306,6 +306,9 @@ signing:
 	if err := sy.Update(context.Background()); err != nil {
 		t.Fatalf("update: %v", err)
 	}
+	if err := sy.Snapshot(context.Background(), time.Now()); err != nil {
+		t.Fatalf("snapshot after update: %v", err)
+	}
 
 	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, nil).Handler())
 	defer srv.Close()

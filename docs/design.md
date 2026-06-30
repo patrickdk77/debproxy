@@ -1,6 +1,6 @@
 # Design Decisions
 
-## The metadata index is disposable
+## The metadata index is persistent but rebuildable
 
 An apt repository is already a self-describing structure: a signed `Release` file
 points to `Packages` indices by hash, and each `Packages` entry points to a `.deb`
@@ -12,10 +12,16 @@ re-parsing every file on each update:
 - Update provenance: which packages came from `auto_update` upstreams and what
   versions were last seen upstream.
 
-The index is **fully rebuildable** from the pool (plus a fresh upstream fetch for
-update state) via `debproxy rebuild`. This means losing the index is never
-catastrophic, and swapping the storage format is low-risk. There is no SQL database;
-the index lives in zstd-compressed deb822 files alongside the pool.
+The index is kept across snapshots and survives restarts. It is **fully rebuildable**
+from the pool (plus a fresh upstream fetch for update state) via `debproxy rebuild`,
+so losing it is not catastrophic, and swapping the storage format is low-risk.
+There is no SQL database; the index lives in zstd-compressed deb822 files alongside
+the pool.
+
+When multiple instances run against the same storage backend, each instance merges
+any changes written by others before flushing its own dirty state (merge-before-write),
+and periodically re-reads files that have changed on disk (~hourly) so the in-memory
+view stays consistent without requiring a full reload.
 
 ## Snapshots are static files, not database rows
 

@@ -162,7 +162,7 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 		slog.Info("update job", "os", k.osName, "codename", k.codename, "updated", updated)
 	}
 
-	return s.Snapshot(ctx, time.Now())
+	return nil
 }
 
 func anyArchWithPkg(compMap map[string]map[string]avail.Pkg, name string) map[string]avail.Pkg {

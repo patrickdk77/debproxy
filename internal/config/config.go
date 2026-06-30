@@ -31,7 +31,14 @@ type Config struct {
 	// RefreshInterval controls how often the server re-fetches upstream package
 	// indices in the background. Accepts a Go duration string (e.g. "6h", "12h").
 	// Empty string or "0" disables periodic background refreshing.
-	RefreshInterval string                 `yaml:"refresh_interval"`
+	RefreshInterval  string `yaml:"refresh_interval"`
+	// SnapshotSchedule controls when the server automatically publishes snapshots
+	// while running in serve mode. Three formats are accepted:
+	//   "daily@HH:MM"          — every day at a fixed UTC time (e.g. "daily@03:00")
+	//   "weekly@day@HH:MM"     — every week on a fixed UTC day/time (e.g. "weekly@sunday@03:00")
+	//   Go duration string     — every N hours/minutes with jitter (e.g. "24h")
+	// Empty string or "0" disables automatic snapshots.
+	SnapshotSchedule string `yaml:"snapshot_schedule"`
 
 	ResolvedLayouts []model.Layout `yaml:"-"`
 }

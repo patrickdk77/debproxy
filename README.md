@@ -64,7 +64,7 @@ cp /usr/share/keyrings/ubuntu-archive-keyring.gpg /etc/debproxy/keys/
 |---|---|
 | `serve` | Start the HTTP server (`:8080`). Publishes signing public key on startup. |
 | `prime` | Seed the cache with a named package and its dependency closure, then snapshot. |
-| `update` | Refresh all `auto_update` upstreams, pull newer versions, snapshot. |
+| `update` | Refresh all `auto_update` upstreams, pull newer versions, and publish a snapshot. |
 | `snapshot` | Publish an immutable signed snapshot of the current cache state. |
 | `rebuild` | Repopulate the metadata index by scanning the pool directory. |
 | `publish-key` | Write the signing public key files into the storage root. |

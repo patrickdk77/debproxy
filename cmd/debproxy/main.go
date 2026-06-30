@@ -216,6 +216,10 @@ func runUpdate(args []string) int {
 		slog.Error("update", "err", err)
 		return 1
 	}
+	if err := s.Snapshot(ctx, time.Now()); err != nil {
+		slog.Error("snapshot after update", "err", err)
+		return 1
+	}
 	slog.Info("update complete")
 	return 0
 }
@@ -420,6 +424,12 @@ func runServe(args []string) int {
 		refreshInterval = d
 	}
 
+	snapSched, err := parseSnapshotSchedule(cfg.SnapshotSchedule)
+	if err != nil {
+		slog.Error("invalid snapshot_schedule", "value", cfg.SnapshotSchedule, "err", err)
+		return 1
+	}
+
 	syncr := syncerpkg.New(cfg, store, index, key, httpClient, indexCache, notifier)
 	if err := syncr.PreloadExistsCache(context.Background()); err != nil {
 		slog.Warn("preload pool exists cache", "err", err)
@@ -432,6 +442,7 @@ func runServe(args []string) int {
 	stopFlush := startPeriodicFlush(index, 5*time.Minute)
 	stopMerge := startPeriodicMerge(index, time.Hour)
 	stopRefresher := startIndexRefresher(cfg, httpClient, indexCache, refreshInterval, syncr)
+	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched)
 
 	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier).Handler()}
 	go func() {
@@ -456,6 +467,7 @@ func runServe(args []string) int {
 	}
 
 	stopRefresher()
+	stopSnapshotter()
 	stopMerge()
 	stopFlush()
 	return 0
@@ -529,6 +541,126 @@ func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client
 	}
 	if err := syncr.UpdateWithCache(ctx, cache); err != nil {
 		slog.Warn("post-refresh update failed", "err", err)
+	}
+}
+
+// snapshotSched holds a parsed snapshot_schedule value.
+type snapshotSched struct {
+	kind    string        // "interval", "daily", "weekly"
+	d       time.Duration // interval mode
+	hour    int           // daily/weekly: UTC hour
+	minute  int           // daily/weekly: UTC minute
+	weekday time.Weekday  // weekly only
+}
+
+// parseSnapshotSchedule parses snapshot_schedule from config. Accepted forms:
+//
+//	"daily@HH:MM"       every day at a fixed UTC time (e.g. "daily@03:00")
+//	"sunday@HH:MM"      every Sunday at a fixed UTC time (any weekday name works)
+//	Go duration string  interval with up to 5 minutes of jitter (e.g. "24h")
+//	"" or "0"           disabled
+func parseSnapshotSchedule(s string) (snapshotSched, error) {
+	if s == "" || s == "0" {
+		return snapshotSched{}, nil
+	}
+	lower := strings.ToLower(s)
+	at := strings.IndexByte(lower, '@')
+	if at < 0 {
+		// No '@' — must be a plain duration.
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return snapshotSched{}, fmt.Errorf("snapshot_schedule %q: expected a duration, \"daily@HH:MM\", or \"day@HH:MM\"", s)
+		}
+		return snapshotSched{kind: "interval", d: d}, nil
+	}
+	prefix, timePart := lower[:at], s[at+1:]
+	t, err := time.Parse("15:04", timePart)
+	if err != nil {
+		return snapshotSched{}, fmt.Errorf("snapshot_schedule %q: time must be HH:MM", s)
+	}
+	if prefix == "daily" {
+		return snapshotSched{kind: "daily", hour: t.Hour(), minute: t.Minute()}, nil
+	}
+	wd, err := parseWeekday(prefix)
+	if err != nil {
+		return snapshotSched{}, fmt.Errorf("snapshot_schedule %q: unknown day %q (use daily, sunday, monday, ...)", s, prefix)
+	}
+	return snapshotSched{kind: "weekly", weekday: wd, hour: t.Hour(), minute: t.Minute()}, nil
+}
+
+func parseWeekday(s string) (time.Weekday, error) {
+	switch s {
+	case "sunday", "sun":
+		return time.Sunday, nil
+	case "monday", "mon":
+		return time.Monday, nil
+	case "tuesday", "tue":
+		return time.Tuesday, nil
+	case "wednesday", "wed":
+		return time.Wednesday, nil
+	case "thursday", "thu":
+		return time.Thursday, nil
+	case "friday", "fri":
+		return time.Friday, nil
+	case "saturday", "sat":
+		return time.Saturday, nil
+	}
+	return 0, fmt.Errorf("unknown weekday %q", s)
+}
+
+// nextSnapshotAfter returns when the next snapshot should fire after now (UTC).
+func nextSnapshotAfter(sched snapshotSched, now time.Time) time.Time {
+	now = now.UTC()
+	switch sched.kind {
+	case "daily":
+		next := time.Date(now.Year(), now.Month(), now.Day(), sched.hour, sched.minute, 0, 0, time.UTC)
+		if !next.After(now) {
+			next = next.AddDate(0, 0, 1)
+		}
+		return next
+	case "weekly":
+		daysUntil := (int(sched.weekday) - int(now.Weekday()) + 7) % 7
+		next := time.Date(now.Year(), now.Month(), now.Day()+daysUntil, sched.hour, sched.minute, 0, 0, time.UTC)
+		if !next.After(now) {
+			next = next.AddDate(0, 0, 7)
+		}
+		return next
+	default: // interval
+		jitter := time.Duration(rand.Intn(301)) * time.Second
+		return now.Add(sched.d + jitter)
+	}
+}
+
+// startPeriodicSnapshot publishes a snapshot on the configured schedule.
+// A no-op if sched is empty (automatic snapshots disabled).
+func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if sched.kind == "" {
+			<-stop
+			return
+		}
+		for {
+			next := nextSnapshotAfter(sched, time.Now())
+			slog.Info("next scheduled snapshot", "at", next.Format(time.RFC3339))
+			select {
+			case <-time.After(time.Until(next)):
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+				slog.Info("publishing scheduled snapshot")
+				if err := syncr.Snapshot(ctx, time.Now()); err != nil {
+					slog.Warn("scheduled snapshot failed", "err", err)
+				}
+				cancel()
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
 	}
 }
 

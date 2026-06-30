@@ -6,7 +6,7 @@
 flowchart TD
   cfg["config.yaml"] --> factory["backend factories"]
   factory --> storage["storage backend"]
-  factory --> meta["metadata index (disposable)"]
+  factory --> meta["metadata index (persistent)"]
   storage --> pool["pool/{os}/{codename}/{upstream}/...\n(global, original names, ref-based dedup)"]
   storage --> pub["per-snapshot dists/\n(write-once signed metadata)"]
   storage --> mfiles["metadata/index/{os}/{codename}/{component}/{arch}.packages.zst"]
@@ -78,7 +78,7 @@ internal/
   ingest/                     -- download + verify + store .deb, record IndexEntry
   metadata/
     metadata.go               -- MetadataIndex interface
-    deb822store/store.go      -- in-memory index backed by zstd deb822 files; Flush/Refresh/CommitSnapshot
+    deb822store/store.go      -- in-memory index backed by zstd deb822 files; Flush/Refresh/merge-before-write
   metadatafactory/factory.go  -- always returns deb822store.Store
   model/model.go              -- domain types: Digest, Checksums, IndexEntry, UpstreamSource, Layout, ...
   publish/                    -- generate Packages (plain/gz/zst), Release, InRelease, Release.gpg
@@ -136,36 +136,18 @@ CMD ["serve", "--config", "/etc/debproxy/config.yaml"]
 
 ## Kubernetes
 
-Manifests live under `deploy/k8s/`. Apply in order:
+Manifests live under `deploy/k8s/` and are applied with kustomize. Public keyrings
+are non-sensitive and live in a ConfigMap; only the private signing key is in a Secret:
 
 ```
-deploy/k8s/namespace.yaml      -- debproxy namespace
-deploy/k8s/configmap.yaml      -- config.yaml at /etc/debproxy/config.yaml
-deploy/k8s/secret.example.yaml -- signing private key + upstream public keys
-deploy/k8s/pvc.yaml            -- ReadWriteOnce volume at /var/lib/debproxy (filesystem backend)
-deploy/k8s/deployment.yaml     -- single replica, liveness/readiness on /healthz, nonroot
-deploy/k8s/service.yaml        -- ClusterIP on port 8080
-deploy/k8s/ingress.yaml        -- ingress for apt clients
-```
-
-Compact deployment shape:
-
-```yaml
-spec:
-  replicas: 1   # filesystem (RWO) -> single writer
-                # use S3 or an RWX volume to scale out
-  template:
-    spec:
-      containers:
-        - name: debproxy
-          args: ["serve", "--config", "/etc/debproxy/config.yaml"]
-          ports: [{containerPort: 8080}]
-          livenessProbe:  {httpGet: {path: /healthz, port: 8080}}
-          readinessProbe: {httpGet: {path: /healthz, port: 8080}}
-          volumeMounts:
-            - {name: config, mountPath: /etc/debproxy}
-            - {name: keys,   mountPath: /etc/debproxy/keys, readOnly: true}
-            - {name: pool,   mountPath: /var/lib/debproxy}
+deploy/k8s/namespace.yaml   -- debproxy namespace
+deploy/k8s/configmap.yaml   -- config.yaml at /etc/debproxy/config.yaml
+deploy/k8s/keyrings.yaml    -- public upstream keyrings (ConfigMap) at /etc/debproxy/keys/
+deploy/k8s/secret.yaml      -- private signing key (Secret) at /etc/debproxy/signing/
+deploy/k8s/pvc.yaml         -- ReadWriteOnce volume at /var/lib/debproxy (filesystem backend)
+deploy/k8s/deployment.yaml  -- single replica, liveness/readiness on /healthz, nonroot
+deploy/k8s/service.yaml     -- ClusterIP on port 8080
+deploy/k8s/ingress.yaml     -- ingress for apt clients
 ```
 
 **Scaling:** the filesystem backend with an RWO PVC requires `replicas: 1` and a
