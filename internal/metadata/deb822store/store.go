@@ -31,6 +31,7 @@ import (
 const (
 	indexPrefix    = "metadata/index/"
 	upstreamPrefix = "metadata/upstream/"
+	sourcesSuffix  = "/sources.zst"
 )
 
 // Store is an in-memory MetadataIndex backed by deb822+zstd files.
@@ -41,6 +42,7 @@ type Store struct {
 	mu           sync.RWMutex
 	entries      map[string][]model.IndexEntry           // key: "os/codename/component/arch"
 	states       map[string][]model.UpstreamPackageState // key: upstream name
+	sources      map[string][]model.SourceEntry          // key: "os/codename/component"
 	fileModTimes map[string]time.Time                    // relPath -> mod time at last load
 	dirty        map[string]bool                         // relPath -> needs flush
 }
@@ -51,6 +53,7 @@ func New(ctx context.Context, backend storage.Storage) (*Store, error) {
 		backend:      backend,
 		entries:      map[string][]model.IndexEntry{},
 		states:       map[string][]model.UpstreamPackageState{},
+		sources:      map[string][]model.SourceEntry{},
 		fileModTimes: map[string]time.Time{},
 		dirty:        map[string]bool{},
 	}
@@ -74,6 +77,10 @@ func (s *Store) loadAll(ctx context.Context) error {
 		switch {
 		case strings.HasPrefix(p, indexPrefix) && strings.HasSuffix(p, ".packages.zst"):
 			if err := s.loadIndexFile(ctx, p); err != nil {
+				return fmt.Errorf("load %s: %w", p, err)
+			}
+		case strings.HasPrefix(p, indexPrefix) && strings.HasSuffix(p, sourcesSuffix):
+			if err := s.loadSourcesFile(ctx, p); err != nil {
 				return fmt.Errorf("load %s: %w", p, err)
 			}
 		case strings.HasPrefix(p, upstreamPrefix) && strings.HasSuffix(p, ".state.zst"):
@@ -112,8 +119,9 @@ func (s *Store) Refresh(ctx context.Context) error {
 
 	for _, p := range paths {
 		isIndex := strings.HasPrefix(p, indexPrefix) && strings.HasSuffix(p, ".packages.zst")
+		isSrc := strings.HasPrefix(p, indexPrefix) && strings.HasSuffix(p, sourcesSuffix)
 		isState := strings.HasPrefix(p, upstreamPrefix) && strings.HasSuffix(p, ".state.zst")
-		if !isIndex && !isState {
+		if !isIndex && !isSrc && !isState {
 			continue
 		}
 		seen[p] = true
@@ -172,6 +180,9 @@ func (s *Store) evictFile(relPath string) {
 	if strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, ".packages.zst") {
 		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), ".packages.zst")
 		delete(s.entries, key)
+	} else if strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, sourcesSuffix) {
+		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), sourcesSuffix)
+		delete(s.sources, key)
 	} else if strings.HasPrefix(relPath, upstreamPrefix) && strings.HasSuffix(relPath, ".state.zst") {
 		upstream := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
 		delete(s.states, upstream)
@@ -257,6 +268,7 @@ func (s *Store) Reset(ctx context.Context) error {
 	defer s.mu.Unlock()
 	s.entries = map[string][]model.IndexEntry{}
 	s.states = map[string][]model.UpstreamPackageState{}
+	s.sources = map[string][]model.SourceEntry{}
 	return nil
 }
 
@@ -483,6 +495,16 @@ func (s *Store) writeRelPath(ctx context.Context, relPath string) error {
 		entries := append([]model.IndexEntry(nil), s.entries[key]...)
 		s.mu.RUnlock()
 		return s.flushEntries(ctx, parts[0], parts[1], parts[2], parts[3], entries)
+	case strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, sourcesSuffix):
+		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), sourcesSuffix)
+		parts := strings.SplitN(key, "/", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid sources key %q", key)
+		}
+		s.mu.RLock()
+		srcs := append([]model.SourceEntry(nil), s.sources[key]...)
+		s.mu.RUnlock()
+		return s.flushSources(ctx, parts[0], parts[1], parts[2], srcs)
 	case strings.HasPrefix(relPath, upstreamPrefix) && strings.HasSuffix(relPath, ".state.zst"):
 		up := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
 		s.mu.RLock()
@@ -512,6 +534,21 @@ func (s *Store) mergeFromDisk(ctx context.Context, relPath string) error {
 		key := entryKey(osName, codename, component, arch)
 		s.mu.Lock()
 		s.entries[key] = mergeIndexEntries(disk, s.entries[key])
+		s.mu.Unlock()
+	case strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, sourcesSuffix):
+		inner := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), sourcesSuffix)
+		parts := strings.SplitN(inner, "/", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("unexpected path: %s", relPath)
+		}
+		osName, codename, component := parts[0], parts[1], parts[2]
+		disk, err := readSourceEntries(ctx, s.backend, relPath, osName, codename, component)
+		if err != nil {
+			return err
+		}
+		key := sourceKey(osName, codename, component)
+		s.mu.Lock()
+		s.sources[key] = mergeSourceEntries(disk, s.sources[key])
 		s.mu.Unlock()
 	case strings.HasPrefix(relPath, upstreamPrefix) && strings.HasSuffix(relPath, ".state.zst"):
 		upstreamName := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
@@ -733,6 +770,232 @@ func stateFromParagraph(upstream string, p *apt.Paragraph) model.UpstreamPackage
 	}
 }
 
+// --- source entry methods ---
+
+func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error {
+	if e.FirstSeen.IsZero() {
+		e.FirstSeen = metadata.Now()
+	}
+	key := sourceKey(e.OS, e.Codename, e.Component)
+	relPath := sourceRelPath(e.OS, e.Codename, e.Component)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	srcs := s.sources[key]
+	updated := false
+	for i, existing := range srcs {
+		if existing.Package == e.Package && existing.Version == e.Version {
+			srcs[i] = e
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		srcs = append(srcs, e)
+	}
+	s.sources[key] = srcs
+	s.dirty[relPath] = true
+	return nil
+}
+
+func (s *Store) ListSourceEntries(_ context.Context, sel model.Selector) ([]model.SourceEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var out []model.SourceEntry
+	for key, srcs := range s.sources {
+		osName, codename, component, ok := splitSourceKey(key)
+		if !ok {
+			continue
+		}
+		if sel.OS != "" && sel.OS != osName {
+			continue
+		}
+		if sel.Codename != "" && sel.Codename != codename {
+			continue
+		}
+		if sel.Component != "" && sel.Component != component {
+			continue
+		}
+		out = append(out, srcs...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Package != out[j].Package {
+			return out[i].Package < out[j].Package
+		}
+		return debversion.Compare(out[i].Version, out[j].Version) < 0
+	})
+	return out, nil
+}
+
+func (s *Store) FindSourceEntry(_ context.Context, sel model.Selector, pkg, version string) (*model.SourceEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var best *model.SourceEntry
+	for key, srcs := range s.sources {
+		osName, codename, component, ok := splitSourceKey(key)
+		if !ok {
+			continue
+		}
+		if sel.OS != "" && sel.OS != osName {
+			continue
+		}
+		if sel.Codename != "" && sel.Codename != codename {
+			continue
+		}
+		if sel.Component != "" && sel.Component != component {
+			continue
+		}
+		for _, e := range srcs {
+			if e.Package != pkg {
+				continue
+			}
+			if version != "" {
+				if e.Version == version {
+					cp := e
+					return &cp, nil
+				}
+				continue
+			}
+			if best == nil || debversion.Compare(e.Version, best.Version) > 0 {
+				cp := e
+				best = &cp
+			}
+		}
+	}
+	return best, nil
+}
+
+func (s *Store) loadSourcesFile(ctx context.Context, relPath string) error {
+	inner := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), sourcesSuffix)
+	parts := strings.SplitN(inner, "/", 3)
+	if len(parts) != 3 {
+		return fmt.Errorf("unexpected sources path: %s", relPath)
+	}
+	osName, codename, component := parts[0], parts[1], parts[2]
+	srcs, err := readSourceEntries(ctx, s.backend, relPath, osName, codename, component)
+	if err != nil {
+		return err
+	}
+	s.sources[sourceKey(osName, codename, component)] = srcs
+	return nil
+}
+
+func readSourceEntries(ctx context.Context, backend storage.Storage, relPath, osName, codename, component string) ([]model.SourceEntry, error) {
+	rc, err := backend.OpenPublished(ctx, relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	zr, err := zstd.NewReader(rc)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	paras, err := apt.ParseParagraphs(zr)
+	if err != nil {
+		return nil, err
+	}
+	srcs := make([]model.SourceEntry, 0, len(paras))
+	for _, p := range paras {
+		srcs = append(srcs, sourceEntryFromParagraph(osName, codename, component, p))
+	}
+	return srcs, nil
+}
+
+func (s *Store) flushSources(ctx context.Context, osName, codename, component string, srcs []model.SourceEntry) error {
+	relPath := sourceRelPath(osName, codename, component)
+	data, err := serializeSources(srcs)
+	if err != nil {
+		return err
+	}
+	return s.backend.WriteFile(ctx, relPath, bytes.NewReader(data), int64(len(data)))
+}
+
+func serializeSources(srcs []model.SourceEntry) ([]byte, error) {
+	paras := make([]*apt.Paragraph, len(srcs))
+	for i, e := range srcs {
+		paras[i] = sourceEntryToParagraph(e)
+	}
+	return compress(paras)
+}
+
+func sourceEntryToParagraph(e model.SourceEntry) *apt.Paragraph {
+	p := apt.NewParagraph()
+	p.Set("Package", e.Package)
+	p.Set("Version", e.Version)
+	p.Set("X-Debproxy-Upstream", e.Upstream)
+	p.Set("X-Debproxy-Local-Dir", e.LocalDir)
+	p.Set("X-Debproxy-Upstream-Dir", e.UpstreamDir)
+	p.Set("X-Debproxy-First-Seen", e.FirstSeen.UTC().Format(time.RFC3339))
+	p.Set("X-Debproxy-Stanza", e.Stanza)
+	for i, f := range e.Files {
+		p.Set(fmt.Sprintf("X-Debproxy-File-%d", i),
+			fmt.Sprintf("%s %d %s", f.Filename, f.Size, string(f.SHA256)))
+	}
+	return p
+}
+
+func sourceEntryFromParagraph(osName, codename, component string, p *apt.Paragraph) model.SourceEntry {
+	stanza := strings.TrimPrefix(p.Get("X-Debproxy-Stanza"), "\n")
+	firstSeen, _ := time.Parse(time.RFC3339, p.Get("X-Debproxy-First-Seen"))
+
+	var files []model.SourceFile
+	for i := 0; ; i++ {
+		v := p.Get(fmt.Sprintf("X-Debproxy-File-%d", i))
+		if v == "" {
+			break
+		}
+		parts := strings.Fields(v)
+		if len(parts) != 3 {
+			break
+		}
+		size, _ := strconv.ParseInt(parts[1], 10, 64)
+		files = append(files, model.SourceFile{
+			Filename: parts[0],
+			Size:     size,
+			SHA256:   model.Digest(parts[2]),
+		})
+	}
+
+	return model.SourceEntry{
+		OS:          osName,
+		Codename:    codename,
+		Component:   component,
+		Package:     p.Get("Package"),
+		Version:     p.Get("Version"),
+		Upstream:    p.Get("X-Debproxy-Upstream"),
+		LocalDir:    p.Get("X-Debproxy-Local-Dir"),
+		UpstreamDir: p.Get("X-Debproxy-Upstream-Dir"),
+		Files:       files,
+		Stanza:      stanza,
+		FirstSeen:   firstSeen,
+	}
+}
+
+func mergeSourceEntries(disk, memory []model.SourceEntry) []model.SourceEntry {
+	type pk struct{ pkg, ver string }
+	mem := make(map[pk]model.SourceEntry, len(memory))
+	for _, e := range memory {
+		mem[pk{e.Package, e.Version}] = e
+	}
+	out := make([]model.SourceEntry, 0, len(disk)+len(memory))
+	for _, e := range disk {
+		k := pk{e.Package, e.Version}
+		if m, ok := mem[k]; ok {
+			out = append(out, m)
+			delete(mem, k)
+		} else {
+			out = append(out, e)
+		}
+	}
+	for _, e := range mem {
+		out = append(out, e)
+	}
+	return out
+}
+
 // --- key helpers ---
 
 func entryKey(osName, codename, component, arch string) string {
@@ -745,4 +1008,20 @@ func splitEntryKey(key string) (osName, codename, component, arch string, ok boo
 		return "", "", "", "", false
 	}
 	return parts[0], parts[1], parts[2], parts[3], true
+}
+
+func sourceKey(osName, codename, component string) string {
+	return osName + "/" + codename + "/" + component
+}
+
+func splitSourceKey(key string) (osName, codename, component string, ok bool) {
+	parts := strings.SplitN(key, "/", 3)
+	if len(parts) != 3 {
+		return "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], true
+}
+
+func sourceRelPath(osName, codename, component string) string {
+	return path.Join(indexPrefix, osName, codename, component) + sourcesSuffix
 }

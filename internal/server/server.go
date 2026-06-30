@@ -24,6 +24,7 @@ import (
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/ingest"
 	"github.com/debproxy/debproxy/internal/metadata"
+	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/publish"
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
@@ -146,6 +147,11 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, parts []
 		s.servePool(w, r, strings.Join(remainder, "/"), false)
 		return
 	}
+	if remainder[0] == "src" {
+		// Source files under snapshots are served directly from storage (no pull-through).
+		s.servePool(w, r, strings.Join(remainder, "/"), false)
+		return
+	}
 	rel := path.Join(snapshotID, osName, path.Join(remainder...))
 	s.servePublished(w, r, rel)
 }
@@ -162,6 +168,10 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 
 	if remainder[0] == "pool" {
 		s.servePool(w, r, strings.Join(remainder, "/"), true)
+		return
+	}
+	if remainder[0] == "src" {
+		s.serveSrc(w, r, osName, strings.Join(remainder, "/"))
 		return
 	}
 	if remainder[0] == "dists" {
@@ -284,6 +294,136 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 	}
 	defer rc.Close()
 	serveSeekable(w, r, poolPath, rc, info.Size, info.ModTime)
+}
+
+// serveSrc serves a source package file from src/, pulling it through from
+// upstream on first request when called from the live path.
+func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, srcPath string) {
+	// Ensure the file exists locally, pulling through from upstream if needed.
+	exists, err := s.store.Exists(r.Context(), srcPath)
+	if err != nil {
+		slog.Error("src exists check", "path", srcPath, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !exists {
+		if err := s.pullThroughSource(r.Context(), osName, srcPath); err != nil {
+			slog.Error("source pull-through", "path", srcPath, "err", err)
+			http.Error(w, "source pull-through failed", http.StatusBadGateway)
+			return
+		}
+	}
+
+	info, err := s.store.Stat(r.Context(), srcPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rc, err := s.store.Open(r.Context(), srcPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+	serveSeekable(w, r, srcPath, rc, info.Size, info.ModTime)
+}
+
+// pullThroughSource fetches one source file from the upstream and stores it.
+// srcPath has the form src/{os}/{codename}/{upstream}/{component}/{letter}/{name}/{filename}.
+func (s *Server) pullThroughSource(ctx context.Context, osName, srcPath string) error {
+	// src/{os}/{codename}/{upstream}/{component}/{letter}/{name}/{filename}
+	segs := strings.Split(srcPath, "/")
+	if len(segs) < 8 || segs[0] != "src" {
+		return errors.New("invalid src path")
+	}
+	codename, upstreamName, component, pkgName, filename :=
+		segs[2], segs[3], segs[4], segs[6], segs[7]
+
+	// Try the metadata index first (populated by update job).
+	entry, err := s.index.FindSourceEntry(ctx,
+		model.Selector{OS: osName, Codename: codename, Component: component},
+		pkgName, "")
+	if err != nil {
+		return err
+	}
+	if entry != nil {
+		return s.downloadAndCacheSourceFile(ctx, *entry, upstreamName, filename)
+	}
+
+	// Fall back to fetching live Sources from upstream.
+	var us *model.UpstreamSource
+	for _, layout := range s.cfg.ResolvedLayouts {
+		if layout.OS != osName || layout.Codename != codename || layout.Component != component {
+			continue
+		}
+		for i := range layout.Upstreams {
+			if layout.Upstreams[i].Name == upstreamName && layout.Upstreams[i].FetchSources {
+				us = &layout.Upstreams[i]
+				break
+			}
+		}
+		if us != nil {
+			break
+		}
+	}
+	if us == nil {
+		return fmt.Errorf("upstream %q not found or sources not enabled for %s/%s/%s", upstreamName, osName, codename, component)
+	}
+
+	f := upstream.NewFetcher(*us, s.client)
+	srcs, err := f.FetchSources(ctx)
+	if err != nil {
+		return fmt.Errorf("fetch Sources: %w", err)
+	}
+	for _, raw := range srcs {
+		if raw.Package != pkgName {
+			continue
+		}
+		for _, sf := range raw.Files {
+			if sf.Filename != filename {
+				continue
+			}
+			data, err := f.DownloadSourceFile(ctx, raw.Directory, filename, sf.SHA256)
+			if err != nil {
+				return err
+			}
+			return s.store.PutFile(ctx, srcPath, bytes.NewReader(data), int64(len(data)))
+		}
+		return fmt.Errorf("file %s not listed in source package %s", filename, pkgName)
+	}
+	return fmt.Errorf("source package %s not found upstream", pkgName)
+}
+
+// downloadAndCacheSourceFile downloads one file using a stored SourceEntry.
+func (s *Server) downloadAndCacheSourceFile(ctx context.Context, entry model.SourceEntry, upstreamName, filename string) error {
+	var us *model.UpstreamSource
+	for _, layout := range s.cfg.ResolvedLayouts {
+		if layout.OS != entry.OS || layout.Codename != entry.Codename || layout.Component != entry.Component {
+			continue
+		}
+		for i := range layout.Upstreams {
+			if layout.Upstreams[i].Name == upstreamName {
+				us = &layout.Upstreams[i]
+				break
+			}
+		}
+		if us != nil {
+			break
+		}
+	}
+	if us == nil {
+		return fmt.Errorf("upstream %q not found in config", upstreamName)
+	}
+	in := ingest.New(s.store, s.index, s.client, s.notifier, nil)
+	return in.CacheSourceFile(ctx, entry, *us, filename)
 }
 
 // pullThrough resolves poolPath to an available upstream package and caches it
@@ -527,6 +667,25 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 		stanzas[r.key.comp][r.key.arch] = r.list
 	}
 
+	// Build source stanzas for components that have upstream Sources data.
+	var sourceStanzas map[string][]string
+	if av.Srcs != nil {
+		sourceStanzas = make(map[string][]string, len(av.Srcs))
+		for comp, srcMap := range av.Srcs {
+			stanzaList := make([]string, 0, len(srcMap))
+			// Sort by package name for deterministic output.
+			names := make([]string, 0, len(srcMap))
+			for name := range srcMap {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				stanzaList = append(stanzaList, srcMap[name].StanzaStr)
+			}
+			sourceStanzas[comp] = stanzaList
+		}
+	}
+
 	sink := newMemSink()
 	in := publish.SuiteInput{
 		OS:              av.OS,
@@ -538,6 +697,7 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 		Architectures:   arches,
 		Components:      components,
 		Stanzas:         stanzas,
+		SourceStanzas:   sourceStanzas,
 		Date:            time.Now(),
 		FastCompression: true,
 	}
@@ -637,6 +797,7 @@ func httpCacheControl(urlPath string) string {
 		}
 		return "public, max-age=31536000, immutable"
 	default:
+		// pool/, src/, and pinned snapshot paths are all immutable.
 		return "public, max-age=31536000, immutable"
 	}
 }

@@ -4,6 +4,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -103,4 +104,42 @@ func (in *Ingestor) Cache(ctx context.Context, osName, codename string, p avail.
 		FirstSeen: metadata.Now(),
 	}
 	return in.index.UpsertEntry(ctx, entry)
+}
+
+// CacheSourceFile downloads one source package file from the upstream and
+// stores it under src/. It is idempotent: if the file is already present it
+// returns immediately without verifying the content.
+func (in *Ingestor) CacheSourceFile(ctx context.Context, entry model.SourceEntry, us model.UpstreamSource, filename string) error {
+	var srcFile *model.SourceFile
+	for i := range entry.Files {
+		if entry.Files[i].Filename == filename {
+			srcFile = &entry.Files[i]
+			break
+		}
+	}
+	if srcFile == nil {
+		return fmt.Errorf("file %s not listed in source entry %s %s", filename, entry.Package, entry.Version)
+	}
+
+	filePath := model.SourceFilePath(entry.OS, entry.Codename, entry.Upstream, entry.Component, entry.Package, filename)
+
+	exists, err := in.store.Exists(ctx, filePath)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	slog.Debug("downloading source file", "package", entry.Package, "version", entry.Version, "file", filename, "upstream", entry.Upstream)
+	f := upstream.NewFetcher(us, in.client)
+	data, err := f.DownloadSourceFile(ctx, entry.UpstreamDir, filename, string(srcFile.SHA256))
+	if err != nil {
+		return err
+	}
+	if err := in.store.PutFile(ctx, filePath, bytes.NewReader(data), int64(len(data))); err != nil {
+		return err
+	}
+	slog.Info("cached source file", "package", entry.Package, "version", entry.Version, "file", filename, "upstream", entry.Upstream)
+	return nil
 }

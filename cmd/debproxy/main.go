@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -46,6 +47,8 @@ func main() {
 		os.Exit(runPrime(os.Args[2:]))
 	case "publish-key":
 		os.Exit(runPublishKey(os.Args[2:]))
+	case "cleanup":
+		os.Exit(runCleanup(os.Args[2:]))
 	case "healthcheck":
 		os.Exit(runHealthcheck(os.Args[2:]))
 	case "version":
@@ -105,6 +108,7 @@ func usage() {
   debproxy rebuild [--config path] [--reset]
   debproxy update [--config path]
   debproxy snapshot [--config path]
+  debproxy cleanup [--config path]
   debproxy prime [--config path] --os debian --codename trixie --component main --pkg name[,name...]
   debproxy publish-key [--config path]
   debproxy healthcheck [--addr http://localhost:8080]
@@ -249,6 +253,57 @@ func runSnapshot(args []string) int {
 	}
 	slog.Info("snapshot complete")
 	return 0
+}
+
+func runCleanup(args []string) int {
+	cfg, err := loadConfig(args)
+	if err != nil {
+		slog.Error("load config", "err", err)
+		return 1
+	}
+	store, index, err := openBackends(context.Background(), cfg)
+	if err != nil {
+		slog.Error("open backends", "err", err)
+		return 1
+	}
+	key, err := loadKey(cfg)
+	if err != nil {
+		slog.Error("load signing key", "err", err)
+		return 1
+	}
+	maxAge, err := parseDuration(cfg.MaxSnapshotAge)
+	if err != nil {
+		slog.Error("invalid max_snapshot_age", "value", cfg.MaxSnapshotAge, "err", err)
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
+	if err := s.Cleanup(ctx, cfg.MaxSnapshots, maxAge, time.Now()); err != nil {
+		slog.Error("cleanup", "err", err)
+		return 1
+	}
+	if err := index.Flush(ctx); err != nil {
+		slog.Error("flush index", "err", err)
+		return 1
+	}
+	slog.Info("cleanup complete")
+	return 0
+}
+
+// parseDuration extends time.ParseDuration with "d" suffix support (e.g. "30d" = 720h).
+func parseDuration(s string) (time.Duration, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	if strings.HasSuffix(s, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
 }
 
 func runPrime(args []string) int {
@@ -429,6 +484,11 @@ func runServe(args []string) int {
 		slog.Error("invalid snapshot_schedule", "value", cfg.SnapshotSchedule, "err", err)
 		return 1
 	}
+	cleanupSched, err := parseSnapshotSchedule(cfg.CleanupSchedule)
+	if err != nil {
+		slog.Error("invalid cleanup_schedule", "value", cfg.CleanupSchedule, "err", err)
+		return 1
+	}
 
 	syncr := syncerpkg.New(cfg, store, index, key, httpClient, indexCache, notifier)
 	if err := syncr.PreloadExistsCache(context.Background()); err != nil {
@@ -443,6 +503,7 @@ func runServe(args []string) int {
 	stopMerge := startPeriodicMerge(index, time.Hour)
 	stopRefresher := startIndexRefresher(cfg, httpClient, indexCache, refreshInterval, syncr)
 	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched)
+	stopCleaner := startPeriodicCleanup(syncr, cleanupSched, cfg)
 
 	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier).Handler()}
 	go func() {
@@ -468,6 +529,7 @@ func runServe(args []string) int {
 
 	stopRefresher()
 	stopSnapshotter()
+	stopCleaner()
 	stopMerge()
 	stopFlush()
 	return 0
@@ -651,6 +713,43 @@ func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched) func() 
 				slog.Info("publishing scheduled snapshot")
 				if err := syncr.Snapshot(ctx, time.Now()); err != nil {
 					slog.Warn("scheduled snapshot failed", "err", err)
+				}
+				cancel()
+			case <-stop:
+				return
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+// startPeriodicCleanup runs snapshot pruning and pool GC on the configured schedule.
+func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *config.Config) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if sched.kind == "" {
+			<-stop
+			return
+		}
+		for {
+			next := nextSnapshotAfter(sched, time.Now())
+			slog.Info("next scheduled cleanup", "at", next.Format(time.RFC3339))
+			select {
+			case <-time.After(time.Until(next)):
+				maxAge, err := parseDuration(cfg.MaxSnapshotAge)
+				if err != nil {
+					slog.Warn("scheduled cleanup: invalid max_snapshot_age", "err", err)
+					continue
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+				slog.Info("running scheduled cleanup")
+				if err := syncr.Cleanup(ctx, cfg.MaxSnapshots, maxAge, time.Now()); err != nil {
+					slog.Warn("scheduled cleanup failed", "err", err)
 				}
 				cancel()
 			case <-stop:

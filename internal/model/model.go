@@ -28,7 +28,10 @@ type UpstreamSource struct {
 	Component  string
 	Archs      []string
 	AutoUpdate bool
-	VerifyKeys openpgp.EntityList
+	// FetchSources enables pull-through of deb-src (source package) requests for
+	// this upstream within the component it was resolved for.
+	FetchSources bool
+	VerifyKeys   openpgp.EntityList
 	// Username and Password are used for HTTP Basic Auth (e.g. Ubuntu ESM/Pro).
 	// Leave empty for unauthenticated upstreams.
 	Username string
@@ -85,6 +88,46 @@ type UpstreamPackageState struct {
 	Arch            string
 	UpstreamVersion string
 	LastChecked     time.Time
+}
+
+// SourceFile is one file belonging to a source package.
+type SourceFile struct {
+	Filename string
+	Size     int64
+	SHA256   Digest
+}
+
+// SourceEntry records one source package's placement within a layout component.
+type SourceEntry struct {
+	OS          string
+	Codename    string
+	Component   string
+	Package     string
+	Version     string
+	Upstream    string
+	// LocalDir is the storage directory for this source package's files:
+	// src/{os}/{codename}/{upstream}/{component}/{letter}/{name}
+	LocalDir    string
+	// UpstreamDir is the upstream's original Directory: field, used for pull-through.
+	UpstreamDir string
+	Files       []SourceFile
+	// Stanza is the full deb822 Sources stanza with Directory: rewritten to LocalDir.
+	Stanza      string
+	FirstSeen   time.Time
+}
+
+// SourceDir returns the storage directory for a source package's files.
+func SourceDir(osName, codename, upstreamName, component, name string) string {
+	first := "_"
+	if name != "" {
+		first = strings.ToLower(name[:1])
+	}
+	return path.Join("src", osName, codename, upstreamName, component, first, name)
+}
+
+// SourceFilePath returns the storage path for a single source package file.
+func SourceFilePath(osName, codename, upstreamName, component, name, filename string) string {
+	return SourceDir(osName, codename, upstreamName, component, name) + "/" + filename
 }
 
 // PoolPath builds the storage path for a package under pool/{os}/{codename}/{upstream}/...

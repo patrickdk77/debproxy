@@ -27,6 +27,12 @@ Two namespaces share one storage root (filesystem directory or S3 prefix):
 the original Debian filename. Shared across all snapshots; never duplicated per
 snapshot.
 
+**`src/`** -- source package file store. One copy of each source file (`.dsc`,
+`.orig.tar.*`, `.debian.tar.*`), keyed by
+`src/{os}/{codename}/{upstream}/{component}/{letter}/{name}/{filename}`. Populated
+on demand via pull-through; only present when `sources: true` is set on the
+component layout and a client has requested source files.
+
 **Per-snapshot `dists/`** -- write-once signed metadata only. Each snapshot lives
 under `{snapshot-id}/{os}/dists/{codename}/`. `Packages` entries point at the global
 pool via relative `Filename:` paths. `current/{os}` is a small text file containing
@@ -41,12 +47,16 @@ Example on-disk layout:
 ```
 root/
   pool/debian/trixie/debian-security/main/a/apt/apt_2.6.1_amd64.deb
+  src/debian/trixie/debian-main/main/a/apt/apt_2.6.1.dsc      # source file (pull-through)
+  src/debian/trixie/debian-main/main/a/apt/apt_2.6.1.orig.tar.xz
   2026-06-29/debian/dists/trixie/InRelease
   2026-06-29/debian/dists/trixie/main/binary-amd64/Packages.gz
+  2026-06-29/debian/dists/trixie/main/source/Sources.gz        # generated when sources: true
   current/debian                           # contains "2026-06-29"
   keys/debproxy.asc
   keys/ABCDEF1234....asc
   metadata/index/debian/trixie/main/amd64.packages.zst
+  metadata/index/debian/trixie/main/sources.zst                # source entry metadata
   metadata/upstream/debian-main.state.zst
 ```
 
@@ -58,10 +68,12 @@ On S3 these are simply key prefixes within the configured bucket/prefix.
 |---|---|
 | `/live/{os}/{codename}/dists/...` | Dynamically generated, merged from all upstreams; cached in memory for 5 minutes |
 | `/live/{os}/{codename}/pool/...` | Pool file with lazy pull-through from upstream |
+| `/live/{os}/{codename}/src/...` | Source file with lazy pull-through from upstream (requires `sources: true`) |
 | `/current/{os}/dists/...` | Resolves to newest published snapshot |
 | `/{snapshot-id}/{os}/dists/...` | Reads from `{snapshot-id}/{os}/dists/...` in storage |
 | `/{date}/{os}/dists/...` | Resolves to newest snapshot with timestamp <= date |
 | `/{selector}/{os}/pool/...` | Pool file (no pull-through for pinned snapshots) |
+| `/{selector}/{os}/src/...` | Source file (no pull-through for pinned snapshots) |
 | `/keys/...` | Published signing key files |
 | `/healthz` | Always 200 OK |
 

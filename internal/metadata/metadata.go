@@ -36,6 +36,15 @@ type MetadataIndex interface {
 
 	UpsertUpstreamState(ctx context.Context, state model.UpstreamPackageState) error
 	GetUpstreamState(ctx context.Context, upstream, name, arch string) (*model.UpstreamPackageState, error)
+
+	// UpsertSourceEntry inserts or updates a source package record.
+	UpsertSourceEntry(ctx context.Context, entry model.SourceEntry) error
+	// ListSourceEntries returns source entries matching the selector (empty fields match any).
+	// Arch is ignored for source entries since sources are architecture-independent.
+	ListSourceEntries(ctx context.Context, sel model.Selector) ([]model.SourceEntry, error)
+	// FindSourceEntry returns the matching source entry; if version is empty, the highest
+	// version within the selector is returned. Returns nil if not found.
+	FindSourceEntry(ctx context.Context, sel model.Selector, pkg, version string) (*model.SourceEntry, error)
 }
 
 // Now returns the current time (overridable in tests).

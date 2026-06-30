@@ -39,6 +39,19 @@ type Config struct {
 	//   Go duration string     — every N hours/minutes with jitter (e.g. "24h")
 	// Empty string or "0" disables automatic snapshots.
 	SnapshotSchedule string `yaml:"snapshot_schedule"`
+	// MaxSnapshots is the maximum number of snapshots to retain. A snapshot is
+	// only deleted when BOTH MaxSnapshots and MaxSnapshotAge are exceeded.
+	// 0 disables count-based pruning.
+	MaxSnapshots int `yaml:"max_snapshots"`
+	// MaxSnapshotAge is the maximum age of a snapshot before it becomes eligible
+	// for deletion. Accepts a Go duration string with optional "d" suffix for days
+	// (e.g. "90d", "720h"). A snapshot is only deleted when BOTH MaxSnapshots and
+	// MaxSnapshotAge are exceeded. Empty string or "0" disables age-based pruning.
+	MaxSnapshotAge string `yaml:"max_snapshot_age"`
+	// CleanupSchedule controls when the server automatically runs snapshot pruning
+	// and pool GC while in serve mode. Accepts the same format as SnapshotSchedule.
+	// Empty string or "0" disables automatic cleanup.
+	CleanupSchedule string `yaml:"cleanup_schedule"`
 
 	ResolvedLayouts []model.Layout `yaml:"-"`
 }
@@ -94,6 +107,9 @@ type ComponentLayout struct {
 	Component     string   `yaml:"component"`
 	Architectures []string `yaml:"architectures"`
 	Upstreams     []string `yaml:"upstreams"`
+	// Sources enables pull-through of deb-src (source package) requests for
+	// this component. When true, FetchSources is set on each resolved UpstreamSource.
+	Sources bool `yaml:"sources"`
 }
 
 // Load reads and validates configuration from path.
@@ -225,15 +241,16 @@ func (c *Config) resolveLayouts() error {
 					}
 
 					upstreams = append(upstreams, model.UpstreamSource{
-						Name:       upName,
-						URL:        def.URL,
-						Suite:      suite,
-						Component:  component,
-						Archs:      upArchs,
-						AutoUpdate: def.AutoUpdate,
-						VerifyKeys: keyrings[upName],
-						Username:   def.Username,
-						Password:   expandEnvRef(def.Password),
+						Name:         upName,
+						URL:          def.URL,
+						Suite:        suite,
+						Component:    component,
+						Archs:        upArchs,
+						AutoUpdate:   def.AutoUpdate,
+						FetchSources: comp.Sources,
+						VerifyKeys:   keyrings[upName],
+						Username:     def.Username,
+						Password:     expandEnvRef(def.Password),
 					})
 				}
 

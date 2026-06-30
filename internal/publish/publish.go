@@ -42,6 +42,10 @@ type SuiteInput struct {
 	Components    []string
 	// Stanzas[component][arch] holds rendered Packages stanzas.
 	Stanzas map[string]map[string][]string
+	// SourceStanzas[component] holds rendered Sources stanzas. When non-nil,
+	// {component}/source/Sources (and compressed variants) are written for each
+	// component that has at least one stanza.
+	SourceStanzas map[string][]string
 	// Date overrides the Release Date (zero = now).
 	Date time.Time
 	// FastCompression selects speed over ratio (level 1 / fastest presets).
@@ -185,6 +189,48 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 				return err
 			}
 			files = append(files, cf.hf)
+		}
+	}
+
+	// Generate source/Sources files for components that have source stanzas.
+	for comp, stanzas := range in.SourceStanzas {
+		if len(stanzas) == 0 {
+			continue
+		}
+		content := []byte(strings.Join(stanzas, "\n"))
+		if len(content) > 0 && content[len(content)-1] != '\n' {
+			content = append(content, '\n')
+		}
+		sum256 := sha256.Sum256(content)
+		sum512 := sha512.Sum512(content)
+		plain := hashedFile{
+			rel:    comp + "/source/Sources",
+			size:   int64(len(content)),
+			sha256: hex.EncodeToString(sum256[:]),
+			sha512: hex.EncodeToString(sum512[:]),
+		}
+		if err := sink.WriteFile(ctx, path.Join(distRoot, plain.rel), bytes.NewReader(content), plain.size); err != nil {
+			return err
+		}
+		files = append(files, plain)
+
+		for _, v := range variants {
+			compressed, err := v.fn(content)
+			if err != nil {
+				return err
+			}
+			cs256 := sha256.Sum256(compressed)
+			cs512 := sha512.Sum512(compressed)
+			hf := hashedFile{
+				rel:    comp + "/source/Sources" + v.suffix,
+				size:   int64(len(compressed)),
+				sha256: hex.EncodeToString(cs256[:]),
+				sha512: hex.EncodeToString(cs512[:]),
+			}
+			if err := sink.WriteFile(ctx, path.Join(distRoot, hf.rel), bytes.NewReader(compressed), hf.size); err != nil {
+				return err
+			}
+			files = append(files, hf)
 		}
 	}
 

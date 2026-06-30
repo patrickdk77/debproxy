@@ -119,6 +119,36 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 
 	for k := range s.layoutsByOSCodename() {
 		av := avail.Build(ctx, s.cfg, s.client, cache, k.osName, k.codename)
+
+		// Record source entries from upstream Sources indices.
+		for comp, srcMap := range av.Srcs {
+			for _, sp := range srcMap {
+				files := make([]model.SourceFile, len(sp.Files))
+				for i, f := range sp.Files {
+					files[i] = model.SourceFile{
+						Filename: f.Filename,
+						Size:     f.Size,
+						SHA256:   model.Digest(f.SHA256),
+					}
+				}
+				entry := model.SourceEntry{
+					OS:          k.osName,
+					Codename:    k.codename,
+					Component:   comp,
+					Package:     sp.Package,
+					Version:     sp.Version,
+					Upstream:    sp.Upstream.Name,
+					LocalDir:    sp.LocalDir,
+					UpstreamDir: sp.UpstreamDir,
+					Files:       files,
+					Stanza:      sp.StanzaStr,
+				}
+				if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
+					slog.Warn("upsert source entry", "package", sp.Package, "version", sp.Version, "err", err)
+				}
+			}
+		}
+
 		entries, err := s.index.ListEntries(ctx, model.Selector{OS: k.osName, Codename: k.codename})
 		if err != nil {
 			return err
@@ -210,6 +240,12 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 	components, arches := s.componentsAndArches(osName, codename)
 	stanzas := groupStanzas(entries, components, arches)
 
+	srcEntries, err := s.index.ListSourceEntries(ctx, model.Selector{OS: osName, Codename: codename})
+	if err != nil {
+		return err
+	}
+	sourceStanzas := groupSourceStanzas(srcEntries, components)
+
 	in := publish.SuiteInput{
 		OS:            osName,
 		Codename:      codename,
@@ -220,6 +256,7 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 		Architectures: arches,
 		Components:    components,
 		Stanzas:       stanzas,
+		SourceStanzas: sourceStanzas,
 		Date:          now,
 	}
 	return publish.GenerateSuite(ctx, sink, prefix, in, s.key)
@@ -249,9 +286,51 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
+// groupSourceStanzas builds SourceStanzas[component] from source entries.
+// When the metadata holds multiple versions of the same source package, only
+// the highest version is included in the snapshot.
+// Returns nil when there are no source entries at all.
+func groupSourceStanzas(entries []model.SourceEntry, components []string) map[string][]string {
+	if len(entries) == 0 {
+		return nil
+	}
+	// Keep only the highest version per (component, package).
+	type key struct{ comp, pkg string }
+	best := map[key]model.SourceEntry{}
+	for _, e := range entries {
+		k := key{e.Component, e.Package}
+		if existing, ok := best[k]; !ok || debversion.Compare(e.Version, existing.Version) > 0 {
+			best[k] = e
+		}
+	}
+	out := map[string][]string{}
+	for _, comp := range components {
+		out[comp] = nil
+	}
+	for k, e := range best {
+		if _, ok := out[k.comp]; ok {
+			out[k.comp] = append(out[k.comp], e.Stanza)
+		}
+	}
+	return out
+}
+
 // groupStanzas builds Stanzas[component][arch], fanning Architecture: all
 // packages into every binary-arch index per Debian convention.
+// When the metadata holds multiple versions of the same package (e.g. after an
+// auto_update download), only the highest version is included in the snapshot.
 func groupStanzas(entries []model.IndexEntry, components, arches []string) map[string]map[string][]string {
+	// Phase 1: for each (component, arch, package) keep only the highest version.
+	type key struct{ comp, arch, pkg string }
+	best := map[key]model.IndexEntry{}
+	for _, e := range entries {
+		k := key{e.Component, e.Arch, e.Package}
+		if existing, ok := best[k]; !ok || debversion.Compare(e.Version, existing.Version) > 0 {
+			best[k] = e
+		}
+	}
+
+	// Phase 2: build output, fanning arch=all into every arch.
 	out := map[string]map[string][]string{}
 	for _, comp := range components {
 		out[comp] = map[string][]string{}
@@ -259,19 +338,17 @@ func groupStanzas(entries []model.IndexEntry, components, arches []string) map[s
 			out[comp][arch] = nil
 		}
 	}
-	for _, e := range entries {
-		comp := out[e.Component]
+	for k, e := range best {
+		comp := out[k.comp]
 		if comp == nil {
 			continue
 		}
-		if e.Arch == "all" {
+		if k.arch == "all" {
 			for _, arch := range arches {
 				comp[arch] = append(comp[arch], e.Control)
 			}
-			continue
-		}
-		if _, ok := comp[e.Arch]; ok {
-			comp[e.Arch] = append(comp[e.Arch], e.Control)
+		} else if _, ok := comp[k.arch]; ok {
+			comp[k.arch] = append(comp[k.arch], e.Control)
 		}
 	}
 	return out

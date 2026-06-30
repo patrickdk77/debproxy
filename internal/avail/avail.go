@@ -34,6 +34,18 @@ type Pkg struct {
 	StanzaStr  string // verbatim upstream stanza with Filename rewritten to PoolPath
 }
 
+// SrcPkg is one source package version selected for a component.
+type SrcPkg struct {
+	Package     string
+	Version     string
+	Component   string
+	UpstreamDir string // upstream's original Directory: field (for pull-through)
+	LocalDir    string // our src/ storage directory
+	Files       []apt.RawSrcFile
+	Upstream    model.UpstreamSource
+	StanzaStr   string // Sources stanza with Directory: rewritten to LocalDir
+}
+
 // Available is the merged view for one os/codename across all its components.
 type Available struct {
 	OS               string
@@ -44,6 +56,9 @@ type Available struct {
 	// Pkgs[component][arch][name] = selected package.
 	Pkgs       map[string]map[string]map[string]Pkg
 	ByPoolPath map[string]Pkg
+	// Srcs[component][name] = selected source package. Only populated when at
+	// least one upstream in the layout has FetchSources set.
+	Srcs map[string]map[string]SrcPkg
 }
 
 // upstreamResult holds the parsed index for one upstream source within a layout.
@@ -178,6 +193,83 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 	for a := range archSet {
 		av.Arches = append(av.Arches, a)
 	}
+
+	// Fetch Sources indices for upstreams with FetchSources enabled.
+	type srcWork struct {
+		component string
+		src       model.UpstreamSource
+	}
+	var srcJobs []srcWork
+	for _, layout := range cfg.ResolvedLayouts {
+		if layout.OS != osName || layout.Codename != codename {
+			continue
+		}
+		for _, src := range layout.Upstreams {
+			if src.FetchSources {
+				srcJobs = append(srcJobs, srcWork{layout.Component, src})
+			}
+		}
+	}
+
+	if len(srcJobs) > 0 {
+		av.Srcs = map[string]map[string]SrcPkg{}
+		type srcResult struct {
+			component string
+			src       model.UpstreamSource
+			raws      []apt.RawSrc
+		}
+		srcResults := make([]srcResult, len(srcJobs))
+		var srcWg sync.WaitGroup
+		for i, j := range srcJobs {
+			srcWg.Add(1)
+			go func(i int, j srcWork) {
+				defer srcWg.Done()
+				f := upstream.NewFetcher(j.src, client)
+				raws, err := f.FetchSources(ctx)
+				if err != nil {
+					slog.Warn("upstream Sources unavailable, skipping",
+						"upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
+					return
+				}
+				slog.Debug("fetched upstream Sources", "upstream", j.src.Name, "component", j.src.Component, "packages", len(raws))
+				srcResults[i] = srcResult{j.component, j.src, raws}
+			}(i, j)
+		}
+		srcWg.Wait()
+
+		for _, r := range srcResults {
+			if r.raws == nil {
+				continue
+			}
+			if av.Srcs[r.component] == nil {
+				av.Srcs[r.component] = map[string]SrcPkg{}
+			}
+			for _, raw := range r.raws {
+				if raw.Package == "" || raw.Version == "" {
+					continue
+				}
+				if existing, ok := av.Srcs[r.component][raw.Package]; ok {
+					if strings.Compare(raw.Version, existing.Version) <= 0 {
+						continue
+					}
+				}
+				localDir := model.SourceDir(osName, codename, r.src.Name, r.component, raw.Package)
+				files := make([]apt.RawSrcFile, len(raw.Files))
+				copy(files, raw.Files)
+				av.Srcs[r.component][raw.Package] = SrcPkg{
+					Package:     raw.Package,
+					Version:     raw.Version,
+					Component:   r.component,
+					UpstreamDir: raw.Directory,
+					LocalDir:    localDir,
+					Files:       files,
+					Upstream:    r.src,
+					StanzaStr:   raw.WithDirectory(localDir),
+				}
+			}
+		}
+	}
+
 	return av
 }
 

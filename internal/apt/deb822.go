@@ -70,7 +70,11 @@ func (p *Paragraph) WriteTo(w io.Writer) (int64, error) {
 		v := p.values[p.lkeys[i]]
 		var line string
 		if strings.Contains(v, "\n") {
-			line = k + ":\n" + indentContinuation(v) + "\n"
+			// Trim a leading \n that arises when a field has an empty first line
+			// (e.g. "Checksums-Sha256:\n hash size file") and ParseParagraphs stores
+			// it as "\nhash size file". Without the trim, WriteTo would emit a blank
+			// continuation line before the first real entry.
+			line = k + ":\n" + indentContinuation(strings.TrimPrefix(v, "\n")) + "\n"
 		} else {
 			line = k + ": " + v + "\n"
 		}

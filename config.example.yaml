@@ -18,6 +18,21 @@
 # Omit or set to "0" to disable — use `debproxy snapshot` to publish manually.
 # snapshot_schedule: "sunday@03:00"
 
+# max_snapshots and max_snapshot_age together define the snapshot retention policy.
+# A snapshot is only deleted when BOTH limits are exceeded — it must be beyond the
+# count limit AND older than the age limit. This prevents deleting recent snapshots
+# even if you have accumulated many of them.
+#   max_snapshots: 30          keep the 30 most-recent snapshots; excess + old ones are pruned
+#   max_snapshot_age: "90d"    a snapshot must be older than 90 days to be eligible
+# Accepts a Go duration string for max_snapshot_age; "d" suffix supported (e.g. "30d", "720h").
+# max_snapshots: 30
+# max_snapshot_age: "90d"
+
+# cleanup_schedule controls when the server automatically prunes old snapshots and
+# runs pool GC while in serve mode. Accepts the same format as snapshot_schedule.
+# Omit or set to "0" to disable — use `debproxy cleanup` to run manually.
+# cleanup_schedule: "sunday@04:00"
+
 storage:
   backend: filesystem   # filesystem | s3
   filesystem:
@@ -147,6 +162,7 @@ layouts:
         components:
           - component: main
             upstreams: [debian-main, debian-security]
+            # sources: true   # enable deb-src pull-through (apt-get source)
       - codename: bookworm
         components:
           - component: main
