@@ -30,6 +30,23 @@ type FileSink interface {
 	WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error
 }
 
+// Compression controls which formats are produced and at what level.
+// GZip and ZStd use 0 to disable. Positive ZStd levels are mapped via
+// zstd.EncoderLevelFromZstd for best-match to the encoder's internal presets.
+type Compression struct {
+	GZip int  // 0=disabled, 1-9=gzip level
+	ZStd int  // 0=disabled, positive mapped via EncoderLevelFromZstd
+	XZ   bool // true=enabled (64 MB dict), false=disabled
+}
+
+// DefaultSnapshotCompression is the built-in default for snapshot publishing:
+// maximum compression for all formats, including xz.
+var DefaultSnapshotCompression = Compression{GZip: 9, ZStd: 11, XZ: true}
+
+// DefaultLiveCompression is the built-in default for live publishing:
+// fast compression, no xz (apt falls back to gz when xz is absent).
+var DefaultLiveCompression = Compression{GZip: 3, ZStd: 3, XZ: false}
+
 // SuiteInput describes one suite (codename) to publish.
 type SuiteInput struct {
 	OS            string
@@ -48,9 +65,10 @@ type SuiteInput struct {
 	SourceStanzas map[string][]string
 	// Date overrides the Release Date (zero = now).
 	Date time.Time
-	// FastCompression selects speed over ratio (level 1 / fastest presets).
-	// Leave false for snapshots, which are written once and served many times.
-	FastCompression bool
+	// Compression controls which index formats are produced and at what level.
+	// Zero value disables all formats — callers should set DefaultSnapshotCompression
+	// or DefaultLiveCompression, or resolve from config.
+	Compression Compression
 }
 
 type hashedFile struct {
@@ -67,21 +85,25 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 
 	var files []hashedFile
 
-	// Compression variants. xz is skipped for the live path (FastCompression)
-	// because it is ~10× slower than gz/zstd and apt falls back to gz when xz
-	// is absent from InRelease. Snapshots keep xz for maximum compression.
+	// Build the list of compression variants to produce.
+	// xz is ~10× slower than gz/zstd; apt falls back to gz when xz is absent,
+	// so it is typically only worth the cost for snapshots.
 	type compVariant struct {
 		suffix string
 		fn     func([]byte) ([]byte, error)
 	}
 	var variants []compVariant
-	if !in.FastCompression {
-		variants = append(variants, compVariant{".xz", func(d []byte) ([]byte, error) { return xzBytes(d, false) }})
+	if in.Compression.XZ {
+		variants = append(variants, compVariant{".xz", xzBytes})
 	}
-	variants = append(variants,
-		compVariant{".gz", func(d []byte) ([]byte, error) { return gzipBytes(d, in.FastCompression) }},
-		compVariant{".zst", func(d []byte) ([]byte, error) { return zstdBytes(d, in.FastCompression) }},
-	)
+	if in.Compression.GZip > 0 {
+		level := in.Compression.GZip
+		variants = append(variants, compVariant{".gz", func(d []byte) ([]byte, error) { return gzipBytes(d, level) }})
+	}
+	if in.Compression.ZStd > 0 {
+		level := in.Compression.ZStd
+		variants = append(variants, compVariant{".zst", func(d []byte) ([]byte, error) { return zstdBytes(d, level) }})
+	}
 
 	comps := append([]string(nil), in.Components...)
 	sort.Strings(comps)
@@ -312,11 +334,8 @@ func padSize(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-func xzBytes(data []byte, fast bool) ([]byte, error) {
-	dictCap := 64 << 20 // 64 MB — xz preset 9
-	if fast {
-		dictCap = 2 << 20 // 2 MB — xz preset 2
-	}
+func xzBytes(data []byte) ([]byte, error) {
+	const dictCap = 64 << 20 // 64 MB — xz preset 9
 	var buf bytes.Buffer
 	xw, err := xz.WriterConfig{DictCap: dictCap}.NewWriter(&buf)
 	if err != nil {
@@ -331,11 +350,7 @@ func xzBytes(data []byte, fast bool) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func gzipBytes(data []byte, fast bool) ([]byte, error) {
-	level := gzip.BestCompression // 9
-	if fast {
-		level = 3
-	}
+func gzipBytes(data []byte, level int) ([]byte, error) {
 	var buf bytes.Buffer
 	gw, err := gzip.NewWriterLevel(&buf, level)
 	if err != nil {
@@ -350,13 +365,10 @@ func gzipBytes(data []byte, fast bool) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func zstdBytes(data []byte, fast bool) ([]byte, error) {
-	level := zstd.SpeedBestCompression
-	if fast {
-		level = zstd.SpeedDefault // level 3
-	}
+func zstdBytes(data []byte, level int) ([]byte, error) {
+	encoderLevel := zstd.EncoderLevelFromZstd(level)
 	var buf bytes.Buffer
-	zw, err := zstd.NewWriter(&buf, zstd.WithEncoderLevel(level))
+	zw, err := zstd.NewWriter(&buf, zstd.WithEncoderLevel(encoderLevel))
 	if err != nil {
 		return nil, err
 	}

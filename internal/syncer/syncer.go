@@ -305,6 +305,7 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 		Stanzas:       stanzas,
 		SourceStanzas: sourceStanzas,
 		Date:          now,
+		Compression:   s.cfg.Storage.Compression.ResolveSnapshot(),
 	}
 	return publish.GenerateSuite(ctx, sink, prefix, in, s.key)
 }

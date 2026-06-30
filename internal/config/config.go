@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/debproxy/debproxy/internal/model"
+	"github.com/debproxy/debproxy/internal/publish"
 	"github.com/debproxy/debproxy/internal/webhook"
 )
 
@@ -64,10 +65,102 @@ type ScheduleConfig struct {
 	Cleanup string `yaml:"cleanup"`
 }
 
+// CompressionLevel is a YAML-compatible compression setting.
+// false decodes as CompressionDisabled (-1).
+// true or absent decodes as CompressionDefault (0), meaning use the built-in default.
+// A positive integer decodes as that explicit level.
+type CompressionLevel int
+
+const (
+	CompressionDisabled CompressionLevel = -1
+	CompressionDefault  CompressionLevel = 0
+)
+
+func (c *CompressionLevel) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Tag {
+	case "!!bool":
+		var b bool
+		if err := value.Decode(&b); err != nil {
+			return err
+		}
+		if b {
+			*c = CompressionDefault
+		} else {
+			*c = CompressionDisabled
+		}
+	case "!!int":
+		var n int
+		if err := value.Decode(&n); err != nil {
+			return err
+		}
+		if n < 0 {
+			return fmt.Errorf("compression level must be non-negative, got %d", n)
+		}
+		*c = CompressionLevel(n)
+	default:
+		return fmt.Errorf("compression level must be a boolean or integer, got %s", value.Tag)
+	}
+	return nil
+}
+
+// ResolveLevel maps a CompressionLevel to a concrete integer for publish.
+// CompressionDisabled returns 0 (which publish treats as disabled).
+// CompressionDefault returns def.
+// Any positive value returns itself.
+func ResolveLevel(c CompressionLevel, def int) int {
+	switch {
+	case c < 0:
+		return 0
+	case c == 0:
+		return def
+	default:
+		return int(c)
+	}
+}
+
+// CompressionFormatConfig holds per-format compression settings for one path (snapshot or live).
+type CompressionFormatConfig struct {
+	GZip  CompressionLevel `yaml:"gzip"`
+	ZStd  CompressionLevel `yaml:"zstd"`
+	XZ    CompressionLevel `yaml:"xz"`
+	BZip2 CompressionLevel `yaml:"bzip2"`
+}
+
+// CompressionConfig holds compression settings for snapshot and live publishing.
+type CompressionConfig struct {
+	Snapshot CompressionFormatConfig `yaml:"snapshot"`
+	Live     CompressionFormatConfig `yaml:"live"`
+}
+
+// ResolveSnapshot returns concrete compression settings for snapshot publishing,
+// applying built-in defaults where fields are absent or set to true.
+func (c CompressionConfig) ResolveSnapshot() publish.Compression {
+	def := publish.DefaultSnapshotCompression
+	fc := c.Snapshot
+	return publish.Compression{
+		GZip: ResolveLevel(fc.GZip, def.GZip),
+		ZStd: ResolveLevel(fc.ZStd, def.ZStd),
+		XZ:   fc.XZ != CompressionDisabled, // default=enabled; user sets false to disable
+	}
+}
+
+// ResolveLive returns concrete compression settings for live publishing,
+// applying built-in defaults where fields are absent or set to true.
+func (c CompressionConfig) ResolveLive() publish.Compression {
+	def := publish.DefaultLiveCompression
+	fc := c.Live
+	return publish.Compression{
+		GZip: ResolveLevel(fc.GZip, def.GZip),
+		ZStd: ResolveLevel(fc.ZStd, def.ZStd),
+		XZ:   fc.XZ > CompressionDefault, // default=disabled; positive level enables
+	}
+}
+
 type StorageConfig struct {
-	Backend    string           `yaml:"backend"`
-	Filesystem FilesystemConfig `yaml:"filesystem"`
-	S3         S3Config         `yaml:"s3"`
+	Backend     string              `yaml:"backend"`
+	Filesystem  FilesystemConfig    `yaml:"filesystem"`
+	S3          S3Config            `yaml:"s3"`
+	Compression CompressionConfig   `yaml:"compression"`
 }
 
 type FilesystemConfig struct {

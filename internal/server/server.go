@@ -768,18 +768,18 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 
 	sink := newMemSink()
 	in := publish.SuiteInput{
-		OS:              av.OS,
-		Codename:        av.Codename,
-		Suite:           av.Codename,
-		Origin:          "debproxy",
-		Label:           "debproxy-live",
-		Description:     "debproxy live view of " + av.OS + "/" + av.Codename,
-		Architectures:   arches,
-		Components:      components,
-		Stanzas:         stanzas,
-		SourceStanzas:   sourceStanzas,
-		Date:            time.Now(),
-		FastCompression: true,
+		OS:            av.OS,
+		Codename:      av.Codename,
+		Suite:         av.Codename,
+		Origin:        "debproxy",
+		Label:         "debproxy-live",
+		Description:   "debproxy live view of " + av.OS + "/" + av.Codename,
+		Architectures: arches,
+		Components:    components,
+		Stanzas:       stanzas,
+		SourceStanzas: sourceStanzas,
+		Date:          time.Now(),
+		Compression:   s.cfg.Storage.Compression.ResolveLive(),
 	}
 	if err := publish.GenerateSuite(ctx, sink, "", in, s.key); err != nil {
 		return nil, err

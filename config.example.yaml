@@ -49,6 +49,20 @@ storage:
   #   bucket: my-debproxy-bucket
   #   region: us-east-1
   #   prefix: ""          # optional path prefix inside the bucket
+  
+  # compression controls what formats are used for Release/Packages files.
+  # Set to false to disable a format, true to use the built-in default, or an
+  # integer to select an explicit level.
+  # Built-in defaults: snapshot gzip=9 zstd=11 xz=true; live gzip=3 zstd=3 xz=false.
+  # compression:
+  #   snapshot:
+  #     gzip: true
+  #     zstd: true
+  #     xz: false
+  #   live:
+  #     gzip: false
+  #     zstd: 3
+  #     xz: false
 
 upstreams:
   # --- Debian ---
