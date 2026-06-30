@@ -222,6 +222,10 @@ func runUpdate(args []string) int {
 		slog.Error("update", "err", err)
 		return 1
 	}
+	if err := index.Flush(ctx); err != nil {
+		slog.Error("flush index after update", "err", err)
+		return 1
+	}
 	if err := s.Snapshot(ctx, time.Now()); err != nil {
 		slog.Error("snapshot after update", "err", err)
 		return 1
@@ -355,6 +359,10 @@ func runPrime(args []string) int {
 		return 1
 	}
 	slog.Info("prime complete", "packages", names)
+	if err := index.Flush(ctx); err != nil {
+		slog.Error("flush index after prime", "err", err)
+		return 1
+	}
 	if *snapshot {
 		if err := s.Snapshot(ctx, time.Now()); err != nil {
 			slog.Error("snapshot", "err", err)
