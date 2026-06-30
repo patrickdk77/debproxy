@@ -100,7 +100,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := httptest.NewServer(server.New(cfg, store, index, repoKey, nil, nil, nil).Handler())
+	srv := httptest.NewServer(server.New(cfg, store, index, repoKey, nil, nil, nil, nil).Handler())
 	defer srv.Close()
 
 	// --- /live: verify signed Release, list package, pull-through the .deb ---
@@ -310,7 +310,7 @@ signing:
 		t.Fatalf("snapshot after update: %v", err)
 	}
 
-	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, nil).Handler())
+	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, nil, nil).Handler())
 	defer srv.Close()
 
 	body := httpGet(t, srv.URL+"/current/debian/dists/trixie/InRelease")

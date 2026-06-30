@@ -3,39 +3,43 @@
 # Set this if your mirrors require a specific UA or you want a fixed identity.
 # user_agent: "Debian APT-HTTP/1.3 (2.8.3)"
 
-# refresh_interval controls how often the server re-fetches upstream package
-# indices in the background, keeping the live-path cache warm between requests.
-# The first refresh runs 2 minutes after startup (plus random jitter).
-# Subsequent refreshes run every interval plus up to 5 minutes of random jitter.
-# Use a Go duration string (e.g. "6h", "12h", "24h"). Omit or set to "0" to disable.
-# refresh_interval: "6h"
-
-# snapshot_schedule controls when the server automatically publishes snapshots
-# while running in serve mode. Three formats are accepted:
-#   "daily@HH:MM"    every day at a fixed UTC time           e.g. "daily@03:00"
-#   "day@HH:MM"      every week on that day at a fixed time  e.g. "sunday@03:00"
-#   Go duration      every N hours with up to 5 min jitter   e.g. "24h"
-# Omit or set to "0" to disable — use `debproxy snapshot` to publish manually.
-# snapshot_schedule: "sunday@03:00"
-
-# max_snapshots and max_snapshot_age together define the snapshot retention policy.
-# A snapshot is only deleted when BOTH limits are exceeded — it must be beyond the
-# count limit AND older than the age limit. This prevents deleting recent snapshots
-# even if you have accumulated many of them.
-#   max_snapshots: 30          keep the 30 most-recent snapshots; excess + old ones are pruned
-#   max_snapshot_age: "90d"    a snapshot must be older than 90 days to be eligible
-# Accepts a Go duration string for max_snapshot_age; "d" suffix supported (e.g. "30d", "720h").
-# max_snapshots: 30
-# max_snapshot_age: "90d"
-
-# cleanup_schedule controls when the server automatically prunes old snapshots and
-# runs pool GC while in serve mode. Accepts the same format as snapshot_schedule.
-# Omit or set to "0" to disable — use `debproxy cleanup` to run manually.
-# cleanup_schedule: "sunday@04:00"
-
 # metrics_addr is the listen address for the Prometheus /metrics endpoint.
 # Leave commented out (or set to "") to disable metrics entirely.
 # metrics_addr: ":9090"
+
+schedule:
+  # refresh controls how often the server re-fetches upstream package
+  # indices in the background, keeping the live-path cache warm between requests.
+  # The first refresh runs 2 minutes after startup (plus random jitter).
+  # Subsequent refreshes run every interval plus up to 5 minutes of random jitter.
+  # Use a Go duration string (e.g. "6h", "12h", "24h"). Omit or set to "0" to disable.
+  refresh: 6h
+
+  # controls when the server automatically publishes snapshots
+  # while running in serve mode. Three formats are accepted:
+  #   "daily@HH:MM"    every day at a fixed UTC time           e.g. "daily@03:00"
+  #   "day@HH:MM"      every week on that day at a fixed time  e.g. "sunday@03:00"
+  #   Go duration      every N hours with up to 5 min jitter   e.g. "24h"
+  # Omit or set to "0" to disable — use `debproxy snapshot` to publish manually.
+  snapshot: sunday@03:00
+
+  # history and age together define the snapshot retention policy.
+  # A snapshot is only deleted when BOTH limits are exceeded — it must be beyond the
+  # count limit AND older than the age limit. This prevents deleting recent snapshots
+  # even if you have accumulated many of them.
+  #   history: 30   keep the 30 most-recent snapshots; excess + old ones are pruned
+  #   age: "90d"    a snapshot must be older than 90 days to be eligible
+  # Accepts a Go duration string for age; "d" suffix supported (e.g. "30d", "720h").
+  history: 30
+  age: 90d
+
+  # cleanup controls when the server automatically prunes old snapshots and
+  # runs pool GC while in serve mode.
+  # Omit or set to "0" to disable — use `debproxy cleanup` to run manually.
+  cleanup: "sunday@04:00"
+
+signing:
+  private_key: /etc/debproxy/keys/debproxy-signing.asc
 
 storage:
   backend: filesystem   # filesystem | s3
@@ -259,9 +263,6 @@ layouts:
               - ubuntu-ports-main
               - ubuntu-ports-updates
               - ubuntu-ports-security
-
-signing:
-  private_key: /etc/debproxy/keys/debproxy-signing.asc
 
 # webhooks fire an HTTP POST whenever a new .deb is downloaded from upstream.
 # Each hook renders its `body` template and POSTs to `url`. Values in `headers`

@@ -277,15 +277,15 @@ func runCleanup(args []string) int {
 		slog.Error("load signing key", "err", err)
 		return 1
 	}
-	maxAge, err := parseDuration(cfg.MaxSnapshotAge)
+	maxAge, err := parseDuration(cfg.Schedule.Age)
 	if err != nil {
-		slog.Error("invalid max_snapshot_age", "value", cfg.MaxSnapshotAge, "err", err)
+		slog.Error("invalid schedule.age", "value", cfg.Schedule.Age, "err", err)
 		return 1
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
-	if err := s.Cleanup(ctx, cfg.MaxSnapshots, maxAge, time.Now()); err != nil {
+	if err := s.Cleanup(ctx, cfg.Schedule.History, maxAge, time.Now()); err != nil {
 		slog.Error("cleanup", "err", err)
 		return 1
 	}
@@ -480,23 +480,23 @@ func runServe(args []string) int {
 	}
 
 	var refreshInterval time.Duration
-	if cfg.RefreshInterval != "" && cfg.RefreshInterval != "0" {
-		d, err := time.ParseDuration(cfg.RefreshInterval)
+	if cfg.Schedule.Refresh != "" && cfg.Schedule.Refresh != "0" {
+		d, err := time.ParseDuration(cfg.Schedule.Refresh)
 		if err != nil {
-			slog.Error("invalid refresh_interval", "value", cfg.RefreshInterval, "err", err)
+			slog.Error("invalid schedule.refresh", "value", cfg.Schedule.Refresh, "err", err)
 			return 1
 		}
 		refreshInterval = d
 	}
 
-	snapSched, err := parseSnapshotSchedule(cfg.SnapshotSchedule)
+	snapSched, err := parseSnapshotSchedule(cfg.Schedule.Snapshot)
 	if err != nil {
-		slog.Error("invalid snapshot_schedule", "value", cfg.SnapshotSchedule, "err", err)
+		slog.Error("invalid schedule.snapshot", "value", cfg.Schedule.Snapshot, "err", err)
 		return 1
 	}
-	cleanupSched, err := parseSnapshotSchedule(cfg.CleanupSchedule)
+	cleanupSched, err := parseSnapshotSchedule(cfg.Schedule.Cleanup)
 	if err != nil {
-		slog.Error("invalid cleanup_schedule", "value", cfg.CleanupSchedule, "err", err)
+		slog.Error("invalid schedule.cleanup", "value", cfg.Schedule.Cleanup, "err", err)
 		return 1
 	}
 
@@ -525,7 +525,7 @@ func runServe(args []string) int {
 		}()
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier).Handler()}
+	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier, syncr.ExistsCache()).Handler()}
 	go func() {
 		slog.Info("listening", "addr", *addr, "layouts", len(cfg.ResolvedLayouts))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -626,7 +626,7 @@ func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client
 	}
 }
 
-// snapshotSched holds a parsed snapshot_schedule value.
+// snapshotSched holds a parsed schedule.snapshot or schedule.cleanup value.
 type snapshotSched struct {
 	kind    string        // "interval", "daily", "weekly"
 	d       time.Duration // interval mode
@@ -635,7 +635,7 @@ type snapshotSched struct {
 	weekday time.Weekday  // weekly only
 }
 
-// parseSnapshotSchedule parses snapshot_schedule from config. Accepted forms:
+// parseSnapshotSchedule parses a schedule.snapshot or schedule.cleanup value. Accepted forms:
 //
 //	"daily@HH:MM"       every day at a fixed UTC time (e.g. "daily@03:00")
 //	"sunday@HH:MM"      every Sunday at a fixed UTC time (any weekday name works)
@@ -651,21 +651,21 @@ func parseSnapshotSchedule(s string) (snapshotSched, error) {
 		// No '@' — must be a plain duration.
 		d, err := time.ParseDuration(s)
 		if err != nil {
-			return snapshotSched{}, fmt.Errorf("snapshot_schedule %q: expected a duration, \"daily@HH:MM\", or \"day@HH:MM\"", s)
+			return snapshotSched{}, fmt.Errorf("schedule %q: expected a duration, \"daily@HH:MM\", or \"day@HH:MM\"", s)
 		}
 		return snapshotSched{kind: "interval", d: d}, nil
 	}
 	prefix, timePart := lower[:at], s[at+1:]
 	t, err := time.Parse("15:04", timePart)
 	if err != nil {
-		return snapshotSched{}, fmt.Errorf("snapshot_schedule %q: time must be HH:MM", s)
+		return snapshotSched{}, fmt.Errorf("schedule %q: time must be HH:MM", s)
 	}
 	if prefix == "daily" {
 		return snapshotSched{kind: "daily", hour: t.Hour(), minute: t.Minute()}, nil
 	}
 	wd, err := parseWeekday(prefix)
 	if err != nil {
-		return snapshotSched{}, fmt.Errorf("snapshot_schedule %q: unknown day %q (use daily, sunday, monday, ...)", s, prefix)
+		return snapshotSched{}, fmt.Errorf("schedule %q: unknown day %q (use daily, sunday, monday, ...)", s, prefix)
 	}
 	return snapshotSched{kind: "weekly", weekday: wd, hour: t.Hour(), minute: t.Minute()}, nil
 }
@@ -761,14 +761,14 @@ func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *con
 			slog.Info("next scheduled cleanup", "at", next.Format(time.RFC3339))
 			select {
 			case <-time.After(time.Until(next)):
-				maxAge, err := parseDuration(cfg.MaxSnapshotAge)
+				maxAge, err := parseDuration(cfg.Schedule.Age)
 				if err != nil {
-					slog.Warn("scheduled cleanup: invalid max_snapshot_age", "err", err)
+					slog.Warn("scheduled cleanup: invalid schedule.age", "err", err)
 					continue
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 				slog.Info("running scheduled cleanup")
-				if err := syncr.Cleanup(ctx, cfg.MaxSnapshots, maxAge, time.Now()); err != nil {
+				if err := syncr.Cleanup(ctx, cfg.Schedule.History, maxAge, time.Now()); err != nil {
 					slog.Warn("scheduled cleanup failed", "err", err)
 				}
 				cancel()

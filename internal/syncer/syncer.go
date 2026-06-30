@@ -49,6 +49,10 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 	return &Syncer{cfg: cfg, store: store, index: index, key: key, client: client, indexCache: indexCache, notifier: notifier, exists: &ingest.ExistsCache{}}
 }
 
+// ExistsCache returns the syncer's pool-exists cache so it can be shared with
+// the server for consistent pull-through tracking.
+func (s *Syncer) ExistsCache() *ingest.ExistsCache { return s.exists }
+
 // PreloadExistsCache populates the in-memory pool-exists cache from the current
 // metadata index so that Cache calls skip redundant storage Exists checks for
 // files already known to be present.

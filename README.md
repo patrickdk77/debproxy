@@ -6,6 +6,8 @@ Pull-through Debian/Ubuntu apt caching proxy with signed immutable snapshots.
 Stores packages in a global pool (filesystem or S3); metadata is kept in
 zstd-compressed deb822 files alongside the pool, no external database required.
 
+Snapshots for Ci/CD can be served directly from s3 or a web server as they are read-only. debproxy would only need to be running then to update for new dependencies and creation of a new snapshot. Only if using /live/ for pullthough does the debproxy serve mode is needed.
+
 See [docs/architecture.md](docs/architecture.md), [docs/design.md](docs/design.md), and [docs/todo.md](docs/todo.md) for architecture, design decisions, and implementation status.
 
 ## Quick start

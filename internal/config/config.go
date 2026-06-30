@@ -28,36 +28,40 @@ type Config struct {
 	Upstreams       map[string]UpstreamDef `yaml:"upstreams"`
 	Layouts         []OSLayout             `yaml:"layouts"`
 	Signing         SigningConfig          `yaml:"signing"`
-	// RefreshInterval controls how often the server re-fetches upstream package
-	// indices in the background. Accepts a Go duration string (e.g. "6h", "12h").
-	// Empty string or "0" disables periodic background refreshing.
-	RefreshInterval  string `yaml:"refresh_interval"`
-	// SnapshotSchedule controls when the server automatically publishes snapshots
-	// while running in serve mode. Three formats are accepted:
-	//   "daily@HH:MM"          — every day at a fixed UTC time (e.g. "daily@03:00")
-	//   "weekly@day@HH:MM"     — every week on a fixed UTC day/time (e.g. "weekly@sunday@03:00")
-	//   Go duration string     — every N hours/minutes with jitter (e.g. "24h")
-	// Empty string or "0" disables automatic snapshots.
-	SnapshotSchedule string `yaml:"snapshot_schedule"`
-	// MaxSnapshots is the maximum number of snapshots to retain. A snapshot is
-	// only deleted when BOTH MaxSnapshots and MaxSnapshotAge are exceeded.
-	// 0 disables count-based pruning.
-	MaxSnapshots int `yaml:"max_snapshots"`
-	// MaxSnapshotAge is the maximum age of a snapshot before it becomes eligible
-	// for deletion. Accepts a Go duration string with optional "d" suffix for days
-	// (e.g. "90d", "720h"). A snapshot is only deleted when BOTH MaxSnapshots and
-	// MaxSnapshotAge are exceeded. Empty string or "0" disables age-based pruning.
-	MaxSnapshotAge string `yaml:"max_snapshot_age"`
-	// CleanupSchedule controls when the server automatically runs snapshot pruning
-	// and pool GC while in serve mode. Accepts the same format as SnapshotSchedule.
-	// Empty string or "0" disables automatic cleanup.
-	CleanupSchedule string `yaml:"cleanup_schedule"`
+	Schedule        ScheduleConfig         `yaml:"schedule"`
 	// MetricsAddr is the listen address for the Prometheus metrics endpoint
 	// (e.g. ":9090"). The endpoint is exposed at /metrics on this address.
 	// Leave empty to disable metrics.
 	MetricsAddr string `yaml:"metrics_addr"`
 
 	ResolvedLayouts []model.Layout `yaml:"-"`
+}
+
+// ScheduleConfig holds all periodic scheduling settings.
+type ScheduleConfig struct {
+	// Refresh controls how often the server re-fetches upstream package indices
+	// in the background. Accepts a Go duration string (e.g. "6h", "12h").
+	// Empty string or "0" disables periodic background refreshing.
+	Refresh string `yaml:"refresh"`
+	// Snapshot controls when the server automatically publishes snapshots while
+	// running in serve mode. Three formats are accepted:
+	//   "daily@HH:MM"      every day at a fixed UTC time (e.g. "daily@03:00")
+	//   "day@HH:MM"        every week on that day (e.g. "sunday@03:00")
+	//   Go duration string every N hours with up to 5 min jitter (e.g. "24h")
+	// Empty string or "0" disables automatic snapshots.
+	Snapshot string `yaml:"snapshot"`
+	// History is the maximum number of snapshots to retain. A snapshot is only
+	// deleted when BOTH History and Age are exceeded. 0 disables count-based pruning.
+	History int `yaml:"history"`
+	// Age is the maximum age of a snapshot before it becomes eligible for deletion.
+	// Accepts a Go duration string with optional "d" suffix (e.g. "90d", "720h").
+	// A snapshot is only deleted when BOTH History and Age are exceeded.
+	// Empty string or "0" disables age-based pruning.
+	Age string `yaml:"age"`
+	// Cleanup controls when the server automatically prunes old snapshots and runs
+	// pool GC while in serve mode. Accepts the same format as Snapshot.
+	// Empty string or "0" disables automatic cleanup.
+	Cleanup string `yaml:"cleanup"`
 }
 
 type StorageConfig struct {

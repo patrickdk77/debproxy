@@ -43,6 +43,7 @@ type Server struct {
 	client     *http.Client
 	indexCache *upstream.IndexCache
 	notifier   *webhook.Notifier
+	exists     *ingest.ExistsCache // shared with syncer; nil disables re-index
 
 	mu           sync.Mutex
 	liveCache    map[string]*liveEntry   // key: os/codename
@@ -64,8 +65,10 @@ type liveEntry struct {
 	expiry time.Time
 }
 
-// New creates a Server. notifier may be nil.
-func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex, key *signing.Key, client *http.Client, indexCache *upstream.IndexCache, notifier *webhook.Notifier) *Server {
+// New creates a Server. notifier and exists may be nil.
+// exists should be the same ExistsCache used by the Syncer so that pull-through
+// re-indexing and update operations share a consistent view of indexed files.
+func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex, key *signing.Key, client *http.Client, indexCache *upstream.IndexCache, notifier *webhook.Notifier, exists *ingest.ExistsCache) *Server {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Minute}
 	}
@@ -80,6 +83,7 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 		client:       client,
 		indexCache:   indexCache,
 		notifier:     notifier,
+		exists:       exists,
 		liveCache:    map[string]*liveEntry{},
 		liveBuilding: map[string]chan struct{}{},
 		retryCancel:  map[string]context.CancelFunc{},
@@ -332,6 +336,17 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 		metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "success").Inc()
 	} else {
 		metrics.PoolHitsTotal.WithLabelValues(osLabel, cnLabel, upLabel).Inc()
+		// File is in the pool but absent from the metadata index — e.g. a
+		// prior `debproxy prime` or `debproxy update` downloaded it without
+		// flushing, so the pool file outlived the process that wrote it.
+		// Re-establish the metadata entry so the next snapshot includes it.
+		if allowPullThrough && s.exists != nil && !s.exists.Has(poolPath) {
+			if err := s.pullThrough(r.Context(), poolPath); err != nil {
+				slog.Warn("re-index pull-through", "path", poolPath, "err", err)
+				// Non-fatal: the file exists and will be served; metadata will
+				// be repaired by `debproxy rebuild` if this keeps failing.
+			}
+		}
 	}
 
 	info, err := s.store.Stat(r.Context(), poolPath)
@@ -511,7 +526,7 @@ func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
 	}
 
 	slog.Debug("pull-through", "path", poolPath, "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
-	in := ingest.New(s.store, s.index, s.client, s.notifier, nil)
+	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
 	return in.Cache(ctx, osName, codename, p)
 }
 

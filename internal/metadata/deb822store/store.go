@@ -449,6 +449,7 @@ func (s *Store) Flush(ctx context.Context) error {
 		delete(s.dirty, relPath)
 		s.mu.Unlock()
 	}
+	slog.Info("metadata saved", "files", len(dirty))
 	return nil
 }
 

@@ -1,3 +1,10 @@
+schedule:
+  refresh: 6h
+  snapshot: sunday@03:00
+  history: 30
+  age: 90d
+  cleanup: sunday@04:00
+
 storage:
   backend: filesystem
   filesystem:
