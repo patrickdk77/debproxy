@@ -561,21 +561,35 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	inReleaseURL := f.distsURL("InRelease")
 	cacheKey := inReleaseURL + "\x00" + f.src.Component
 
-	releaseBody, _, err := f.fetchVerifiedRelease(ctx)
+	releaseBody, resp, err := f.fetchVerifiedRelease(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rel, err := apt.ParseRelease(bytes.NewReader(releaseBody))
-	if err != nil {
-		return nil, fmt.Errorf("parse Release for sources: %w", err)
-	}
-	base := f.src.Component + "/source/"
 
-	// Get cached entry for Sources reuse / PDiff.
+	var rel *apt.Release
 	var cachedEntry *indexCacheEntry
 	if f.cache != nil {
 		cachedEntry, _ = f.cache.get(cacheKey)
 	}
+	if resp != nil && resp.StatusCode == http.StatusNotModified {
+		// InRelease unchanged — return cached srcs if available.
+		if cachedEntry != nil && cachedEntry.srcs != nil {
+			return cachedEntry.srcs, nil
+		}
+		if cachedEntry != nil {
+			rel = cachedEntry.release
+		}
+	}
+	if rel == nil && releaseBody != nil {
+		rel, err = apt.ParseRelease(bytes.NewReader(releaseBody))
+		if err != nil {
+			return nil, fmt.Errorf("parse Release for sources: %w", err)
+		}
+	}
+	if rel == nil {
+		return nil, nil
+	}
+	base := f.src.Component + "/source/"
 
 	// Cache hit: if SHA256 unchanged, return cached srcs immediately.
 	if cachedEntry != nil && cachedEntry.srcsRelease != nil && cachedEntry.srcs != nil {

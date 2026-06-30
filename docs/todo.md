@@ -1,3 +1,2 @@
 # TODOs
 
-- Prometheus metrics endpoint

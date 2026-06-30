@@ -1,6 +1,6 @@
 # debproxy
 
-CICD apt caching server, do not let your build fail from a connection issue, ubuntu ddos, server maintenance, or other problems.
+CI/CD apt caching server, do not let your build fail from a connection issue, Ubuntu DDoS, server maintenance, or other problems. Create snapshots your CI/CD chain pulls from, so you have immutable source of what is allowed, and package listing that only have what is available in the snapshot and not the whole upstream package listing. The snapshots protect against drift between rebuilds to provide consistent package install candidates. Testing is showing 20-30s time saved pulling from a snapshot vs live data due to apt having to process the complete package archive vs only what previous CI/CD builds have pulled in.
 
 Pull-through Debian/Ubuntu apt caching proxy with signed immutable snapshots.
 Stores packages in a global pool (filesystem or S3); metadata is kept in
