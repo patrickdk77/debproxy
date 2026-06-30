@@ -19,7 +19,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: debproxy
-          image: ghcr.io/example/debproxy:latest
+          image: patrickdk/debproxy:latest
           args: ["serve", "--config", "/etc/debproxy/config.yaml"]
           ports:
             - containerPort: 8080
