@@ -1,0 +1,6 @@
+PLAN.md
+*.md
+coverage.out
+tmp
+debproxy
+*.deb

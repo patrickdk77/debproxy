@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: debproxy-config
+  namespace: debproxy
+data:
+  config.yaml: |
+    storage:
+      backend: filesystem
+      filesystem:
+        root: /var/lib/debproxy
+    metadata:
+      backend: mysql
+      mysql:
+        dsn: "debproxy:debproxy@tcp(mysql:3306)/debproxy?parseTime=true"
+    upstreams:
+      debian-main:
+        url: http://deb.debian.org/debian
+        keys:
+          - /etc/debproxy/keys/debian-archive.asc
+        auto_update: false
+      debian-security:
+        url: http://security.debian.org/debian-security
+        suite: "{codename}-security"
+        keys:
+          - /etc/debproxy/keys/debian-archive.asc
+        auto_update: true
+    layouts:
+      - os: debian
+        architectures: [amd64, arm64, i386, all]
+        codenames:
+          - codename: trixie
+            components:
+              - component: main
+                upstreams: [debian-main, debian-security]
+    signing:
+      private_key: /etc/debproxy/keys/debproxy.asc

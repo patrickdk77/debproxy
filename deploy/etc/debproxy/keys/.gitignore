@@ -1,0 +1,7 @@
+# Key files contain secrets — never commit them.
+*.asc
+*.gpg
+*.key
+
+# Allow the README.
+!README

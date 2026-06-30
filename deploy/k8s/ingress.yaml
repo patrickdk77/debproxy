@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: debproxy
+  namespace: debproxy
+spec:
+  rules:
+    - host: debproxy.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: debproxy
+                port:
+                  number: 8080

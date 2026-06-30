@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: debproxy
+  namespace: debproxy
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: debproxy
+  template:
+    metadata:
+      labels:
+        app: debproxy
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: debproxy
+          image: ghcr.io/example/debproxy:latest
+          args: ["serve", "--config", "/etc/debproxy/config.yaml"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DEBPROXY_METADATA_MYSQL_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: debproxy-keys
+                  key: mysql-dsn
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/debproxy
+            - name: keys
+              mountPath: /etc/debproxy/keys
+              readOnly: true
+            - name: pool
+              mountPath: /var/lib/debproxy
+      volumes:
+        - name: config
+          configMap:
+            name: debproxy-config
+        - name: keys
+          secret:
+            secretName: debproxy-keys
+        - name: pool
+          persistentVolumeClaim:
+            claimName: debproxy-pool

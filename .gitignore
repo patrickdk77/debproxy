@@ -1,0 +1,13 @@
+/debproxy
+/cmd/debtest/
+*.deb
+*.test
+*.out
+coverage.out
+.idea/
+.vscode/
+*.swp
+.DS_Store
+/vendor/
+config.yaml
+/tmp

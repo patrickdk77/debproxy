@@ -1,0 +1,91 @@
+services:
+
+  debproxy:
+    image: debproxy
+    command: ["serve", "--config", "/etc/debproxy/config.yaml", "--addr", ":8080"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/etc/debproxy:/etc/debproxy:ro
+      - cache:/var/lib/debproxy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/debproxy", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+  # One-shot: publish the repo signing public key to the store.
+  # Run once after initial setup: docker compose run --rm publish-key
+  publish-key:
+    image: debproxy
+    command: ["publish-key", "--config", "/etc/debproxy/config.yaml"]
+    volumes:
+      - ./deploy/etc/debproxy:/etc/debproxy:ro
+      - cache:/var/lib/debproxy
+    profiles: ["setup"]
+
+  # One-shot: seed specific packages into the cache and publish a snapshot.
+  # Example: docker compose run --rm prime
+  prime:
+    image: debproxy
+    command:
+      - prime
+      - --config
+      - /etc/debproxy/config.yaml
+      - --os
+      - debian
+      - --codename
+      - trixie
+      - --component
+      - main
+      - --pkg
+      - apt,apt-transport-https,ca-certificates
+    volumes:
+      - ./deploy/etc/debproxy:/etc/debproxy:ro
+      - cache:/var/lib/debproxy
+    profiles: ["setup"]
+
+  # Periodic update + snapshot. Run on a schedule via an external cron or
+  # systemd timer:
+  #   docker compose run --rm update
+  # Or add it to host cron:
+  #   0 * * * * docker compose -f /opt/debproxy/docker-compose.yaml run --rm update
+  update:
+    image: debproxy
+    command: ["update", "--config", "/etc/debproxy/config.yaml"]
+    volumes:
+      - ./deploy/etc/debproxy:/etc/debproxy:ro
+      - cache:/var/lib/debproxy
+    profiles: ["update"]
+
+  # On-demand snapshot without running an update job:
+  #   docker compose run --rm snapshot
+  snapshot:
+    image: debproxy
+    command: ["snapshot", "--config", "/etc/debproxy/config.yaml"]
+    volumes:
+      - ./deploy/etc/debproxy:/etc/debproxy:ro
+      - cache:/var/lib/debproxy
+    profiles: ["snapshot"]
+
+  # Print the git commit the image was built from:
+  #   docker compose run --rm version
+  version:
+    image: debproxy
+    command: ["version"]
+    profiles: ["version"]
+
+  # Rebuild the metadata index from pool files:
+  #   docker compose run --rm rebuild
+  rebuild:
+    image: debproxy
+    command: ["rebuild", "--config", "/etc/debproxy/config.yaml"]
+    volumes:
+      - ./deploy/etc/debproxy:/etc/debproxy:ro
+      - cache:/var/lib/debproxy
+    profiles: ["rebuild"]
+
+volumes:
+  cache:

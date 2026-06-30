@@ -1,0 +1,42 @@
+Place the following key files here before starting debproxy:
+
+  debian-archive-keyring.asc
+      Debian archive signing key.
+      Source: /usr/share/keyrings/debian-archive-keyring.gpg on any Debian system,
+      or: https://ftp-master.debian.org/keys/
+
+      Export in armored form:
+        gpg --dearmor < /usr/share/keyrings/debian-archive-keyring.gpg \
+          | gpg --armor > debian-archive-keyring.asc
+
+  ubuntu-archive-keyring.asc
+      Ubuntu archive signing key.
+      Source: /usr/share/keyrings/ubuntu-archive-keyring.gpg on any Ubuntu system.
+
+      Export in armored form:
+        gpg --dearmor < /usr/share/keyrings/ubuntu-archive-keyring.gpg \
+          | gpg --armor > ubuntu-archive-keyring.asc
+
+  debproxy-signing.asc
+      Debproxy's own repository signing key (private key, armored).
+      Generate a new key:
+        gpg --batch --gen-key <<EOF
+        %no-protection
+        Key-Type: EdDSA
+        Key-Curve: Ed25519
+        Name-Real: debproxy
+        Name-Email: debproxy@example.com
+        Expire-Date: 0
+        EOF
+        gpg --armor --export-secret-keys debproxy@example.com > debproxy-signing.asc
+
+      After starting the container, publish the public key to the store once:
+        docker compose run --rm publish-key
+
+      Clients add the public key with:
+        curl http://<debproxy-host>:8080/keys/debproxy.asc \
+          | sudo tee /usr/share/keyrings/debproxy.asc
+
+      And use a sources.list entry such as:
+        deb [signed-by=/usr/share/keyrings/debproxy.asc] \
+          http://<debproxy-host>:8080/current/debian trixie main
