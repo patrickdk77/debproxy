@@ -58,10 +58,11 @@ buildx:
 		--file $(DOCKERFILE_PATH) \
 		--tag $(IMAGE_NAME) \
 		.
-	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_REPO):$(GIT_VERSION_MAJOR)
 	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_REPO):$(GIT_VERSION_MAJOR).$(GIT_VERSION_MINOR)
+	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_REPO):$(GIT_VERSION_MAJOR)
 	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_REPO):latest
 
-	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_HUB):$(GIT_VERSION_MAJOR)
+	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_HUB):$(GIT_VERSION)
 	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_HUB):$(GIT_VERSION_MAJOR).$(GIT_VERSION_MINOR)
+	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_HUB):$(GIT_VERSION_MAJOR)
 	skopeo copy --all docker://$(IMAGE_NAME) docker://$(DOCKER_HUB):latest
