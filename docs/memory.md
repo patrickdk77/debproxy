@@ -57,3 +57,37 @@ The live cache holds **~1.06 GB** (gz + zst combined). Plain bytes are never all
 | **Total** | **~4.8 GB** |
 
 Reducing the number of active codenames has a roughly linear effect on both categories. Disabling a large Ubuntu codename (e.g. bionic) saves around 430 MB from the upstream cache and 220 MB from the live cache.
+
+## Rebuild spike
+
+During a background live cache rebuild the old and new entries coexist in memory until the swap completes. Peak usage is therefore steady state plus one additional live cache: ~4.8 GB + ~1.1 GB = ~5.9 GB. The old entry is dereferenced at swap and collected on the next GC cycle, so the spike is brief but real. Provision at least 6 GB to avoid OOM during a rebuild.
+
+## Configuration recommendations
+
+### Debian only (trixie + bookworm + experimental)
+
+| Component | Size |
+|---|---:|
+| Upstream package cache | ~657 MB |
+| Live cache (gz + zst) | ~250 MB |
+| Go runtime, binary, other | ~1.6 GB |
+| **Steady state** | **~2.5 GB** |
+| **Rebuild spike** | **~2.75 GB** |
+
+Debian packages average ~1,200 bytes per stanza and the live cache is small because Debian has no universe component. Provision **3 GB** to comfortably cover the rebuild spike with headroom for GC lag.
+
+### Ubuntu only (noble + jammy)
+
+| Component | Size |
+|---|---:|
+| Upstream package cache | ~735 MB |
+| Live cache (gz + zst) | ~414 MB |
+| Go runtime, binary, other | ~1.6 GB |
+| **Steady state** | **~2.75 GB** |
+| **Rebuild spike** | **~3.2 GB** |
+
+Ubuntu universe is the dominant cost; noble and jammy each carry 240,000 to 280,000 upstream packages at ~1,400 bytes per stanza, and the live cache is larger than Debian's due to universe generating four architecture files per codename. Provision **3.5 GB** to cover the rebuild spike with headroom for GC lag.
+
+### Full reference config (all codenames)
+
+Provision **6 GB** as documented in the rebuild spike section above.
