@@ -67,7 +67,7 @@ var errUnknownSelector = errors.New("unknown snapshot selector")
 type liveEntry struct {
 	av     *avail.Available
 	files  map[string][]byte
-	hashes map[string]string // file key → sha256 from Release; O(1) ETag lookup
+	hashes map[string]string // file key -> sha256 from Release; O(1) ETag lookup
 	built  time.Time
 	expiry time.Time
 }
@@ -265,7 +265,7 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 		key := path.Join(remainder...)
 		data, ok := entry.files[key]
 		if !ok {
-			// Plain index file (Packages/Sources) is never stored — serve from
+			// Plain index file (Packages/Sources) is never stored  -- serve from
 			// a compressed variant, transparently decoding if the client can't
 			// accept any of our compressed formats.
 			s.servePlainFromLive(w, r, key, entry)
@@ -303,7 +303,7 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 	info, err := s.store.StatPublished(r.Context(), relPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Plain index files are not stored — serve from a compressed variant.
+			// Plain index files are not stored  -- serve from a compressed variant.
 			s.servePublishedFromCompressed(w, r, relPath)
 			return
 		}
@@ -327,7 +327,7 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 
 // servePublishedFromCompressed serves a plain (unencoded) file by reading a
 // compressed variant from storage. Plain Packages/Sources files are never
-// stored — only compressed variants exist.
+// stored  -- only compressed variants exist.
 //
 // The ETag is the sha256 of the plain file as recorded in the Release document
 // stored alongside the snapshot. Because it is the content hash (not a hash of
@@ -376,7 +376,7 @@ func (s *Server) servePublishedFromCompressed(w http.ResponseWriter, r *http.Req
 	case compSfx == ".gz" && strings.Contains(accept, "gzip"):
 		encoding, body = "gzip", compBytes
 	case strings.Contains(accept, "gzip"):
-		// Canonical was .zst but client only accepts gzip — try a second read
+		// Canonical was .zst but client only accepts gzip  -- try a second read
 		// for the .gz variant so we avoid sending plain bytes unnecessarily.
 		if rc, err := s.store.OpenPublished(r.Context(), relPath+".gz"); err == nil {
 			if b, rerr := io.ReadAll(rc); rerr == nil {
@@ -427,7 +427,7 @@ func segAt(segs []string, i int) string {
 // servePool serves a pool .deb, pulling it (and its dependency closure) through
 // from upstream on first request when allowPullThrough is set.
 // osLabel, cnLabel, upLabel are the metric label values passed by the caller
-// from already-parsed URL segments — no re-parsing needed.
+// from already-parsed URL segments  -- no re-parsing needed.
 func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath string, allowPullThrough bool, osLabel, cnLabel, upLabel string) {
 	exists, err := s.store.Exists(r.Context(), poolPath)
 	if err != nil {
@@ -449,7 +449,7 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 		metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "success").Inc()
 	} else {
 		metrics.PoolHitsTotal.WithLabelValues(osLabel, cnLabel, upLabel).Inc()
-		// File is in the pool but absent from the metadata index — e.g. a
+		// File is in the pool but absent from the metadata index  -- e.g. a
 		// prior `debproxy prime` or `debproxy update` downloaded it without
 		// flushing, so the pool file outlived the process that wrote it.
 		// Re-establish the metadata entry so the next snapshot includes it.
@@ -912,7 +912,7 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 		return nil, nil, err
 	}
 
-	// Parse each Release file in the sink once to build a path→sha256 index.
+	// Parse each Release file in the sink once to build a path->sha256 index.
 	// This is used by servePlainFromLive for O(1) ETag lookups without re-hashing.
 	hashes := make(map[string]string, len(sink.files))
 	for key, data := range sink.files {
@@ -969,7 +969,7 @@ func serveSeekable(w http.ResponseWriter, r *http.Request, name string, rc io.Re
 }
 
 // servePlainFromLive serves a plain (unencoded) index file by finding a
-// compressed variant in entry.files. Plain index files are never stored —
+// compressed variant in entry.files. Plain index files are never stored  --
 // their bytes are streamed through compressors during generation.
 //
 // The ETag is the sha256 of the plain file as recorded in the Release file,

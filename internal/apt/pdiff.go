@@ -20,7 +20,7 @@ type PDiffPatch struct {
 // PDiffIndex is a parsed Packages.diff/Index file.
 type PDiffIndex struct {
 	CurrentSHA256 string       // SHA256 of the current full Packages file
-	Patches       []PDiffPatch // oldest-first; patch i transforms [i]→[i+1] (or current)
+	Patches       []PDiffPatch // oldest-first; patch i transforms [i]->[i+1] (or current)
 }
 
 // PatchChain returns the patch names needed to bring a Packages file with the
@@ -86,8 +86,8 @@ func parsePDiffList(raw string) [][3]string {
 // ed-patch application. It is never mutated and is discarded after all ops are applied.
 type lineIdx struct {
 	lines       []string
-	stanzaOf    []int // 0-based line → stanza index; -1 for blank separator lines
-	stanzaFirst []int // stanza index → first 0-based line of that stanza
+	stanzaOf    []int // 0-based line -> stanza index; -1 for blank separator lines
+	stanzaFirst []int // stanza index -> first 0-based line of that stanza
 }
 
 func buildLineIdxRaws(raws []string) lineIdx {
@@ -167,7 +167,7 @@ func insertionStanza(li *lineIdx, addr int) int {
 	if s >= 0 {
 		return s
 	}
-	// addr is a blank separator — insert after the preceding content stanza.
+	// addr is a blank separator  -- insert after the preceding content stanza.
 	if addr > 1 {
 		return li.stanzaAt(addr - 1)
 	}
@@ -386,7 +386,7 @@ func applyEdOpGeneric[T any](items []T, li *lineIdx, op edOp, parse func(io.Read
 			return items, nil
 		}
 		if s1 == s2 {
-			// Change within one stanza — reconstruct from surrounding unchanged
+			// Change within one stanza  -- reconstruct from surrounding unchanged
 			// lines in the read-only index, then parse the result.
 			rebuilt := rebuildStanza(li, s1, op.addr1, op.addr2, op.text)
 			newItems, err := parse(strings.NewReader(rebuilt))

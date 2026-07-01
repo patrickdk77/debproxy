@@ -20,11 +20,11 @@ schedule:
   #   "daily@HH:MM"    every day at a fixed UTC time           e.g. "daily@03:00"
   #   "day@HH:MM"      every week on that day at a fixed time  e.g. "sunday@03:00"
   #   Go duration      every N hours with up to 5 min jitter   e.g. "24h"
-  # Omit or set to "0" to disable — use `debproxy snapshot` to publish manually.
+  # Omit or set to "0" to disable  -- use `debproxy snapshot` to publish manually.
   snapshot: sunday@03:00
 
   # history and age together define the snapshot retention policy.
-  # A snapshot is only deleted when BOTH limits are exceeded — it must be beyond the
+  # A snapshot is only deleted when BOTH limits are exceeded  -- it must be beyond the
   # count limit AND older than the age limit. This prevents deleting recent snapshots
   # even if you have accumulated many of them.
   #   history: 30   keep the 30 most-recent snapshots; excess + old ones are pruned
@@ -35,7 +35,7 @@ schedule:
 
   # cleanup controls when the server automatically prunes old snapshots and
   # runs pool GC while in serve mode.
-  # Omit or set to "0" to disable — use `debproxy cleanup` to run manually.
+  # Omit or set to "0" to disable  -- use `debproxy cleanup` to run manually.
   cleanup: "sunday@04:00"
 
 signing:
@@ -81,50 +81,50 @@ upstreams:
     auto_update: true
 
   # --- Ubuntu (x86) ---
-  # archive.ubuntu.com serves amd64, i386, and all (arch-independent packages).
+  # archive.ubuntu.com serves amd64 and i386.
   # arm64 and other ports architectures are NOT served here; they return 404.
   ubuntu-main:
     url: http://archive.ubuntu.com/ubuntu
-    architectures: [amd64, i386, all]
+    architectures: [amd64, i386]
     keys:
       - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
     auto_update: false
   ubuntu-updates:
     url: http://archive.ubuntu.com/ubuntu
     suite: "{codename}-updates"
-    architectures: [amd64, i386, all]
+    architectures: [amd64, i386]
     keys:
       - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
     auto_update: true
   ubuntu-security:
     url: http://security.ubuntu.com/ubuntu
     suite: "{codename}-security"
-    architectures: [amd64, i386, all]
+    architectures: [amd64, i386]
     keys:
       - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
     auto_update: true
 
   # --- Ubuntu ports (arm64 and other non-x86 architectures) ---
-  # ports.ubuntu.com serves arm64, armhf, ppc64el, riscv64, s390x, and all.
+  # ports.ubuntu.com serves arm64, armhf, ppc64el, riscv64, and s390x.
   # It mirrors the same suites ({codename}, {codename}-updates, {codename}-security)
   # but under a different hostname and path.
   ubuntu-ports-main:
     url: http://ports.ubuntu.com/ubuntu-ports
-    architectures: [arm64, all]
+    architectures: [arm64]
     keys:
       - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
     auto_update: false
   ubuntu-ports-updates:
     url: http://ports.ubuntu.com/ubuntu-ports
     suite: "{codename}-updates"
-    architectures: [arm64, all]
+    architectures: [arm64]
     keys:
       - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
     auto_update: true
   ubuntu-ports-security:
     url: http://ports.ubuntu.com/ubuntu-ports
     suite: "{codename}-security"
-    architectures: [arm64, all]
+    architectures: [arm64]
     keys:
       - /etc/debproxy/keys/ubuntu-archive-keyring.gpg
     auto_update: true
@@ -178,7 +178,7 @@ upstreams:
 layouts:
   # Debian: deb.debian.org serves all architectures, no split needed.
   - os: debian
-    architectures: [amd64, arm64, i386, all]
+    architectures: [amd64, arm64, i386]
     codenames:
       - codename: trixie
         components:
@@ -192,14 +192,14 @@ layouts:
 
   # Ubuntu: layout lists all desired architectures; each upstream restricts
   # which architectures it fetches via its own `architectures:` field.
-  # The x86 upstreams serve amd64/i386/all; the ports upstreams serve arm64/all.
-  # arch-independent ("all") packages are fetched from both sets -- duplicates
-  # are resolved by taking the higher version.
+  # The x86 upstreams serve amd64/i386; the ports upstreams serve arm64.
+  # arch-independent packages are fetched automatically from each upstream
+  # that serves a binary-all/Packages file and merged into every arch index.
   #
   # ESM upstreams are added to main (infra) and universe (apps) for LTS
   # releases only. Remove them if you do not have an Ubuntu Pro subscription.
   - os: ubuntu
-    architectures: [amd64, arm64, i386, all]
+    architectures: [amd64, arm64, i386]
     codenames:
       - codename: noble
         components:

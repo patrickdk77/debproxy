@@ -29,9 +29,9 @@ type Options struct {
 
 // Run scans the pool and repopulates the metadata index from .deb control data.
 // Component membership is resolved in order:
-//  1. Existing index entries (read before any reset) — authoritative.
-//  2. Upstream Packages fetched on demand via HTTPClient — for files missing from index.
-//  3. All upstream components with a warning — last resort when offline.
+//  1. Existing index entries (read before any reset)  -- authoritative.
+//  2. Upstream Packages fetched on demand via HTTPClient  -- for files missing from index.
+//  3. All upstream components with a warning  -- last resort when offline.
 func Run(ctx context.Context, cfg *config.Config, store storage.Storage, index metadata.MetadataIndex, opts Options) error {
 	poolComponents, err := buildPoolComponentMap(ctx, index)
 	if err != nil {
@@ -87,7 +87,7 @@ func Run(ctx context.Context, cfg *config.Config, store storage.Storage, index m
 
 		comps, ok := poolComponents[poolPath]
 		if !ok {
-			// Not in prior index — ask upstream Packages (fetched on demand).
+			// Not in prior index  -- ask upstream Packages (fetched on demand).
 			comps, ok = fetcher.lookup(ctx, osName, codename, upstreamName, pkgName, pkgVersion, pkgArch)
 		}
 		if !ok {

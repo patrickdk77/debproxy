@@ -111,12 +111,12 @@ Fill in the placeholder values before applying:
 
 ```bash
 # 1. Add public keyrings (armor with: gpg --armor --export ...)
-#    Edit deploy/k8s/keyrings.yaml — replace REPLACE_ME under
+#    Edit deploy/k8s/keyrings.yaml  -- replace REPLACE_ME under
 #    debian-archive-keyring.gpg and ubuntu-archive-keyring.gpg
 
 # 2. Create the Secret from the example (private signing key only)
 cp deploy/k8s/secret.example.yaml secret.yaml
-# edit secret.yaml — fill in debproxy-signing.asc
+# edit secret.yaml  -- fill in debproxy-signing.asc
 kubectl apply -f secret.yaml
 
 # 3. Apply everything else

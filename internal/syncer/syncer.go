@@ -127,7 +127,7 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 		av := avail.Build(ctx, s.cfg, s.client, cache, k.osName, k.codename)
 
 		// Snapshot current source versions only when at least one source has
-		// auto_update enabled — otherwise the map is unused and the index query wasted.
+		// auto_update enabled  -- otherwise the map is unused and the index query wasted.
 		hasAutoUpdateSrc := false
 		for _, srcMap := range av.Srcs {
 			for _, sp := range srcMap {

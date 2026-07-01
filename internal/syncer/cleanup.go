@@ -201,7 +201,7 @@ func (s *Syncer) scanPackagesRefs(ctx context.Context, relPath string, ref map[s
 	}
 	defer rc.Close()
 	sc := bufio.NewScanner(rc)
-	sc.Buffer(make([]byte, 1<<20), 1<<20) // 1 MB — handles long Depends: lines
+	sc.Buffer(make([]byte, 1<<20), 1<<20) // 1 MB  -- handles long Depends: lines
 	for sc.Scan() {
 		if fn, ok := strings.CutPrefix(sc.Text(), "Filename: "); ok {
 			ref[fn] = true

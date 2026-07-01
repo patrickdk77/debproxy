@@ -102,7 +102,7 @@ func (s *Store) loadAll(ctx context.Context) error {
 // Refresh merges any metadata files that have been written since the last load
 // into the in-memory state, and evicts entries for files that no longer exist.
 // Uses merge semantics (our in-memory version wins on conflict) so it is safe
-// to call with dirty in-memory state — no pending writes are lost.
+// to call with dirty in-memory state  -- no pending writes are lost.
 func (s *Store) Refresh(ctx context.Context) error {
 	paths, err := s.backend.ListPublished(ctx, "metadata/")
 	if err != nil {

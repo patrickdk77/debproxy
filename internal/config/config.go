@@ -315,7 +315,7 @@ func (c *Config) resolveLayouts() error {
 					return fmt.Errorf("layout %s/%s/%s: at least one upstream is required", osLayout.OS, cn.Codename, comp.Component)
 				}
 
-				archs := mergeArchs(osLayout.Architectures, cn.Architectures, comp.Architectures)
+				archs := filterAll(mergeArchs(osLayout.Architectures, cn.Architectures, comp.Architectures))
 				if len(archs) == 0 {
 					return fmt.Errorf("layout %s/%s/%s: architectures are required", osLayout.OS, cn.Codename, comp.Component)
 				}
@@ -351,7 +351,7 @@ func (c *Config) resolveLayouts() error {
 					}
 					component = expandPlaceholders(component, osLayout.OS, cn.Codename, comp.Component)
 
-					upArchs := def.Architectures
+					upArchs := filterAll(def.Architectures)
 					if len(upArchs) == 0 {
 						upArchs = archs
 					}
@@ -383,6 +383,18 @@ func (c *Config) resolveLayouts() error {
 	}
 	c.ResolvedLayouts = resolved
 	return nil
+}
+
+// filterAll removes "all" from a list of architectures. arch-independent
+// packages are fetched automatically and do not need to be listed explicitly.
+func filterAll(archs []string) []string {
+	out := archs[:0:0]
+	for _, a := range archs {
+		if a != "all" {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func mergeArchs(layers ...[]string) []string {

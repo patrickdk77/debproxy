@@ -9,13 +9,13 @@ Docker builds of two sample images were tested across three modes: no proxy, pro
 | web (small) | 131.8s | 113.6s | 92.7s | 13.8% | 29.7% |
 | web2 (large) | 743.6s | 542.9s | 460.5s | 27.0% | 38.0% |
 
-The **web** image is a simple Apache server used as a base image. **web2** is a complex build that patches and rebuilds Apache, installs many packages, and calls `apt-get update` and `apt-get dist-upgrade` multiple times — nothing was changed to optimize the build logic.
+The **web** image is a simple Apache server used as a base image. **web2** is a complex build that patches and rebuilds Apache, installs many packages, and calls `apt-get update` and `apt-get dist-upgrade` multiple times  -- nothing was changed to optimize the build logic.
 
 The snapshot gains come from apt only having to download, parse, and index packages actually used in the CI/CD chain rather than the entire archive. Most docker build time is spent in this phase, so the reduction can be significant.
 
 ---
 
-## web — Small Application Build
+## web  -- Small Application Build
 
 ### No Proxy (131.8s)
 
@@ -36,7 +36,7 @@ The snapshot gains come from apt only having to download, parse, and index packa
  => => naming to docker.io/library/web                                                                 0.0s
 ```
 
-### Proxy — Live Mode (113.6s, −13.8%)
+### Proxy  -- Live Mode (113.6s, -13.8%)
 
 ```
 [+] Building 113.6s (7/7) FINISHED                                                           docker:default
@@ -55,7 +55,7 @@ The snapshot gains come from apt only having to download, parse, and index packa
  => => naming to docker.io/library/web                                                                 0.0s
 ```
 
-### Proxy — Snapshot (92.7s, −29.7%)
+### Proxy  -- Snapshot (92.7s, -29.7%)
 
 ```
 [+] Building 92.7s (7/7) FINISHED                                                            docker:default
@@ -76,7 +76,7 @@ The snapshot gains come from apt only having to download, parse, and index packa
 
 ---
 
-## web2 — Large Application Build
+## web2  -- Large Application Build
 
 ### No Proxy (743.6s)
 
@@ -103,7 +103,7 @@ The snapshot gains come from apt only having to download, parse, and index packa
  => => naming to docker.io/library/web2                                                                0.0s
 ```
 
-### Proxy — Live Mode (542.9s, −27.0%)
+### Proxy  -- Live Mode (542.9s, -27.0%)
 
 ```
 [+] Building 542.9s (13/13) FINISHED                                                         docker:default
@@ -128,7 +128,7 @@ The snapshot gains come from apt only having to download, parse, and index packa
  => => naming to docker.io/library/web2                                                                0.0s
 ```
 
-### Proxy — Snapshot (460.5s, −38.0%)
+### Proxy  -- Snapshot (460.5s, -38.0%)
 
 ```
 [+] Building 460.5s (13/13) FINISHED                                                         docker:default

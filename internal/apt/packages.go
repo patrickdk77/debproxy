@@ -34,7 +34,7 @@ func (r RawPkg) WithFilename(newFilename string) string {
 	const prefix = "\nFilename: "
 	idx := strings.Index(r.Raw, prefix)
 	if idx < 0 {
-		// Filename is the first (or only) field — handle gracefully.
+		// Filename is the first (or only) field  -- handle gracefully.
 		return "Filename: " + newFilename + "\n" + r.Raw
 	}
 	rest := r.Raw[idx+len(prefix):]
@@ -78,7 +78,7 @@ func ParsePackageRaws(r io.Reader) ([]RawPkg, error) {
 		raw.WriteString(line)
 		raw.WriteByte('\n')
 		if line[0] == ' ' || line[0] == '\t' {
-			// Continuation line — only Depends/Pre-Depends need accumulation.
+			// Continuation line  -- only Depends/Pre-Depends need accumulation.
 			cont := line[1:]
 			switch lastKey {
 			case "depends":

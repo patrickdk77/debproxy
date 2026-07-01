@@ -141,7 +141,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 	// list all architectures there even though arm64 Packages are only served from
 	// ports.ubuntu.com. Checking rel.Files is authoritative: if no Packages variant
 	// is listed for a given arch, the upstream does not serve it.
-	archs := make([]string, 0, len(f.src.Archs))
+	archs := make([]string, 0, len(f.src.Archs)+1)
 	for _, arch := range f.src.Archs {
 		prefix := f.src.Component + "/binary-" + arch + "/Packages"
 		for path := range rel.Files {
@@ -155,6 +155,17 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 		slog.Debug("upstream does not serve all configured arches for component",
 			"upstream", f.src.Name, "component", f.src.Component,
 			"configured", f.src.Archs, "available", archs)
+	}
+	// Always fetch binary-all/Packages when the upstream serves it, regardless of
+	// configured architectures. avail.Build fans these packages into every binary
+	// arch index, capturing packages that only appear in the dedicated all-packages
+	// file (e.g. some Debian packages absent from per-arch Packages files).
+	allPrefix := f.src.Component + "/binary-all/Packages"
+	for path := range rel.Files {
+		if strings.HasPrefix(path, allPrefix) {
+			archs = append(archs, "all")
+			break
+		}
 	}
 
 	archPkgs := make(map[string][]apt.RawPkg, len(archs))
@@ -357,7 +368,7 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 		}
 	}
 
-	// SHA256 changed — try PDiff before falling back to a full download.
+	// SHA256 changed  -- try PDiff before falling back to a full download.
 	if cached != nil && cached.release != nil {
 		if cachedSHA256 := cached.release.Files[base+"Packages"].SHA256; cachedSHA256 != "" {
 			if updated, ok := f.tryPDiff(ctx, rel, base, arch, cachedSHA256, cached.archPkgs[arch]); ok {
@@ -476,7 +487,7 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 	// This catches bugs in patch application, wrong patch sequences, or any
 	// other corruption that slipped past per-patch verification.
 	if err := verifyDigest(apt.SerializeRawPkgs(pkgs), idx.CurrentSHA256); err != nil {
-		slog.Warn("pdiff: final Packages SHA256 mismatch after applying patches — falling back to full fetch",
+		slog.Warn("pdiff: final Packages SHA256 mismatch after applying patches  -- falling back to full fetch",
 			"upstream", f.src.Name, "arch", arch, "err", err)
 		return nil, false
 	}
@@ -568,7 +579,7 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 
 	// Verify final result matches expected SHA256 from the PDiff Index.
 	if err := verifyDigest(apt.SerializeRawSrcs(srcs), idx.CurrentSHA256); err != nil {
-		slog.Warn("pdiff: final Sources SHA256 mismatch after applying patches — falling back to full fetch",
+		slog.Warn("pdiff: final Sources SHA256 mismatch after applying patches  -- falling back to full fetch",
 			"upstream", f.src.Name, "component", f.src.Component, "err", err)
 		return nil, false
 	}
@@ -594,7 +605,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 		cachedEntry, _ = f.cache.get(cacheKey)
 	}
 	if resp != nil && resp.StatusCode == http.StatusNotModified {
-		// InRelease unchanged — return cached srcs if available.
+		// InRelease unchanged  -- return cached srcs if available.
 		if cachedEntry != nil && cachedEntry.srcs != nil {
 			return cachedEntry.srcs, nil
 		}
@@ -624,7 +635,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 			}
 		}
 
-		// SHA256 changed — try PDiff.
+		// SHA256 changed  -- try PDiff.
 		if cachedSHA256 := cachedEntry.srcsRelease.Files[base+"Sources"].SHA256; cachedSHA256 != "" {
 			if updated, ok := f.tryPDiffSrc(ctx, rel, base, cachedSHA256, cachedEntry.srcs); ok {
 				if f.cache != nil {

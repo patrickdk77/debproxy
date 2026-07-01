@@ -92,7 +92,7 @@ func TestControlParagraph_xz(t *testing.T) {
 
 // TestControlParagraph_xz_file simulates the rebuild code path where an
 // *os.File is passed to ControlParagraph. Previously openARMember returned
-// io.LimitReader(*os.File, n), which is non-seekable — some xz streams fail
+// io.LimitReader(*os.File, n), which is non-seekable  -- some xz streams fail
 // in the ulikunitz/xz streaming mode. The fix buffers the member into a
 // bytes.Reader so the decompressor gets a seekable reader.
 func TestControlParagraph_xz_file(t *testing.T) {
@@ -110,7 +110,7 @@ func TestControlParagraph_xz_file(t *testing.T) {
 	f.Write(ar.Bytes())
 	f.Seek(0, io.SeekStart)
 
-	// Pass *os.File directly — same as toReadSeeker returns for filesystem store.
+	// Pass *os.File directly  -- same as toReadSeeker returns for filesystem store.
 	p, err := deb.ControlParagraph(f)
 	if err != nil {
 		t.Fatal(err)

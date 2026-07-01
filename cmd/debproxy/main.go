@@ -683,7 +683,7 @@ func parseSnapshotSchedule(s string) (snapshotSched, error) {
 	lower := strings.ToLower(s)
 	at := strings.IndexByte(lower, '@')
 	if at < 0 {
-		// No '@' — must be a plain duration.
+		// No '@'  -- must be a plain duration.
 		d, err := time.ParseDuration(s)
 		if err != nil {
 			return snapshotSched{}, fmt.Errorf("schedule %q: expected a duration, \"daily@HH:MM\", or \"day@HH:MM\"", s)
@@ -824,7 +824,7 @@ func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *con
 // startPeriodicMerge calls index.Refresh approximately every interval, merging
 // any changes written by other instances into the in-memory state. Up to 10
 // minutes of jitter is added per cycle so concurrent instances don't all LIST
-// the backend at the same moment. Unlike startPeriodicFlush, this never writes —
+// the backend at the same moment. Unlike startPeriodicFlush, this never writes  --
 // dirty entries are left to the flush goroutine, satisfying the invariant that
 // we don't write when we have no changes of our own.
 func startPeriodicMerge(index metadata.MetadataIndex, interval time.Duration) func() {

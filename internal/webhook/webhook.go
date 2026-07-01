@@ -47,12 +47,12 @@ type compiled struct {
 	contentType string
 	headers     map[string]string
 	tmpl        *template.Template
-	hasBody     bool            // false → GET with no body; true → POST with rendered body
+	hasBody     bool            // false -> GET with no body; true -> POST with rendered body
 	upstreams   map[string]bool // empty = all
 }
 
 // Notifier fires HTTP webhooks when new packages are downloaded.
-// A nil Notifier is safe to use — all calls are no-ops.
+// A nil Notifier is safe to use  -- all calls are no-ops.
 type Notifier struct {
 	hooks  []compiled
 	client *http.Client

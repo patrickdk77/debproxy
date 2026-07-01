@@ -33,18 +33,23 @@ type FileSink interface {
 	WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error
 }
 
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
 // Compression controls which formats are produced and at what level.
 // GZip and ZStd use 0 to disable. Positive ZStd levels are mapped via
 // zstd.EncoderLevelFromZstd for best-match to the encoder's internal presets.
 type Compression struct {
-	GZip int  // 0=disabled, 1-9=gzip level
-	ZStd int  // 0=disabled, positive mapped via EncoderLevelFromZstd
-	XZ   bool // true=enabled (64 MB dict), false=disabled
+	GZip  int  // 0=disabled, 1-9=gzip level
+	ZStd  int  // 0=disabled, positive mapped via EncoderLevelFromZstd
+	XZ    bool // true=enabled (64 MB dict), false=disabled
+	Plain bool // also write uncompressed Packages/Sources alongside compressed variants
 }
 
 // DefaultSnapshotCompression is the built-in default for snapshot publishing:
 // maximum compression for all formats, including xz.
-var DefaultSnapshotCompression = Compression{GZip: 9, ZStd: 11, XZ: true}
+var DefaultSnapshotCompression = Compression{GZip: 9, ZStd: 11, XZ: true, Plain: true}
 
 // DefaultLiveCompression is the built-in default for live publishing:
 // fast compression, no xz (apt falls back to gz when xz is absent).
@@ -69,7 +74,7 @@ type SuiteInput struct {
 	// Date overrides the Release Date (zero = now).
 	Date time.Time
 	// Compression controls which index formats are produced and at what level.
-	// Zero value disables all formats — callers should set DefaultSnapshotCompression
+	// Zero value disables all formats  -- callers should set DefaultSnapshotCompression
 	// or DefaultLiveCompression, or resolve from config.
 	Compression Compression
 	// HashTypes lists which hash sections to write to Release/InRelease.
@@ -171,13 +176,18 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 	var files []hashedFile
 
 	// Build the list of compression variants to produce.
-	// xz is ~10× slower than gz/zstd; apt falls back to gz when xz is absent,
+	// xz is ~10x slower than gz/zstd; apt falls back to gz when xz is absent,
 	// so it is typically only worth the cost for snapshots.
 	type compVariant struct {
 		suffix    string
 		newWriter func(io.Writer) (io.WriteCloser, error)
 	}
 	var variants []compVariant
+	if in.Compression.Plain {
+		variants = append(variants, compVariant{"", func(w io.Writer) (io.WriteCloser, error) {
+			return nopWriteCloser{w}, nil
+		}})
+	}
 	if in.Compression.XZ {
 		variants = append(variants, compVariant{".xz", func(w io.Writer) (io.WriteCloser, error) {
 			return xz.WriterConfig{DictCap: 64 << 20}.NewWriter(w)
@@ -238,7 +248,11 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		}
 		for i, wc := range varWCs {
 			if cerr := wc.Close(); cerr != nil && err == nil {
-				err = fmt.Errorf("close %s: %w", variants[i].suffix, cerr)
+				suf := variants[i].suffix
+				if suf == "" {
+					suf = "plain"
+				}
+				err = fmt.Errorf("close %s: %w", suf, cerr)
 			}
 		}
 		if err != nil {
@@ -276,7 +290,7 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 	}
 
 	// Process combos in GOMAXPROCS-sized batches. Each goroutine streams stanzas
-	// through io.MultiWriter into all compressor buffers simultaneously — the plain
+	// through io.MultiWriter into all compressor buffers simultaneously  -- the plain
 	// content is never assembled as one allocation. After a batch completes its
 	// results are written to the sink and released before the next batch starts.
 	concurrency := runtime.GOMAXPROCS(0)
@@ -329,14 +343,15 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		}
 		batchWg.Wait()
 
-		// Write compressed files to the sink; plain bytes were never assembled
-		// so there is nothing to write for the plain path (its hash is recorded
-		// in Release for clients that need it).
 		for _, jr := range batchResults {
 			if jr.err != nil {
 				return jr.err
 			}
-			files = append(files, jr.plain)
+			// When Plain is false the plain file is not written; record its hash in
+			// Release anyway so legacy apt clients know the canonical size.
+			if !in.Compression.Plain {
+				files = append(files, jr.plain)
+			}
 			for _, cf := range jr.compressed {
 				full := path.Join(distRoot, cf.hf.rel)
 				if err := sink.WriteFile(ctx, full, bytes.NewReader(cf.data), cf.hf.size); err != nil {
@@ -367,7 +382,9 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 			return err
 		}
 		ph.rel = comp + "/source/Sources"
-		files = append(files, ph)
+		if !in.Compression.Plain {
+			files = append(files, ph)
+		}
 
 		for i, v := range variants {
 			data := varBufs[i].Bytes()

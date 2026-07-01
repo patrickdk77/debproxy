@@ -94,7 +94,9 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			av.Pkgs[layout.Component] = map[string]map[string]Pkg{}
 		}
 		for _, a := range layout.Archs {
-			archSet[a] = true
+			if a != "all" {
+				archSet[a] = true
+			}
 		}
 		for _, src := range layout.Upstreams {
 			jobs = append(jobs, work{layout.Component, src})
@@ -126,7 +128,7 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 	wg.Wait()
 
 	// Phase 1: run buildPkg for each (result, arch) pair in parallel.
-	// Each goroutine builds its own private map — no concurrent writes to shared state.
+	// Each goroutine builds its own private map  -- no concurrent writes to shared state.
 	type archEntry struct {
 		component string
 		arch      string
@@ -170,9 +172,12 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 	}
 	wg2.Wait()
 
-	// Phase 2: merge per-arch results sequentially to resolve cross-upstream
-	// version conflicts and build ByPoolPath.
+	// Phase 2a: merge binary-arch results. Must run before Phase 2b so the
+	// per-arch maps are initialized before arch=all packages are fanned into them.
 	for _, e := range entries {
+		if e.arch == "all" {
+			continue
+		}
 		if e.stale {
 			av.HasStaleMismatch = true
 		}
@@ -187,6 +192,27 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			}
 			dest[name] = p
 			av.ByPoolPath[p.PoolPath] = p
+		}
+	}
+
+	// Phase 2b: fan arch=all packages into every binary arch we serve.
+	// These come from upstreams that publish a separate binary-all/Packages
+	// (e.g. Debian main) and may include packages absent from the per-arch files.
+	for _, e := range entries {
+		if e.arch != "all" {
+			continue
+		}
+		if e.stale {
+			av.HasStaleMismatch = true
+		}
+		for _, dest := range av.Pkgs[e.component] {
+			for name, p := range e.pkgs {
+				if existing, ok := dest[name]; ok && debversion.Compare(p.Version, existing.Version) <= 0 {
+					continue
+				}
+				dest[name] = p
+				av.ByPoolPath[p.PoolPath] = p
+			}
 		}
 	}
 
@@ -302,8 +328,7 @@ func buildPkg(osName, codename, component, arch string, src model.UpstreamSource
 }
 
 // DepClosure returns the transitive dependency closure (within the available
-// set, for the given arch falling back to "all") of the seed package names,
-// including the seeds themselves.
+// set) of the seed package names, including the seeds themselves.
 func (av *Available) DepClosure(component, arch string, seeds []string) []Pkg {
 	resolved := map[string]Pkg{}
 	var queue []string
@@ -317,13 +342,11 @@ func (av *Available) DepClosure(component, arch string, seeds []string) []Pkg {
 				}
 			}
 		}
-		// Fall back to any component for arch or "all".
+		// Fall back to any component for the given arch.
 		for _, compMap := range av.Pkgs {
-			for _, a := range []string{arch, "all"} {
-				if archMap := compMap[a]; archMap != nil {
-					if p, ok := archMap[name]; ok {
-						return p, true
-					}
+			if archMap := compMap[arch]; archMap != nil {
+				if p, ok := archMap[name]; ok {
+					return p, true
 				}
 			}
 		}

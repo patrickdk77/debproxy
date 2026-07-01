@@ -236,7 +236,7 @@ func TestPruneSnapshots_CountWithinLimit(t *testing.T) {
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
 
 	now := time.Now()
-	// 2 snapshots, limit is 5 — count within limit so no pruning.
+	// 2 snapshots, limit is 5  -- count within limit so no pruning.
 	store.snapshots["ubuntu"] = []storage.SnapshotRef{
 		{ID: "snap-old", OS: "ubuntu", CreatedAt: now.Add(-200 * 24 * time.Hour)},
 		{ID: "snap-new", OS: "ubuntu", CreatedAt: now.Add(-10 * 24 * time.Hour)},
@@ -258,7 +258,7 @@ func TestPruneSnapshots_CountExceedsButAgeTooYoung(t *testing.T) {
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
 
 	now := time.Now()
-	// 3 snapshots, limit is 2 — count exceeds, but oldest is only 5 days old.
+	// 3 snapshots, limit is 2  -- count exceeds, but oldest is only 5 days old.
 	store.snapshots["ubuntu"] = []storage.SnapshotRef{
 		{ID: "snap-a", OS: "ubuntu", CreatedAt: now.Add(-5 * 24 * time.Hour)},
 		{ID: "snap-b", OS: "ubuntu", CreatedAt: now.Add(-3 * 24 * time.Hour)},
@@ -268,7 +268,7 @@ func TestPruneSnapshots_CountExceedsButAgeTooYoung(t *testing.T) {
 		store.publishedFiles[id+"/ubuntu/dists/jammy/Release"] = "content"
 	}
 
-	// Age limit is 30 days; oldest is only 5 days — no deletion expected.
+	// Age limit is 30 days; oldest is only 5 days  -- no deletion expected.
 	if err := s.Cleanup(context.Background(), 2, 30*24*time.Hour, now); err != nil {
 		t.Fatalf("Cleanup error: %v", err)
 	}
@@ -284,10 +284,10 @@ func TestPruneSnapshots_CountAndAgeExceed(t *testing.T) {
 
 	now := time.Now()
 	// 3 snapshots, keep limit = 2, age limit = 30 days.
-	// snap-old is 100 days old — should be deleted.
-	// snap-mid is 20 days old — within age limit so stays, but it is at index 1 (0-based
+	// snap-old is 100 days old  -- should be deleted.
+	// snap-mid is 20 days old  -- within age limit so stays, but it is at index 1 (0-based
 	//   after sort newest-first: snap-new idx=0, snap-mid idx=1, snap-old idx=2).
-	//   Index >= maxSnapshots(2) AND age > 30d — only snap-old qualifies.
+	//   Index >= maxSnapshots(2) AND age > 30d  -- only snap-old qualifies.
 	store.snapshots["ubuntu"] = []storage.SnapshotRef{
 		{ID: "snap-old", OS: "ubuntu", CreatedAt: now.Add(-100 * 24 * time.Hour)},
 		{ID: "snap-mid", OS: "ubuntu", CreatedAt: now.Add(-20 * 24 * time.Hour)},
@@ -318,7 +318,7 @@ func TestPruneSnapshots_DeletedCountMatchesDeleted(t *testing.T) {
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
 
 	now := time.Now()
-	// 4 snapshots, keep 1, age limit 10 days — 3 oldest qualify (each > 10 days old).
+	// 4 snapshots, keep 1, age limit 10 days  -- 3 oldest qualify (each > 10 days old).
 	store.snapshots["ubuntu"] = []storage.SnapshotRef{
 		{ID: "snap-1", OS: "ubuntu", CreatedAt: now.Add(-90 * 24 * time.Hour)},
 		{ID: "snap-2", OS: "ubuntu", CreatedAt: now.Add(-60 * 24 * time.Hour)},
