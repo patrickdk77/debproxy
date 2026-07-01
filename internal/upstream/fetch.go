@@ -296,14 +296,14 @@ type pkgVariant struct {
 }
 
 var pkgVariants = []pkgVariant{
+	{"Packages.zst", func(d []byte) (io.Reader, error) {
+		return zstd.NewReader(bytes.NewReader(d))
+	}},
 	{"Packages.gz", func(d []byte) (io.Reader, error) {
 		return gzip.NewReader(bytes.NewReader(d))
 	}},
 	{"Packages.xz", func(d []byte) (io.Reader, error) {
 		return xz.NewReader(bytes.NewReader(d))
-	}},
-	{"Packages.zst", func(d []byte) (io.Reader, error) {
-		return zstd.NewReader(bytes.NewReader(d))
 	}},
 	{"Packages.bz2", func(d []byte) (io.Reader, error) {
 		return bzip2.NewReader(bytes.NewReader(d)), nil
@@ -363,20 +363,21 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 			}
 		}
 		if resp.StatusCode == http.StatusNotFound {
-			// File listed in Release but not served here — try the next variant.
-			slog.Warn("Packages file listed in Release but not found, trying next variant",
-				"url", f.distsURL(relPath), "arch", arch)
+			slog.Warn("Packages variant not found, trying next", "url", f.distsURL(relPath), "arch", arch)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s: status %d", relPath, resp.StatusCode)
+			slog.Warn("Packages variant bad status, trying next", "url", f.distsURL(relPath), "status", resp.StatusCode, "arch", arch)
+			continue
 		}
 		if err := verifyDigest(data, entry.SHA256); err != nil {
-			return nil, fmt.Errorf("%s: %w", relPath, err)
+			slog.Warn("Packages variant hash mismatch, trying next", "url", f.distsURL(relPath), "err", err, "arch", arch)
+			continue
 		}
 		r, err := v.decomp(data)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", relPath, err)
+			slog.Warn("Packages variant decompress failed, trying next", "url", f.distsURL(relPath), "err", err, "arch", arch)
+			continue
 		}
 		if rc, ok := r.(io.Closer); ok {
 			defer rc.Close()
@@ -464,14 +465,14 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 }
 
 var srcVariants = []pkgVariant{
+	{"Sources.zst", func(d []byte) (io.Reader, error) {
+		return zstd.NewReader(bytes.NewReader(d))
+	}},
 	{"Sources.gz", func(d []byte) (io.Reader, error) {
 		return gzip.NewReader(bytes.NewReader(d))
 	}},
 	{"Sources.xz", func(d []byte) (io.Reader, error) {
 		return xz.NewReader(bytes.NewReader(d))
-	}},
-	{"Sources.zst", func(d []byte) (io.Reader, error) {
-		return zstd.NewReader(bytes.NewReader(d))
 	}},
 	{"Sources.bz2", func(d []byte) (io.Reader, error) {
 		return bzip2.NewReader(bytes.NewReader(d)), nil
@@ -631,19 +632,21 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 			}
 		}
 		if resp.StatusCode == http.StatusNotFound {
-			slog.Warn("Sources file listed in Release but not found, trying next variant",
-				"url", f.distsURL(relPath))
+			slog.Warn("Sources variant not found, trying next", "url", f.distsURL(relPath))
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s: status %d", relPath, resp.StatusCode)
+			slog.Warn("Sources variant bad status, trying next", "url", f.distsURL(relPath), "status", resp.StatusCode)
+			continue
 		}
 		if err := verifyDigest(data, entry.SHA256); err != nil {
-			return nil, fmt.Errorf("%s: %w", relPath, err)
+			slog.Warn("Sources variant hash mismatch, trying next", "url", f.distsURL(relPath), "err", err)
+			continue
 		}
 		r, err := v.decomp(data)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", relPath, err)
+			slog.Warn("Sources variant decompress failed, trying next", "url", f.distsURL(relPath), "err", err)
+			continue
 		}
 		if rc, ok := r.(io.Closer); ok {
 			defer rc.Close()
