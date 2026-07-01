@@ -21,6 +21,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
+
+	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/avail"
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/ingest"
@@ -61,6 +66,7 @@ var errUnknownSelector = errors.New("unknown snapshot selector")
 type liveEntry struct {
 	av     *avail.Available
 	files  map[string][]byte
+	hashes map[string]string // file key → sha256 from Release; O(1) ETag lookup
 	built  time.Time
 	expiry time.Time
 }
@@ -87,6 +93,17 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 		liveCache:    map[string]*liveEntry{},
 		liveBuilding: map[string]chan struct{}{},
 		retryCancel:  map[string]context.CancelFunc{},
+	}
+}
+
+// sweepExpiredLiveCache removes entries whose TTL has elapsed so that inactive
+// os/codename combinations don't hold large index byte slices indefinitely.
+// Must be called with s.mu held.
+func (s *Server) sweepExpiredLiveCache(now time.Time) {
+	for k, e := range s.liveCache {
+		if now.After(e.expiry) {
+			delete(s.liveCache, k)
+		}
 	}
 }
 
@@ -247,7 +264,10 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 		key := path.Join(remainder...)
 		data, ok := entry.files[key]
 		if !ok {
-			http.NotFound(w, r)
+			// Plain index file (Packages/Sources) is never stored — serve from
+			// a compressed variant, transparently decoding if the client can't
+			// accept any of our compressed formats.
+			s.servePlainFromLive(w, r, key, entry)
 			return
 		}
 		serveBytes(w, r, key, data, entry.built)
@@ -282,7 +302,8 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 	info, err := s.store.StatPublished(r.Context(), relPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			http.NotFound(w, r)
+			// Plain index files are not stored — serve from a compressed variant.
+			s.servePublishedFromCompressed(w, r, relPath)
 			return
 		}
 		slog.Error("stat published file", "path", relPath, "err", err)
@@ -301,6 +322,97 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 	}
 	defer rc.Close()
 	serveSeekable(w, r, relPath, rc, info.Size, info.ModTime)
+}
+
+// servePublishedFromCompressed serves a plain (unencoded) file by reading a
+// compressed variant from storage. Plain Packages/Sources files are never
+// stored — only compressed variants exist.
+//
+// The ETag is the sha256 of the plain file as recorded in the Release document
+// stored alongside the snapshot. Because it is the content hash (not a hash of
+// a particular encoding), it is consistent across gzip/zstd passthrough and
+// decompressed responses, making If-None-Match work regardless of encoding.
+func (s *Server) servePublishedFromCompressed(w http.ResponseWriter, r *http.Request, relPath string) {
+	accept := r.Header.Get("Accept-Encoding")
+
+	// Always read from a fixed canonical order so the ETag (sha256 of the bytes
+	// we read) is stable regardless of what encoding the client accepts.
+	var compBytes []byte
+	var compSfx string
+	for _, sfx := range []string{".zst", ".gz", ".xz"} {
+		rc, err := s.store.OpenPublished(r.Context(), relPath+sfx)
+		if err != nil {
+			continue
+		}
+		b, rerr := io.ReadAll(rc)
+		rc.Close()
+		if rerr != nil {
+			slog.Warn("read compressed published index", "path", relPath+sfx, "err", rerr)
+			continue
+		}
+		compBytes = b
+		compSfx = sfx
+		break
+	}
+	if compBytes == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// ETag: sha256 of the canonical compressed bytes we already have in memory.
+	// Using a fixed read order (zst -> gz -> xz) ensures the same variant is
+	// always chosen, so the ETag is stable across requests regardless of what
+	// encoding the client accepts.
+	compHash := sha256.Sum256(compBytes)
+	etag := fmt.Sprintf(`%x`, compHash)
+
+	// Decide whether to pass through compressed or decompress.
+	var body []byte
+	var encoding string
+	switch {
+	case compSfx == ".zst" && strings.Contains(accept, "zstd"):
+		encoding, body = "zstd", compBytes
+	case compSfx == ".gz" && strings.Contains(accept, "gzip"):
+		encoding, body = "gzip", compBytes
+	case strings.Contains(accept, "gzip"):
+		// Canonical was .zst but client only accepts gzip — try a second read
+		// for the .gz variant so we avoid sending plain bytes unnecessarily.
+		if rc, err := s.store.OpenPublished(r.Context(), relPath+".gz"); err == nil {
+			if b, rerr := io.ReadAll(rc); rerr == nil {
+				encoding, body = "gzip", b
+			} else {
+				slog.Warn("read gz published index for passthrough", "path", relPath+".gz", "err", rerr)
+			}
+			rc.Close()
+		}
+		if body == nil {
+			plain, err := decompressBytes(compSfx, compBytes)
+			if err != nil {
+				slog.Warn("decompress published index for plain serve", "path", relPath, "suffix", compSfx, "err", err)
+				http.Error(w, "decompress failed", http.StatusInternalServerError)
+				return
+			}
+			body = plain
+		}
+	default:
+		plain, err := decompressBytes(compSfx, compBytes)
+		if err != nil {
+			slog.Warn("decompress published index for plain serve", "path", relPath, "suffix", compSfx, "err", err)
+			http.Error(w, "decompress failed", http.StatusInternalServerError)
+			return
+		}
+		body = plain
+	}
+
+	w.Header().Set("Cache-Control", httpCacheControl(r.URL.Path))
+	w.Header().Set("ETag", `"`+etag+`"`)
+	w.Header().Set("Content-Type", contentType(relPath))
+	if encoding != "" {
+		w.Header().Set("Content-Encoding", encoding)
+	}
+	// http.ServeContent reads the ETag we set above, handles If-None-Match and
+	// range requests, and does not override the ETag header.
+	http.ServeContent(w, r, path.Base(relPath), time.Time{}, bytes.NewReader(body))
 }
 
 // segAt returns segs[i] or "" if i is out of range.
@@ -576,19 +688,24 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	// Detach from the client context so a disconnect doesn't abort a build
 	// that will populate the cache for subsequent requests.
 	buildCtx := context.WithoutCancel(ctx)
+	slog.Info("building live cache", "os", osName, "codename", codename)
+	buildStart := time.Now()
 	av := avail.Build(buildCtx, s.cfg, s.client, s.indexCache, osName, codename)
-	files, err := s.generateLiveFiles(buildCtx, av)
+	files, hashes, err := s.generateLiveFiles(buildCtx, av)
+	elapsed := time.Since(buildStart)
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
 	if err == nil {
 		now := time.Now()
 		jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
-		entry = &liveEntry{av: av, files: files, built: now, expiry: now.Add(liveTTLBase + jitter)}
+		entry = &liveEntry{av: av, files: files, hashes: hashes, built: now, expiry: now.Add(liveTTLBase + jitter)}
+		s.sweepExpiredLiveCache(now)
 		s.liveCache[cacheKey] = entry
+		slog.Info("live cache built", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
 		slog.Error("live file generation failed, no stale data available",
-			"os", osName, "codename", codename, "err", err)
+			"os", osName, "codename", codename, "elapsed", elapsed, "err", err)
 	}
 	s.mu.Unlock()
 	close(wait)
@@ -610,20 +727,23 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 	ctx, cancel := context.WithTimeout(context.Background(), retryTimeout)
 	defer cancel()
 
+	buildStart := time.Now()
 	av := avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
-	files, err := s.generateLiveFiles(ctx, av)
+	files, hashes, err := s.generateLiveFiles(ctx, av)
+	elapsed := time.Since(buildStart)
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
 	if err == nil {
 		now := time.Now()
 		jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
-		newEntry := &liveEntry{av: av, files: files, built: now, expiry: now.Add(liveTTLBase + jitter)}
+		newEntry := &liveEntry{av: av, files: files, hashes: hashes, built: now, expiry: now.Add(liveTTLBase + jitter)}
+		s.sweepExpiredLiveCache(now)
 		s.liveCache[cacheKey] = newEntry
-		slog.Debug("live cache refreshed in background", "os", osName, "codename", codename)
+		slog.Debug("live cache refreshed in background", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
 		slog.Error("background live rebuild failed, retaining stale cache",
-			"os", osName, "codename", codename, "err", err)
+			"os", osName, "codename", codename, "elapsed", elapsed, "err", err)
 	}
 	s.mu.Unlock()
 
@@ -676,14 +796,14 @@ func (s *Server) startMismatchRetry(osName, codename string) {
 				"os", osName, "codename", codename, "attempt", i+1, "delay", delay)
 			av := avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
 			if !av.HasStaleMismatch {
-				files, err := s.generateLiveFiles(ctx, av)
+				files, hashes, err := s.generateLiveFiles(ctx, av)
 				if err != nil {
 					slog.Error("mismatch retry: live file generation failed", "os", osName, "codename", codename, "err", err)
 					continue
 				}
 				now := time.Now()
 				jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
-				entry := &liveEntry{av: av, files: files, built: now, expiry: now.Add(liveTTLBase + jitter)}
+				entry := &liveEntry{av: av, files: files, hashes: hashes, built: now, expiry: now.Add(liveTTLBase + jitter)}
 				s.mu.Lock()
 				s.liveCache[key] = entry
 				s.mu.Unlock()
@@ -699,7 +819,7 @@ func (s *Server) startMismatchRetry(osName, codename string) {
 	}()
 }
 
-func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (map[string][]byte, error) {
+func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (map[string][]byte, map[string]string, error) {
 	components, arches := s.componentsAndArches(av.OS, av.Codename)
 
 	type comboKey struct{ comp, arch string }
@@ -782,9 +902,28 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 		Compression:   s.cfg.Storage.Compression.ResolveLive(),
 	}
 	if err := publish.GenerateSuite(ctx, sink, "", in, s.key); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return sink.files, nil
+
+	// Parse each Release file in the sink once to build a path→sha256 index.
+	// This is used by servePlainFromLive for O(1) ETag lookups without re-hashing.
+	hashes := make(map[string]string, len(sink.files))
+	for key, data := range sink.files {
+		if !strings.HasSuffix(key, "/Release") {
+			continue
+		}
+		rel, err := apt.ParseRelease(bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		// The key is "dists/<codename>/Release"; file paths in Release are relative
+		// to "dists/<codename>/", so we reconstruct the full in-memory key.
+		prefix := strings.TrimSuffix(key, "Release") // "dists/<codename>/"
+		for _, fe := range rel.Files {
+			hashes[prefix+fe.Path] = fe.SHA256
+		}
+	}
+	return sink.files, hashes, nil
 }
 
 func (s *Server) componentsAndArches(osName, codename string) ([]string, []string) {
@@ -843,6 +982,92 @@ func serveSeekable(w http.ResponseWriter, r *http.Request, name string, rc io.Re
 		w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, size, modtime.UnixNano()))
 	}
 	http.ServeContent(w, r, path.Base(name), modtime, rs)
+}
+
+// servePlainFromLive serves a plain (unencoded) index file by finding a
+// compressed variant in entry.files. Plain index files are never stored —
+// their bytes are streamed through compressors during generation.
+//
+// The ETag is the sha256 of the plain file as recorded in the Release file,
+// which was computed once during generation. This is consistent across
+// gzip/zstd passthrough and decompressed responses, making If-None-Match work
+// regardless of what encoding the client requested.
+func (s *Server) servePlainFromLive(w http.ResponseWriter, r *http.Request, key string, entry *liveEntry) {
+	accept := r.Header.Get("Accept-Encoding")
+
+	// Decide what to serve.
+	var body []byte
+	var encoding string
+	if strings.Contains(accept, "zstd") {
+		if data, ok := entry.files[key+".zst"]; ok {
+			encoding, body = "zstd", data
+		}
+	}
+	if body == nil && strings.Contains(accept, "gzip") {
+		if data, ok := entry.files[key+".gz"]; ok {
+			encoding, body = "gzip", data
+		}
+	}
+	if body == nil {
+		for _, sfx := range []string{".zst", ".gz", ".xz"} {
+			if data, ok := entry.files[key+sfx]; ok {
+				plain, err := decompressBytes(sfx, data)
+				if err != nil {
+					slog.Warn("decompress live index for plain serve", "key", key, "suffix", sfx, "err", err)
+					continue
+				}
+				body = plain
+				break
+			}
+		}
+	}
+	if body == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	// ETag: O(1) lookup in the pre-built hash index (populated once per cache
+	// build from the Release data). Encoding-independent so If-None-Match works
+	// regardless of whether we serve compressed or plain bytes.
+	etag := entry.hashes[key]
+	w.Header().Set("Cache-Control", httpCacheControl(r.URL.Path))
+	if etag != "" {
+		w.Header().Set("ETag", `"`+etag+`"`)
+	}
+	w.Header().Set("Content-Type", contentType(key))
+	if encoding != "" {
+		w.Header().Set("Content-Encoding", encoding)
+	}
+	http.ServeContent(w, r, path.Base(key), entry.built, bytes.NewReader(body))
+}
+
+// decompressBytes inflates a compressed buffer into plain bytes.
+func decompressBytes(suffix string, data []byte) ([]byte, error) {
+	r := bytes.NewReader(data)
+	switch suffix {
+	case ".zst":
+		zr, err := zstd.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		return io.ReadAll(zr)
+	case ".gz":
+		gr, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		defer gr.Close()
+		return io.ReadAll(gr)
+	case ".xz":
+		xr, err := xz.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		return io.ReadAll(xr)
+	default:
+		return nil, fmt.Errorf("unknown suffix %q", suffix)
+	}
 }
 
 func serveBytes(w http.ResponseWriter, r *http.Request, name string, data []byte, modtime time.Time) {

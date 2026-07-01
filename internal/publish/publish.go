@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +78,14 @@ type hashedFile struct {
 	sha512 string
 }
 
+// sizeWriter counts bytes written through it.
+type sizeWriter struct{ n int64 }
+
+func (s *sizeWriter) Write(p []byte) (int, error) {
+	s.n += int64(len(p))
+	return len(p), nil
+}
+
 // GenerateSuite writes the dists/ tree for a suite under prefix (e.g.
 // "2026-04-30/debian"), signing Release with key.
 func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteInput, key *signing.Key) error {
@@ -89,20 +97,75 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 	// xz is ~10× slower than gz/zstd; apt falls back to gz when xz is absent,
 	// so it is typically only worth the cost for snapshots.
 	type compVariant struct {
-		suffix string
-		fn     func([]byte) ([]byte, error)
+		suffix    string
+		newWriter func(io.Writer) (io.WriteCloser, error)
 	}
 	var variants []compVariant
 	if in.Compression.XZ {
-		variants = append(variants, compVariant{".xz", xzBytes})
+		variants = append(variants, compVariant{".xz", func(w io.Writer) (io.WriteCloser, error) {
+			return xz.WriterConfig{DictCap: 64 << 20}.NewWriter(w)
+		}})
 	}
 	if in.Compression.GZip > 0 {
 		level := in.Compression.GZip
-		variants = append(variants, compVariant{".gz", func(d []byte) ([]byte, error) { return gzipBytes(d, level) }})
+		variants = append(variants, compVariant{".gz", func(w io.Writer) (io.WriteCloser, error) {
+			return gzip.NewWriterLevel(w, level)
+		}})
 	}
 	if in.Compression.ZStd > 0 {
 		level := in.Compression.ZStd
-		variants = append(variants, compVariant{".zst", func(d []byte) ([]byte, error) { return zstdBytes(d, level) }})
+		encoderLevel := zstd.EncoderLevelFromZstd(level)
+		variants = append(variants, compVariant{".zst", func(w io.Writer) (io.WriteCloser, error) {
+			return zstd.NewWriter(w, zstd.WithEncoderLevel(encoderLevel))
+		}})
+	}
+
+	// streamStanzas fans stanzas through hashers and all compressors simultaneously
+	// via io.MultiWriter so the full plain content is never assembled into one buffer.
+	// It returns hashes and size for the plain stream, plus filled compressor buffers.
+	streamStanzas := func(stanzas []string, varBufs []bytes.Buffer, varWCs []io.WriteCloser) (h256, h512 []byte, plainSize int64, err error) {
+		hasher256 := sha256.New()
+		hasher512 := sha512.New()
+		var sw sizeWriter
+
+		dests := make([]io.Writer, 0, 3+len(varWCs))
+		dests = append(dests, hasher256, hasher512, &sw)
+		for i := range varWCs {
+			dests = append(dests, varWCs[i])
+		}
+		mw := io.MultiWriter(dests...)
+
+		var writeErr error
+		write := func(s string) {
+			if writeErr != nil {
+				return
+			}
+			_, writeErr = io.WriteString(mw, s)
+		}
+		for i, s := range stanzas {
+			if i > 0 {
+				write("\n")
+			}
+			write(s)
+		}
+		if n := len(stanzas); n > 0 {
+			last := stanzas[n-1]
+			if len(last) == 0 || last[len(last)-1] != '\n' {
+				write("\n")
+			}
+		}
+		if writeErr != nil {
+			return nil, nil, 0, writeErr
+		}
+		for i, wc := range varWCs {
+			if cerr := wc.Close(); cerr != nil && err == nil {
+				err = fmt.Errorf("close %s: %w", variants[i].suffix, cerr)
+			}
+		}
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		return hasher256.Sum(nil), hasher512.Sum(nil), sw.n, nil
 	}
 
 	comps := append([]string(nil), in.Components...)
@@ -116,16 +179,12 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		hf     hashedFile
 	}
 	type jobResult struct {
-		base       string
-		content    []byte
 		plain      hashedFile
 		compressed []compFile
 		err        error
 	}
 
-	// For each (comp,arch) combo: build content, hash it, compress it, and hash
-	// the compressed output — all in one goroutine per combo so CPU-intensive
-	// work (Join, SHA256/512, compress) runs across all cores simultaneously.
+	// Build the list of (comp, arch) combos to process.
 	var combos []struct{ comp, arch, base string }
 	for _, comp := range comps {
 		for _, arch := range arches {
@@ -135,48 +194,54 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		}
 	}
 
-	jobResults := make([]jobResult, len(combos))
-	var wg sync.WaitGroup
-	for i, c := range combos {
-		wg.Add(1)
-		i, c := i, c
-		go func() {
-			defer wg.Done()
-			stanzas := in.Stanzas[c.comp][c.arch]
-			content := []byte(strings.Join(stanzas, "\n"))
-			if len(content) > 0 && content[len(content)-1] != '\n' {
-				content = append(content, '\n')
-			}
-			sum256 := sha256.Sum256(content)
-			sum512 := sha512.Sum512(content)
-			jr := jobResult{
-				base:    c.base,
-				content: content,
-				plain: hashedFile{
-					rel:    c.base + "/Packages",
-					size:   int64(len(content)),
-					sha256: hex.EncodeToString(sum256[:]),
-					sha512: hex.EncodeToString(sum512[:]),
-				},
-				compressed: make([]compFile, len(variants)),
-			}
-			// Run each compression variant in its own goroutine so gz and zst
-			// compress concurrently (universe/amd64 gz alone takes ~2s).
-			var compWg sync.WaitGroup
-			var compErrOnce sync.Once
-			for vi, v := range variants {
-				compWg.Add(1)
-				vi, v := vi, v
-				go func() {
-					defer compWg.Done()
-					data, err := v.fn(content)
+	// Process combos in GOMAXPROCS-sized batches. Each goroutine streams stanzas
+	// through io.MultiWriter into all compressor buffers simultaneously — the plain
+	// content is never assembled as one allocation. After a batch completes its
+	// results are written to the sink and released before the next batch starts.
+	concurrency := runtime.GOMAXPROCS(0)
+	for batchStart := 0; batchStart < len(combos); batchStart += concurrency {
+		batch := combos[batchStart:min(batchStart+concurrency, len(combos))]
+
+		batchResults := make([]jobResult, len(batch))
+		var batchWg sync.WaitGroup
+		for j, c := range batch {
+			batchWg.Add(1)
+			j, c := j, c
+			go func() {
+				defer batchWg.Done()
+				stanzas := in.Stanzas[c.comp][c.arch]
+
+				varBufs := make([]bytes.Buffer, len(variants))
+				varWCs := make([]io.WriteCloser, len(variants))
+				for i, v := range variants {
+					wc, err := v.newWriter(&varBufs[i])
 					if err != nil {
-						compErrOnce.Do(func() { jr.err = err })
+						batchResults[j] = jobResult{err: fmt.Errorf("open %s: %w", v.suffix, err)}
 						return
 					}
+					varWCs[i] = wc
+				}
+
+				sum256, sum512, plainSize, err := streamStanzas(stanzas, varBufs, varWCs)
+				if err != nil {
+					batchResults[j] = jobResult{err: err}
+					return
+				}
+
+				jr := jobResult{
+					plain: hashedFile{
+						rel:    c.base + "/Packages",
+						size:   plainSize,
+						sha256: hex.EncodeToString(sum256),
+						sha512: hex.EncodeToString(sum512),
+					},
+					compressed: make([]compFile, len(variants)),
+				}
+				for i, v := range variants {
+					data := varBufs[i].Bytes()
 					cs256 := sha256.Sum256(data)
 					cs512 := sha512.Sum512(data)
-					jr.compressed[vi] = compFile{
+					jr.compressed[i] = compFile{
 						suffix: v.suffix,
 						data:   data,
 						hf: hashedFile{
@@ -186,31 +251,27 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 							sha512: hex.EncodeToString(cs512[:]),
 						},
 					}
-				}()
-			}
-			compWg.Wait()
-			jobResults[i] = jr
-		}()
-	}
-	wg.Wait()
+				}
+				batchResults[j] = jr
+			}()
+		}
+		batchWg.Wait()
 
-	// Collect results and write files sequentially (order determines Release
-	// field output, though buildRelease re-sorts by rel path anyway).
-	for _, jr := range jobResults {
-		if jr.err != nil {
-			return jr.err
-		}
-		full := path.Join(distRoot, jr.plain.rel)
-		if err := sink.WriteFile(ctx, full, bytes.NewReader(jr.content), jr.plain.size); err != nil {
-			return err
-		}
-		files = append(files, jr.plain)
-		for _, cf := range jr.compressed {
-			full := path.Join(distRoot, cf.hf.rel)
-			if err := sink.WriteFile(ctx, full, bytes.NewReader(cf.data), cf.hf.size); err != nil {
-				return err
+		// Write compressed files to the sink; plain bytes were never assembled
+		// so there is nothing to write for the plain path (its hash is recorded
+		// in Release for clients that need it).
+		for _, jr := range batchResults {
+			if jr.err != nil {
+				return jr.err
 			}
-			files = append(files, cf.hf)
+			files = append(files, jr.plain)
+			for _, cf := range jr.compressed {
+				full := path.Join(distRoot, cf.hf.rel)
+				if err := sink.WriteFile(ctx, full, bytes.NewReader(cf.data), cf.hf.size); err != nil {
+					return err
+				}
+				files = append(files, cf.hf)
+			}
 		}
 	}
 
@@ -219,37 +280,40 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		if len(stanzas) == 0 {
 			continue
 		}
-		content := []byte(strings.Join(stanzas, "\n"))
-		if len(content) > 0 && content[len(content)-1] != '\n' {
-			content = append(content, '\n')
+		varBufs := make([]bytes.Buffer, len(variants))
+		varWCs := make([]io.WriteCloser, len(variants))
+		for i, v := range variants {
+			wc, err := v.newWriter(&varBufs[i])
+			if err != nil {
+				return fmt.Errorf("open %s for sources: %w", v.suffix, err)
+			}
+			varWCs[i] = wc
 		}
-		sum256 := sha256.Sum256(content)
-		sum512 := sha512.Sum512(content)
+
+		sum256, sum512, plainSize, err := streamStanzas(stanzas, varBufs, varWCs)
+		if err != nil {
+			return err
+		}
+
 		plain := hashedFile{
 			rel:    comp + "/source/Sources",
-			size:   int64(len(content)),
-			sha256: hex.EncodeToString(sum256[:]),
-			sha512: hex.EncodeToString(sum512[:]),
-		}
-		if err := sink.WriteFile(ctx, path.Join(distRoot, plain.rel), bytes.NewReader(content), plain.size); err != nil {
-			return err
+			size:   plainSize,
+			sha256: hex.EncodeToString(sum256),
+			sha512: hex.EncodeToString(sum512),
 		}
 		files = append(files, plain)
 
-		for _, v := range variants {
-			compressed, err := v.fn(content)
-			if err != nil {
-				return err
-			}
-			cs256 := sha256.Sum256(compressed)
-			cs512 := sha512.Sum512(compressed)
+		for i, v := range variants {
+			data := varBufs[i].Bytes()
+			cs256 := sha256.Sum256(data)
+			cs512 := sha512.Sum512(data)
 			hf := hashedFile{
 				rel:    comp + "/source/Sources" + v.suffix,
-				size:   int64(len(compressed)),
+				size:   int64(len(data)),
 				sha256: hex.EncodeToString(cs256[:]),
 				sha512: hex.EncodeToString(cs512[:]),
 			}
-			if err := sink.WriteFile(ctx, path.Join(distRoot, hf.rel), bytes.NewReader(compressed), hf.size); err != nil {
+			if err := sink.WriteFile(ctx, path.Join(distRoot, hf.rel), bytes.NewReader(data), hf.size); err != nil {
 				return err
 			}
 			files = append(files, hf)
@@ -320,8 +384,8 @@ func buildRelease(in SuiteInput, files []hashedFile) string {
 
 	var sb256, sb512 strings.Builder
 	for _, f := range files {
-		sb256.WriteString(fmt.Sprintf("\n %s %s %s", f.sha256, padSize(f.size), f.rel))
-		sb512.WriteString(fmt.Sprintf("\n %s %s %s", f.sha512, padSize(f.size), f.rel))
+		sb256.WriteString(fmt.Sprintf("\n %s %d %s", f.sha256, f.size, f.rel))
+		sb512.WriteString(fmt.Sprintf("\n %s %d %s", f.sha512, f.size, f.rel))
 	}
 	p.Set("SHA256", strings.TrimPrefix(sb256.String(), "\n"))
 	p.Set("SHA512", strings.TrimPrefix(sb512.String(), "\n"))
@@ -330,53 +394,4 @@ func buildRelease(in SuiteInput, files []hashedFile) string {
 	return out
 }
 
-func padSize(n int64) string {
-	return strconv.FormatInt(n, 10)
-}
 
-func xzBytes(data []byte) ([]byte, error) {
-	const dictCap = 64 << 20 // 64 MB — xz preset 9
-	var buf bytes.Buffer
-	xw, err := xz.WriterConfig{DictCap: dictCap}.NewWriter(&buf)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := xw.Write(data); err != nil {
-		return nil, err
-	}
-	if err := xw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func gzipBytes(data []byte, level int) ([]byte, error) {
-	var buf bytes.Buffer
-	gw, err := gzip.NewWriterLevel(&buf, level)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := gw.Write(data); err != nil {
-		return nil, err
-	}
-	if err := gw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func zstdBytes(data []byte, level int) ([]byte, error) {
-	encoderLevel := zstd.EncoderLevelFromZstd(level)
-	var buf bytes.Buffer
-	zw, err := zstd.NewWriter(&buf, zstd.WithEncoderLevel(encoderLevel))
-	if err != nil {
-		return nil, err
-	}
-	if _, err := zw.Write(data); err != nil {
-		return nil, err
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
