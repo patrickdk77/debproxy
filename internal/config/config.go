@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -195,12 +196,14 @@ type UpstreamDef struct {
 type OSLayout struct {
 	OS            string           `yaml:"os"`
 	Architectures []string         `yaml:"architectures"`
+	HashTypes     []string         `yaml:"hash_types"`
 	Codenames     []CodenameLayout `yaml:"codenames"`
 }
 
 type CodenameLayout struct {
 	Codename      string            `yaml:"codename"`
 	Architectures []string          `yaml:"architectures"`
+	HashTypes     []string          `yaml:"hash_types"`
 	Components    []ComponentLayout `yaml:"components"`
 }
 
@@ -317,6 +320,18 @@ func (c *Config) resolveLayouts() error {
 					return fmt.Errorf("layout %s/%s/%s: architectures are required", osLayout.OS, cn.Codename, comp.Component)
 				}
 
+				hashTypes := mergeArchs(osLayout.HashTypes, cn.HashTypes)
+				if len(hashTypes) == 0 {
+					hashTypes = []string{"sha256"}
+				}
+				for _, ht := range hashTypes {
+					switch ht {
+					case "sha256", "sha512", "sha1", "md5sum":
+					default:
+						return fmt.Errorf("layout %s/%s: invalid hash_type %q (valid: sha256, sha512, sha1, md5sum)", osLayout.OS, cn.Codename, ht)
+					}
+				}
+
 				var upstreams []model.UpstreamSource
 				for _, upName := range comp.Upstreams {
 					def, ok := c.Upstreams[upName]
@@ -360,6 +375,7 @@ func (c *Config) resolveLayouts() error {
 					Codename:  cn.Codename,
 					Component: comp.Component,
 					Archs:     archs,
+					HashTypes: hashTypes,
 					Upstreams: upstreams,
 				})
 			}
@@ -376,6 +392,43 @@ func mergeArchs(layers ...[]string) []string {
 		}
 	}
 	return nil
+}
+
+// ComponentsAndArches returns the sorted set of components and architectures
+// configured for the given (os, codename) pair.
+func (c *Config) ComponentsAndArches(osName, codename string) ([]string, []string) {
+	compSet := map[string]bool{}
+	archSet := map[string]bool{}
+	for _, l := range c.ResolvedLayouts {
+		if l.OS != osName || l.Codename != codename {
+			continue
+		}
+		compSet[l.Component] = true
+		for _, a := range l.Archs {
+			archSet[a] = true
+		}
+	}
+	return sortedKeys(compSet), sortedKeys(archSet)
+}
+
+// HashTypesFor returns the configured hash types for the given (os, codename)
+// pair. Defaults to ["sha256"] when the pair is not found.
+func (c *Config) HashTypesFor(osName, codename string) []string {
+	for _, l := range c.ResolvedLayouts {
+		if l.OS == osName && l.Codename == codename {
+			return l.HashTypes
+		}
+	}
+	return []string{"sha256"}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func expandPlaceholders(s, osName, codename, component string) string {

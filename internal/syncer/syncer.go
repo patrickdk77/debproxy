@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"sort"
+	"runtime/debug"
 	"time"
 
 	"github.com/debproxy/debproxy/internal/avail"
@@ -236,6 +236,7 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 			}
 		}
 		slog.Info("update job", "os", k.osName, "codename", k.codename, "updated", updated)
+		debug.FreeOSMemory()
 	}
 
 	return nil
@@ -284,7 +285,7 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 	if err != nil {
 		return err
 	}
-	components, arches := s.componentsAndArches(osName, codename)
+	components, arches := s.cfg.ComponentsAndArches(osName, codename)
 	stanzas := groupStanzas(entries, components, arches)
 
 	srcEntries, err := s.index.ListSourceEntries(ctx, model.Selector{OS: osName, Codename: codename})
@@ -306,33 +307,11 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 		SourceStanzas: sourceStanzas,
 		Date:          now,
 		Compression:   s.cfg.Storage.Compression.ResolveSnapshot(),
+		HashTypes:     s.cfg.HashTypesFor(osName, codename),
 	}
 	return publish.GenerateSuite(ctx, sink, prefix, in, s.key)
 }
 
-func (s *Syncer) componentsAndArches(osName, codename string) ([]string, []string) {
-	compSet := map[string]bool{}
-	archSet := map[string]bool{}
-	for _, l := range s.cfg.ResolvedLayouts {
-		if l.OS != osName || l.Codename != codename {
-			continue
-		}
-		compSet[l.Component] = true
-		for _, a := range l.Archs {
-			archSet[a] = true
-		}
-	}
-	return sortedKeys(compSet), sortedKeys(archSet)
-}
-
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
 
 // groupSourceStanzas builds SourceStanzas[component] from source entries.
 // When the metadata holds multiple versions of the same source package, only

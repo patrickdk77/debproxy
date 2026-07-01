@@ -136,9 +136,30 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 		cachedEntry, _ = f.cache.get(cacheKey)
 	}
 
-	archPkgs := make(map[string][]apt.RawPkg, len(f.src.Archs))
-	var hasStaleMismatch bool
+	// Restrict to architectures that the upstream actually lists in the Release.
+	// The Architectures field is not used because upstreams like archive.ubuntu.com
+	// list all architectures there even though arm64 Packages are only served from
+	// ports.ubuntu.com. Checking rel.Files is authoritative: if no Packages variant
+	// is listed for a given arch, the upstream does not serve it.
+	archs := make([]string, 0, len(f.src.Archs))
 	for _, arch := range f.src.Archs {
+		prefix := f.src.Component + "/binary-" + arch + "/Packages"
+		for path := range rel.Files {
+			if strings.HasPrefix(path, prefix) {
+				archs = append(archs, arch)
+				break
+			}
+		}
+	}
+	if len(archs) < len(f.src.Archs) {
+		slog.Debug("upstream does not serve all configured arches for component",
+			"upstream", f.src.Name, "component", f.src.Component,
+			"configured", f.src.Archs, "available", archs)
+	}
+
+	archPkgs := make(map[string][]apt.RawPkg, len(archs))
+	var hasStaleMismatch bool
+	for _, arch := range archs {
 		paras, err := f.fetchPackagesMaybeReuse(ctx, rel, arch, cachedEntry)
 		if err != nil {
 			if cachedEntry != nil {

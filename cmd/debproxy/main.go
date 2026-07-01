@@ -26,6 +26,7 @@ import (
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/storagefactory"
+	"github.com/debproxy/debproxy/internal/model"
 	syncerpkg "github.com/debproxy/debproxy/internal/syncer"
 	"github.com/debproxy/debproxy/internal/upstream"
 	"github.com/debproxy/debproxy/internal/webhook"
@@ -226,10 +227,12 @@ func runUpdate(args []string) int {
 		slog.Error("flush index after update", "err", err)
 		return 1
 	}
-	if err := s.Snapshot(ctx, time.Now()); err != nil {
+	snapNow := time.Now()
+	if err := s.Snapshot(ctx, snapNow); err != nil {
 		slog.Error("snapshot after update", "err", err)
 		return 1
 	}
+	writeSnapshotName(snapNow.UTC().Format(syncerpkg.SnapshotIDFormat))
 	slog.Info("update complete")
 	return 0
 }
@@ -253,10 +256,12 @@ func runSnapshot(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
-	if err := s.Snapshot(ctx, time.Now()); err != nil {
+	snapNow := time.Now()
+	if err := s.Snapshot(ctx, snapNow); err != nil {
 		slog.Error("snapshot", "err", err)
 		return 1
 	}
+	writeSnapshotName(snapNow.UTC().Format(syncerpkg.SnapshotIDFormat))
 	slog.Info("snapshot complete")
 	return 0
 }
@@ -364,10 +369,12 @@ func runPrime(args []string) int {
 		return 1
 	}
 	if *snapshot {
-		if err := s.Snapshot(ctx, time.Now()); err != nil {
+		snapNow := time.Now()
+		if err := s.Snapshot(ctx, snapNow); err != nil {
 			slog.Error("snapshot", "err", err)
 			return 1
 		}
+		writeSnapshotName(snapNow.UTC().Format(syncerpkg.SnapshotIDFormat))
 	}
 	return 0
 }
@@ -594,18 +601,35 @@ func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstrea
 	}
 }
 
-// refreshIndexes sequentially fetches each unique upstream index into the cache,
-// then runs the auto-update check against the freshly-fetched data.
-// Sources are deduplicated by (URL, suite, component) — the same key the cache uses.
+// refreshIndexes fetches each upstream index into the cache one codename at a
+// time, running a GC pass between codenames to bound peak allocation. After all
+// codenames are fetched it runs the auto-update check against the fresh data.
+// Within each codename, upstreams are deduplicated by (URL, suite, component).
 func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client, cache *upstream.IndexCache, syncr *syncerpkg.Syncer) {
-	seen := map[string]bool{}
+	// Collect upstreams per (os, codename) in config order.
+	type layoutKey struct{ os, codename string }
+	var keys []layoutKey
+	byKey := map[layoutKey][]model.UpstreamSource{}
 	for _, layout := range cfg.ResolvedLayouts {
-		for _, src := range layout.Upstreams {
-			key := src.URL + "\x00" + src.Suite + "\x00" + src.Component
-			if seen[key] {
+		k := layoutKey{layout.OS, layout.Codename}
+		if _, exists := byKey[k]; !exists {
+			keys = append(keys, k)
+		}
+		byKey[k] = append(byKey[k], layout.Upstreams...)
+	}
+
+	totalSeen := 0
+	for _, k := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+		seen := map[string]bool{}
+		for _, src := range byKey[k] {
+			srcKey := src.URL + "\x00" + src.Suite + "\x00" + src.Component
+			if seen[srcKey] {
 				continue
 			}
-			seen[key] = true
+			seen[srcKey] = true
 			if ctx.Err() != nil {
 				return
 			}
@@ -615,14 +639,25 @@ func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client
 				slog.Warn("upstream index refresh failed", "upstream", src.Name, "suite", src.Suite, "component", src.Component, "err", err)
 			}
 		}
+		totalSeen += len(seen)
+		debug.FreeOSMemory()
 	}
-	slog.Info("upstream index refresh complete", "sources", len(seen))
+	slog.Info("upstream index refresh complete", "sources", totalSeen)
 
 	if ctx.Err() != nil {
 		return
 	}
 	if err := syncr.UpdateWithCache(ctx, cache); err != nil {
 		slog.Warn("post-refresh update failed", "err", err)
+	}
+}
+
+// writeSnapshotName records the snapshot ID in a file named "snapshot-name" in
+// the current working directory so that copies or clones of this installation
+// can identify which snapshot they were made from.
+func writeSnapshotName(id string) {
+	if err := os.WriteFile("snapshot-name", []byte(id+"\n"), 0644); err != nil {
+		slog.Warn("write snapshot-name file", "err", err)
 	}
 }
 
@@ -731,8 +766,11 @@ func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched) func() 
 			case <-time.After(time.Until(next)):
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 				slog.Info("publishing scheduled snapshot")
-				if err := syncr.Snapshot(ctx, time.Now()); err != nil {
+				snapNow := time.Now()
+				if err := syncr.Snapshot(ctx, snapNow); err != nil {
 					slog.Warn("scheduled snapshot failed", "err", err)
+				} else {
+					writeSnapshotName(snapNow.UTC().Format(syncerpkg.SnapshotIDFormat))
 				}
 				cancel()
 			case <-stop:

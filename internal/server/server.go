@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -734,6 +735,7 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
+	swapped := err == nil
 	if err == nil {
 		now := time.Now()
 		jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
@@ -746,6 +748,10 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 			"os", osName, "codename", codename, "elapsed", elapsed, "err", err)
 	}
 	s.mu.Unlock()
+
+	if swapped {
+		debug.FreeOSMemory()
+	}
 
 	if av.HasStaleMismatch {
 		s.startMismatchRetry(osName, codename)
@@ -820,7 +826,7 @@ func (s *Server) startMismatchRetry(osName, codename string) {
 }
 
 func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (map[string][]byte, map[string]string, error) {
-	components, arches := s.componentsAndArches(av.OS, av.Codename)
+	components, arches := s.cfg.ComponentsAndArches(av.OS, av.Codename)
 
 	type comboKey struct{ comp, arch string }
 	type comboResult struct {
@@ -900,6 +906,7 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 		SourceStanzas: sourceStanzas,
 		Date:          time.Now(),
 		Compression:   s.cfg.Storage.Compression.ResolveLive(),
+		HashTypes:     s.cfg.HashTypesFor(av.OS, av.Codename),
 	}
 	if err := publish.GenerateSuite(ctx, sink, "", in, s.key); err != nil {
 		return nil, nil, err
@@ -926,29 +933,6 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 	return sink.files, hashes, nil
 }
 
-func (s *Server) componentsAndArches(osName, codename string) ([]string, []string) {
-	compSet := map[string]bool{}
-	archSet := map[string]bool{}
-	for _, l := range s.cfg.ResolvedLayouts {
-		if l.OS != osName || l.Codename != codename {
-			continue
-		}
-		compSet[l.Component] = true
-		for _, a := range l.Archs {
-			archSet[a] = true
-		}
-	}
-	return sortedKeys(compSet), sortedKeys(archSet)
-}
-
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
 
 type memSink struct {
 	files map[string][]byte

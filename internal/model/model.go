@@ -44,6 +44,10 @@ type Layout struct {
 	Codename  string
 	Component string
 	Archs     []string
+	// HashTypes lists the hash algorithms written to Release (e.g. "sha256",
+	// "sha512", "sha1", "md5sum"). All components within a codename share the
+	// same value; it is repeated here for convenient lookup.
+	HashTypes []string
 	Upstreams []UpstreamSource
 }
 
