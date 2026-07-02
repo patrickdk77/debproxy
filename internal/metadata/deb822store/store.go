@@ -787,6 +787,8 @@ func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error 
 	updated := false
 	for i, existing := range srcs {
 		if existing.Package == e.Package && existing.Version == e.Version {
+			e.FilesDownloaded = e.FilesDownloaded || existing.FilesDownloaded
+			e.FirstSeen = existing.FirstSeen
 			srcs[i] = e
 			updated = true
 			break
@@ -930,6 +932,7 @@ func sourceEntryToParagraph(e model.SourceEntry) *apt.Paragraph {
 	p.Set("X-Debproxy-Local-Dir", e.LocalDir)
 	p.Set("X-Debproxy-Upstream-Dir", e.UpstreamDir)
 	p.Set("X-Debproxy-First-Seen", e.FirstSeen.UTC().Format(time.RFC3339))
+	p.Set("X-Debproxy-Files-Downloaded", strconv.FormatBool(e.FilesDownloaded))
 	p.Set("X-Debproxy-Stanza", e.Stanza)
 	for i, f := range e.Files {
 		p.Set(fmt.Sprintf("X-Debproxy-File-%d", i),
@@ -941,6 +944,7 @@ func sourceEntryToParagraph(e model.SourceEntry) *apt.Paragraph {
 func sourceEntryFromParagraph(osName, codename, component string, p *apt.Paragraph) model.SourceEntry {
 	stanza := strings.TrimPrefix(p.Get("X-Debproxy-Stanza"), "\n")
 	firstSeen, _ := time.Parse(time.RFC3339, p.Get("X-Debproxy-First-Seen"))
+	filesDownloaded, _ := strconv.ParseBool(p.Get("X-Debproxy-Files-Downloaded"))
 
 	var files []model.SourceFile
 	for i := 0; ; i++ {
@@ -961,17 +965,18 @@ func sourceEntryFromParagraph(osName, codename, component string, p *apt.Paragra
 	}
 
 	return model.SourceEntry{
-		OS:          osName,
-		Codename:    codename,
-		Component:   component,
-		Package:     p.Get("Package"),
-		Version:     p.Get("Version"),
-		Upstream:    p.Get("X-Debproxy-Upstream"),
-		LocalDir:    p.Get("X-Debproxy-Local-Dir"),
-		UpstreamDir: p.Get("X-Debproxy-Upstream-Dir"),
-		Files:       files,
-		Stanza:      stanza,
-		FirstSeen:   firstSeen,
+		OS:              osName,
+		Codename:        codename,
+		Component:       component,
+		Package:         p.Get("Package"),
+		Version:         p.Get("Version"),
+		Upstream:        p.Get("X-Debproxy-Upstream"),
+		LocalDir:        p.Get("X-Debproxy-Local-Dir"),
+		UpstreamDir:     p.Get("X-Debproxy-Upstream-Dir"),
+		Files:           files,
+		Stanza:          stanza,
+		FirstSeen:       firstSeen,
+		FilesDownloaded: filesDownloaded,
 	}
 }
 

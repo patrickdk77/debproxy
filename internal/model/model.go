@@ -116,8 +116,12 @@ type SourceEntry struct {
 	UpstreamDir string
 	Files       []SourceFile
 	// Stanza is the full deb822 Sources stanza with Directory: rewritten to LocalDir.
-	Stanza      string
-	FirstSeen   time.Time
+	Stanza         string
+	FirstSeen      time.Time
+	// FilesDownloaded is true when at least one file for this source package
+	// version has been stored locally. Only entries with this flag set are
+	// eligible for auto-update downloads on a version bump.
+	FilesDownloaded bool
 }
 
 // SourceDir returns the storage directory for a source package's files.

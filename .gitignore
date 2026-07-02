@@ -1,4 +1,5 @@
 /debproxy
+/debrepo
 /cmd/debtest/
 *.deb
 *.test

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/debproxy/debproxy/internal/avail"
@@ -148,7 +149,9 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 			}
 			prevSrcVersion = make(map[string]string, len(prevSrcEntries))
 			for _, e := range prevSrcEntries {
-				prevSrcVersion[e.Component+"/"+e.Package] = e.Version
+				if e.FilesDownloaded {
+					prevSrcVersion[e.Component+"/"+e.Package] = e.Version
+				}
 			}
 		}
 		var srcUpdated int
@@ -187,6 +190,10 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) erro
 									"package", sp.Package, "version", sp.Version,
 									"file", sf.Filename, "err", err)
 							}
+						}
+						entry.FilesDownloaded = true
+						if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
+							slog.Warn("upsert source entry after auto-update download", "package", sp.Package, "err", err)
 						}
 						srcUpdated++
 					}
@@ -275,6 +282,13 @@ func (s *Syncer) Snapshot(ctx context.Context, now time.Time) error {
 		}
 		slog.Info("published snapshot", "os", osName, "snapshot", snapshotID)
 		metrics.SnapshotPublishesTotal.WithLabelValues(osName).Inc()
+	}
+
+	// Write a plain-text file so clients can discover which snapshot ID
+	// current points to without parsing Release metadata.
+	idBytes := []byte(snapshotID)
+	if err := s.store.WriteFile(ctx, "current/snapshot-name", strings.NewReader(snapshotID), int64(len(idBytes))); err != nil {
+		return fmt.Errorf("write current/snapshot-name: %w", err)
 	}
 	return nil
 }

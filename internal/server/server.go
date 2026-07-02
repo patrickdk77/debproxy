@@ -548,7 +548,14 @@ func (s *Server) pullThroughSource(ctx context.Context, osName, srcPath string) 
 		return err
 	}
 	if entry != nil {
-		return s.downloadAndCacheSourceFile(ctx, *entry, upstreamName, filename)
+		if err := s.downloadAndCacheSourceFile(ctx, *entry, upstreamName, filename); err != nil {
+			return err
+		}
+		entry.FilesDownloaded = true
+		if err := s.index.UpsertSourceEntry(ctx, *entry); err != nil {
+			slog.Warn("upsert source entry after pull-through", "package", entry.Package, "err", err)
+		}
+		return nil
 	}
 
 	// Fall back to fetching live Sources from upstream.
