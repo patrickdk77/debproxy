@@ -34,7 +34,15 @@ func (r RawPkg) WithFilename(newFilename string) string {
 	const prefix = "\nFilename: "
 	idx := strings.Index(r.Raw, prefix)
 	if idx < 0 {
-		// Filename is the first (or only) field  -- handle gracefully.
+		if strings.HasPrefix(r.Raw, "Filename: ") {
+			// Filename is the first field  -- replace it in place.
+			end := strings.IndexByte(r.Raw, '\n')
+			if end < 0 {
+				return "Filename: " + newFilename
+			}
+			return "Filename: " + newFilename + r.Raw[end:]
+		}
+		// No Filename field at all  -- prepend it.
 		return "Filename: " + newFilename + "\n" + r.Raw
 	}
 	rest := r.Raw[idx+len(prefix):]

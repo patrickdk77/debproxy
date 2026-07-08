@@ -368,6 +368,9 @@ func applyEdOpGeneric[T any](items []T, li *lineIdx, op edOp, parse func(io.Read
 		if s1 < 0 {
 			return items, nil
 		}
+		if s2 < s1 || s2 >= len(items) {
+			return nil, fmt.Errorf("ed delete at %d,%d: stanza range [%d,%d] out of bounds for %d items", op.addr1, op.addr2, s1, s2, len(items))
+		}
 		out := make([]T, 0, len(items)-(s2-s1+1))
 		out = append(out, items[:s1]...)
 		return append(out, items[s2+1:]...), nil
@@ -378,12 +381,18 @@ func applyEdOpGeneric[T any](items []T, li *lineIdx, op edOp, parse func(io.Read
 			return nil, fmt.Errorf("ed append at %d: %w", op.addr1, err)
 		}
 		ins := insertionStanza(li, op.addr1)
+		if ins+1 > len(items) {
+			return nil, fmt.Errorf("ed append at %d: insertion point %d out of bounds for %d items", op.addr1, ins+1, len(items))
+		}
 		return sliceInsert(items, ins+1, newItems), nil
 
 	case 'c':
 		s1, s2 := stanzaRange(li, op.addr1, op.addr2)
 		if s1 < 0 {
 			return items, nil
+		}
+		if s2 < s1 || s2 >= len(items) {
+			return nil, fmt.Errorf("ed change at %d,%d: stanza range [%d,%d] out of bounds for %d items", op.addr1, op.addr2, s1, s2, len(items))
 		}
 		if s1 == s2 {
 			// Change within one stanza  -- reconstruct from surrounding unchanged

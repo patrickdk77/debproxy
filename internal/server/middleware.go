@@ -148,6 +148,25 @@ func (sw *statusWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// sanitizeLogField strips characters that could break the quoted Combined Log
+// Format structure or inject forged fields/control sequences (CWE-117): double
+// quotes and ASCII control characters. Applied to header values (Referer,
+// User-Agent) that are attacker-controlled and written verbatim into the log.
+func sanitizeLogField(s string) string {
+	needsStrip := func(r rune) bool { return r == '"' || r < 0x20 || r == 0x7f }
+	if strings.IndexFunc(s, needsStrip) < 0 {
+		return s // common case: nothing to strip, skip the allocation
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if needsStrip(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // logging writes one Apache Combined Log Format line per request to stdout.
 // Format: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-agent}i"
 func logging(next http.Handler) http.Handler {
@@ -156,11 +175,11 @@ func logging(next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
 
-		referer := r.Referer()
+		referer := sanitizeLogField(r.Referer())
 		if referer == "" {
 			referer = "-"
 		}
-		userAgent := r.UserAgent()
+		userAgent := sanitizeLogField(r.UserAgent())
 		if userAgent == "" {
 			userAgent = "-"
 		}
@@ -169,7 +188,7 @@ func logging(next http.Handler) http.Handler {
 			clientIP(r),
 			t.Format("02/Jan/2006:15:04:05 -0700"),
 			r.Method,
-			r.RequestURI,
+			sanitizeLogField(r.RequestURI),
 			r.Proto,
 			sw.status,
 			sw.bytes,

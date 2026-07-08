@@ -55,6 +55,14 @@ type Server struct {
 	liveCache    map[string]*liveEntry   // key: os/codename
 	liveBuilding map[string]chan struct{} // in-flight builds
 	retryCancel  map[string]context.CancelFunc // background mismatch retries
+
+	// validOSCodename and validTriple bound metric-label cardinality to the
+	// configured universe. Keys are "os/codename" and "os/codename/upstream"
+	// respectively, built once from cfg.ResolvedLayouts. Deeper path segments
+	// (section, first-letter bucket, package name, filename) are per-package
+	// and unbounded, so they're never validated or used as metric labels.
+	validOSCodename map[string]bool
+	validTriple     map[string]bool
 }
 
 const (
@@ -82,19 +90,63 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 	if indexCache == nil {
 		indexCache = upstream.NewIndexCache()
 	}
-	return &Server{
-		cfg:          cfg,
-		store:        store,
-		index:        index,
-		key:          key,
-		client:       client,
-		indexCache:   indexCache,
-		notifier:     notifier,
-		exists:       exists,
-		liveCache:    map[string]*liveEntry{},
-		liveBuilding: map[string]chan struct{}{},
-		retryCancel:  map[string]context.CancelFunc{},
+	validOSCodename := map[string]bool{}
+	validTriple := map[string]bool{}
+	for _, l := range cfg.ResolvedLayouts {
+		validOSCodename[l.OS+"/"+l.Codename] = true
+		for _, u := range l.Upstreams {
+			validTriple[l.OS+"/"+l.Codename+"/"+u.Name] = true
+		}
 	}
+
+	return &Server{
+		cfg:             cfg,
+		store:           store,
+		index:           index,
+		key:             key,
+		client:          client,
+		indexCache:      indexCache,
+		notifier:        notifier,
+		exists:          exists,
+		liveCache:       map[string]*liveEntry{},
+		liveBuilding:    map[string]chan struct{}{},
+		retryCancel:     map[string]context.CancelFunc{},
+		validOSCodename: validOSCodename,
+		validTriple:     validTriple,
+	}
+}
+
+// isKnownTriple reports whether (os, codename, upstream) matches a configured
+// layout. Used at the routing layer to reject requests for combinations that
+// could never be served, before any real work (pull-through, live-index
+// generation) is attempted for them.
+func (s *Server) isKnownTriple(osName, codename, upstream string) bool {
+	return s.validTriple[osName+"/"+codename+"/"+upstream]
+}
+
+// isKnownOSCodename is the (os, codename)-only analog of isKnownTriple.
+func (s *Server) isKnownOSCodename(osName, codename string) bool {
+	return s.validOSCodename[osName+"/"+codename]
+}
+
+// metricTriple returns (os, codename, upstream) unchanged if they match a
+// configured layout, otherwise a single constant sentinel for all three so
+// that requests for made-up os/codename/upstream values can't grow the
+// PoolHitsTotal/PullThroughsTotal label set without bound.
+func (s *Server) metricTriple(osName, codename, upstream string) (string, string, string) {
+	if s.validTriple[osName+"/"+codename+"/"+upstream] {
+		return osName, codename, upstream
+	}
+	return "_invalid", "_invalid", "_invalid"
+}
+
+// metricOSCodename is the (os, codename)-only analog of metricTriple, for
+// metrics that don't carry an upstream label (e.g. SourcePullThroughsTotal).
+func (s *Server) metricOSCodename(osName, codename string) (string, string) {
+	if s.validOSCodename[osName+"/"+codename] {
+		return osName, codename
+	}
+	return "_invalid", "_invalid"
 }
 
 // sweepExpiredLiveCache removes entries whose TTL has elapsed so that inactive
@@ -211,8 +263,10 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, parts []
 	}
 	if remainder[0] == "src" {
 		// Source files under snapshots are served directly from storage (no pull-through).
-		// remainder: [src, codename, upstream, ...]
-		cn, up := segAt(remainder, 1), segAt(remainder, 2)
+		// remainder: [src, os, codename, upstream, ...] -- src storage paths embed
+		// os as their own segment (model.SourceDir), same as pool paths do, so it
+		// appears a second time here alongside the osName already split off above.
+		cn, up := segAt(remainder, 2), segAt(remainder, 3)
 		s.servePool(w, r, strings.Join(remainder, "/"), false, osName, cn, up)
 		return
 	}
@@ -233,13 +287,23 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 	if remainder[0] == "pool" {
 		// remainder: [pool, os, codename, upstream, ...]
 		cn, up := segAt(remainder, 2), segAt(remainder, 3)
+		if !s.isKnownTriple(osName, cn, up) {
+			// Reject before any real work (pull-through, live-index build) is
+			// attempted for a combination that could never be served -- not
+			// just relabeled to a metrics sentinel after the fact.
+			http.NotFound(w, r)
+			return
+		}
 		s.servePool(w, r, strings.Join(remainder, "/"), true, osName, cn, up)
 		return
 	}
 	if remainder[0] == "src" {
-		codename := ""
-		if len(remainder) > 1 {
-			codename = remainder[1]
+		// remainder: [src, os, codename, upstream, ...] -- see the comment on the
+		// analogous branch in handleSnapshot for why os appears twice here.
+		codename := segAt(remainder, 2)
+		if !s.isKnownOSCodename(osName, codename) {
+			http.NotFound(w, r)
+			return
 		}
 		s.serveSrc(w, r, osName, codename, strings.Join(remainder, "/"))
 		return
@@ -250,6 +314,10 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 			return
 		}
 		codename := remainder[1]
+		if !s.isKnownOSCodename(osName, codename) {
+			http.NotFound(w, r)
+			return
+		}
 		entry, err := s.getLive(r.Context(), osName, codename)
 		if err != nil {
 			if r.Context().Err() != nil {
@@ -429,6 +497,7 @@ func segAt(segs []string, i int) string {
 // osLabel, cnLabel, upLabel are the metric label values passed by the caller
 // from already-parsed URL segments  -- no re-parsing needed.
 func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath string, allowPullThrough bool, osLabel, cnLabel, upLabel string) {
+	osLabel, cnLabel, upLabel = s.metricTriple(osLabel, cnLabel, upLabel)
 	exists, err := s.store.Exists(r.Context(), poolPath)
 	if err != nil {
 		slog.Error("pool exists check", "path", poolPath, "err", err)
@@ -498,13 +567,14 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 	}
 	if !exists {
 		slog.Debug("source pull-through", "path", srcPath)
+		mOS, mCodename := s.metricOSCodename(osName, codename)
 		if err := s.pullThroughSource(r.Context(), osName, srcPath); err != nil {
 			slog.Error("source pull-through failed", "path", srcPath, "err", err)
 			http.Error(w, "source pull-through failed", http.StatusBadGateway)
-			metrics.SourcePullThroughsTotal.WithLabelValues(osName, codename, "error").Inc()
+			metrics.SourcePullThroughsTotal.WithLabelValues(mOS, mCodename, "error").Inc()
 			return
 		}
-		metrics.SourcePullThroughsTotal.WithLabelValues(osName, codename, "success").Inc()
+		metrics.SourcePullThroughsTotal.WithLabelValues(mOS, mCodename, "success").Inc()
 	}
 
 	info, err := s.store.Stat(r.Context(), srcPath)

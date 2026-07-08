@@ -64,6 +64,14 @@ type ScheduleConfig struct {
 	// pool GC while in serve mode. Accepts the same format as Snapshot.
 	// Empty string or "0" disables automatic cleanup.
 	Cleanup string `yaml:"cleanup"`
+	// GCGrace is the minimum age a pool/src file must reach before pool/src GC
+	// will delete it as unreferenced. This protects against a race between a
+	// concurrent cache write (store.PutFile followed some time later by a
+	// metadata index commit) and a GC pass building its "keep" set from the
+	// index in between those two steps. Accepts a Go duration string (e.g.
+	// "30m", "2h"). Empty string or "0" uses the built-in default of 1 hour --
+	// this is a safety margin, not a feature to casually disable.
+	GCGrace string `yaml:"gc_grace"`
 }
 
 // CompressionLevel is a YAML-compatible compression setting.
@@ -119,12 +127,17 @@ func ResolveLevel(c CompressionLevel, def int) int {
 	}
 }
 
-// CompressionFormatConfig holds per-format compression settings for one path (snapshot or live).
+// CompressionFormatConfig holds per-format compression settings for one path
+// (snapshot or live). Fields are pointers so "absent from YAML" (nil) can be
+// told apart from "explicitly set to true" (&CompressionDefault) -- both
+// decode to the same underlying zero value otherwise, which matters for XZ:
+// its live default is disabled, but an explicit `xz: true` must still enable
+// it rather than being indistinguishable from never having set the key.
 type CompressionFormatConfig struct {
-	GZip  CompressionLevel `yaml:"gzip"`
-	ZStd  CompressionLevel `yaml:"zstd"`
-	XZ    CompressionLevel `yaml:"xz"`
-	BZip2 CompressionLevel `yaml:"bzip2"`
+	GZip  *CompressionLevel `yaml:"gzip"`
+	ZStd  *CompressionLevel `yaml:"zstd"`
+	XZ    *CompressionLevel `yaml:"xz"`
+	BZip2 *CompressionLevel `yaml:"bzip2"`
 }
 
 // CompressionConfig holds compression settings for snapshot and live publishing.
@@ -133,15 +146,33 @@ type CompressionConfig struct {
 	Live     CompressionFormatConfig `yaml:"live"`
 }
 
+// resolveLevelPtr is the nil-aware counterpart of ResolveLevel: an absent
+// field (nil) uses def, same as an explicit CompressionDefault (true) would.
+func resolveLevelPtr(c *CompressionLevel, def int) int {
+	if c == nil {
+		return def
+	}
+	return ResolveLevel(*c, def)
+}
+
+// xzEnabled reports whether XZ should be enabled given fc (nil = never set
+// in YAML) and whatever the calling mode's default is when unset.
+func xzEnabled(fc *CompressionLevel, enabledByDefault bool) bool {
+	if fc == nil {
+		return enabledByDefault
+	}
+	return *fc != CompressionDisabled
+}
+
 // ResolveSnapshot returns concrete compression settings for snapshot publishing,
 // applying built-in defaults where fields are absent or set to true.
 func (c CompressionConfig) ResolveSnapshot() publish.Compression {
 	def := publish.DefaultSnapshotCompression
 	fc := c.Snapshot
 	return publish.Compression{
-		GZip: ResolveLevel(fc.GZip, def.GZip),
-		ZStd: ResolveLevel(fc.ZStd, def.ZStd),
-		XZ:   fc.XZ != CompressionDisabled, // default=enabled; user sets false to disable
+		GZip: resolveLevelPtr(fc.GZip, def.GZip),
+		ZStd: resolveLevelPtr(fc.ZStd, def.ZStd),
+		XZ:   xzEnabled(fc.XZ, def.XZ), // default=enabled; user sets false to disable
 	}
 }
 
@@ -151,9 +182,9 @@ func (c CompressionConfig) ResolveLive() publish.Compression {
 	def := publish.DefaultLiveCompression
 	fc := c.Live
 	return publish.Compression{
-		GZip: ResolveLevel(fc.GZip, def.GZip),
-		ZStd: ResolveLevel(fc.ZStd, def.ZStd),
-		XZ:   fc.XZ > CompressionDefault, // default=disabled; positive level enables
+		GZip: resolveLevelPtr(fc.GZip, def.GZip),
+		ZStd: resolveLevelPtr(fc.ZStd, def.ZStd),
+		XZ:   xzEnabled(fc.XZ, def.XZ), // default=disabled; true/any explicit level enables
 	}
 }
 

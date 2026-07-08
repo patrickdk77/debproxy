@@ -108,7 +108,7 @@ func runVersion() int {
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
   debproxy serve [--config path] [--addr :8080]
-  debproxy rebuild [--config path] [--reset]
+  debproxy rebuild [--config path] [--reset=false]   (--reset defaults to true: truncates the index before rebuild)
   debproxy update [--config path]
   debproxy snapshot [--config path]
   debproxy cleanup [--config path]
@@ -126,6 +126,14 @@ func loadConfig(args []string) (*config.Config, error) {
 		return nil, err
 	}
 	return config.Load(*configPath)
+}
+
+// withTimeout10s runs fn with a fresh 10-second timeout, distinct from
+// whatever budget any other call in the same sequence got.
+func withTimeout10s(fn func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return fn(ctx)
 }
 
 func openBackends(ctx context.Context, cfg *config.Config) (storage.Storage, metadata.MetadataIndex, error) {
@@ -185,9 +193,12 @@ func buildNotifier(cfg *config.Config) (*webhook.Notifier, error) {
 	return webhook.New(cfg.Webhooks, nil)
 }
 
+// loadKey loads the configured signing key. Every caller requires a working
+// key, so a missing/unconfigured key is itself an error -- callers don't need
+// to separately check for a nil key.
 func loadKey(cfg *config.Config) (*signing.Key, error) {
 	if cfg.Signing.PrivateKey == "" {
-		return nil, nil
+		return nil, fmt.Errorf("signing.private_key is not configured")
 	}
 	return signing.Load(cfg.Signing.PrivateKey)
 }
@@ -443,38 +454,47 @@ func runServe(args []string) int {
 		return 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := store.Ping(ctx); err != nil {
+	// Each startup check gets its own fresh timeout rather than sharing one
+	// budget, so a slow-but-healthy backend can't make a later check fail
+	// just because an earlier one ate most of the deadline.
+	if err := withTimeout10s(store.Ping); err != nil {
 		slog.Error("storage ping", "err", err)
 		return 1
 	}
-	if err := index.Ping(ctx); err != nil {
+	if err := withTimeout10s(index.Ping); err != nil {
 		slog.Error("metadata ping", "err", err)
 		return 1
 	}
 
 	key, err := loadKey(cfg)
 	if err != nil {
-		slog.Warn("signing key not loaded", "err", err)
+		slog.Error("load signing key", "err", err)
+		return 1
 	}
-	if key != nil {
-		fpPath := path.Join(signing.KeysDir, key.Fingerprint()+".asc")
+	fpPath := path.Join(signing.KeysDir, key.Fingerprint()+".asc")
+
+	statErr := withTimeout10s(func(ctx context.Context) error {
 		_, err := store.StatPublished(ctx, fpPath)
-		if err != nil && !os.IsNotExist(err) {
-			slog.Error("check signing key", "err", err)
+		return err
+	})
+	if statErr != nil && !os.IsNotExist(statErr) {
+		slog.Error("check signing key", "err", statErr)
+		return 1
+	}
+	if os.IsNotExist(statErr) {
+		var names []string
+		pubErr := withTimeout10s(func(ctx context.Context) error {
+			var err error
+			names, err = key.Publish(ctx, store)
+			return err
+		})
+		if pubErr != nil {
+			slog.Error("publish signing public key", "err", pubErr)
 			return 1
 		}
-		if os.IsNotExist(err) {
-			if names, err := key.Publish(ctx, store); err != nil {
-				slog.Error("publish signing public key", "err", err)
-				return 1
-			} else {
-				slog.Info("published signing public key", "fingerprint", key.Fingerprint(), "files", names)
-			}
-		} else {
-			slog.Debug("signing key already published", "fingerprint", key.Fingerprint())
-		}
+		slog.Info("published signing public key", "fingerprint", key.Fingerprint(), "files", names)
+	} else {
+		slog.Debug("signing key already published", "fingerprint", key.Fingerprint())
 	}
 
 	httpClient := upstream.NewHTTPClient(cfg.UserAgent)
@@ -504,6 +524,10 @@ func runServe(args []string) int {
 	cleanupSched, err := parseSnapshotSchedule(cfg.Schedule.Cleanup)
 	if err != nil {
 		slog.Error("invalid schedule.cleanup", "value", cfg.Schedule.Cleanup, "err", err)
+		return 1
+	}
+	if _, err := parseDuration(cfg.Schedule.Age); err != nil {
+		slog.Error("invalid schedule.age", "value", cfg.Schedule.Age, "err", err)
 		return 1
 	}
 

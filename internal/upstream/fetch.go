@@ -425,12 +425,17 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 // or the patch chain cannot be applied (caller should fall back to full fetch).
 func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, cachedSHA256 string, cachedPkgs []apt.RawPkg) ([]apt.RawPkg, bool) {
 	diffRelPath := base + "Packages.diff/Index"
-	if _, ok := rel.Files[diffRelPath]; !ok {
+	relEntry, ok := rel.Files[diffRelPath]
+	if !ok {
 		return nil, false
 	}
 
 	data, resp, err := f.getConditional(ctx, f.distsURL(diffRelPath), "", "")
 	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	if err := verifyDigest(data, relEntry.SHA256); err != nil {
+		slog.Warn("pdiff: index digest mismatch", "upstream", f.src.Name, "arch", arch, "err", err)
 		return nil, false
 	}
 
@@ -519,12 +524,17 @@ var srcVariants = []pkgVariant{
 // or the patch chain cannot be applied (caller should fall back to full fetch).
 func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cachedSHA256 string, cachedSrcs []apt.RawSrc) ([]apt.RawSrc, bool) {
 	diffRelPath := base + "Sources.diff/Index"
-	if _, ok := rel.Files[diffRelPath]; !ok {
+	relEntry, ok := rel.Files[diffRelPath]
+	if !ok {
 		return nil, false
 	}
 
 	data, resp, err := f.getConditional(ctx, f.distsURL(diffRelPath), "", "")
 	if err != nil || resp.StatusCode != http.StatusOK {
+		return nil, false
+	}
+	if err := verifyDigest(data, relEntry.SHA256); err != nil {
+		slog.Warn("pdiff: sources index digest mismatch", "upstream", f.src.Name, "component", f.src.Component, "err", err)
 		return nil, false
 	}
 

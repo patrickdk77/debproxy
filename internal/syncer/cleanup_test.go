@@ -25,24 +25,35 @@ type mockStorage struct {
 	// published files: path -> content (for OpenPublished)
 	publishedFiles map[string]string
 
+	// poolMTimes: path -> mod time, consulted by Stat. A path with no entry
+	// here gets the zero Time (always older than gcGracePeriod), so existing
+	// tests that expect immediate GC deletion don't need to set this.
+	poolMTimes map[string]time.Time
+
 	// snapshots per osName
 	snapshots map[string][]storage.SnapshotRef
 
 	// deleted tracks Delete and DeletePublished calls
 	deleted []string
+
+	// statCalls counts Stat invocations, so tests can assert gcPool/gcSrc
+	// don't issue a redundant per-candidate Stat now that WalkPool/
+	// ListPublishedInfo supply ModTime directly.
+	statCalls int
 }
 
 func newMockStorage() *mockStorage {
 	return &mockStorage{
 		poolFiles:      map[string]struct{}{},
 		publishedFiles: map[string]string{},
+		poolMTimes:     map[string]time.Time{},
 		snapshots:      map[string][]storage.SnapshotRef{},
 	}
 }
 
-func (m *mockStorage) WalkPool(ctx context.Context, fn func(string) error) error {
+func (m *mockStorage) WalkPool(ctx context.Context, fn func(storage.FileInfo) error) error {
 	for p := range m.poolFiles {
-		if err := fn(p); err != nil {
+		if err := fn(storage.FileInfo{Path: p, ModTime: m.poolMTimes[p]}); err != nil {
 			return err
 		}
 	}
@@ -60,6 +71,16 @@ func (m *mockStorage) ListPublished(ctx context.Context, prefix string) ([]strin
 	for p := range m.publishedFiles {
 		if strings.HasPrefix(p, prefix) {
 			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+func (m *mockStorage) ListPublishedInfo(ctx context.Context, prefix string) ([]storage.FileInfo, error) {
+	var out []storage.FileInfo
+	for p := range m.publishedFiles {
+		if strings.HasPrefix(p, prefix) {
+			out = append(out, storage.FileInfo{Path: p, ModTime: m.poolMTimes[p]})
 		}
 	}
 	return out, nil
@@ -93,8 +114,20 @@ func (m *mockStorage) Open(ctx context.Context, poolPath string) (io.ReadCloser,
 	panic("not implemented: Open")
 }
 
+// Stat looks in both poolFiles and publishedFiles since tests store src/
+// files (which real backends treat as part of the same non-published tree)
+// under publishedFiles. Files with no explicit mtime set in poolMTimes
+// default to the zero Time, which is always older than gcGracePeriod, so
+// existing tests that expect immediate deletion keep working unmodified.
 func (m *mockStorage) Stat(ctx context.Context, poolPath string) (storage.FileInfo, error) {
-	panic("not implemented: Stat")
+	m.statCalls++
+	if _, ok := m.poolFiles[poolPath]; ok {
+		return storage.FileInfo{Path: poolPath, ModTime: m.poolMTimes[poolPath]}, nil
+	}
+	if _, ok := m.publishedFiles[poolPath]; ok {
+		return storage.FileInfo{Path: poolPath, ModTime: m.poolMTimes[poolPath]}, nil
+	}
+	return storage.FileInfo{}, fmt.Errorf("not found: %s", poolPath)
 }
 
 func (m *mockStorage) Exists(ctx context.Context, poolPath string) (bool, error) {
@@ -187,6 +220,14 @@ func minimalConfig(osName, codename string) *config.Config {
 // newTestSyncer builds a *Syncer backed by mock storage and index.
 func newTestSyncer(store *mockStorage, idx *mockIndex, osName, codename string) *syncer.Syncer {
 	cfg := minimalConfig(osName, codename)
+	return syncer.New(cfg, store, idx, nil, nil, nil, nil)
+}
+
+// newTestSyncerWithGCGrace is like newTestSyncer but with a custom
+// schedule.gc_grace value.
+func newTestSyncerWithGCGrace(store *mockStorage, idx *mockIndex, osName, codename, gcGrace string) *syncer.Syncer {
+	cfg := minimalConfig(osName, codename)
+	cfg.Schedule.GCGrace = gcGrace
 	return syncer.New(cfg, store, idx, nil, nil, nil, nil)
 }
 
@@ -350,6 +391,64 @@ func TestPruneSnapshots_DeletedCountMatchesDeleted(t *testing.T) {
 	}
 }
 
+func TestPruneSnapshots_AgeOnly_CountUnlimited(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	now := time.Now()
+	// maxSnapshots=0 (unlimited count): only the age axis should matter.
+	store.snapshots["ubuntu"] = []storage.SnapshotRef{
+		{ID: "snap-old", OS: "ubuntu", CreatedAt: now.Add(-100 * 24 * time.Hour)},
+		{ID: "snap-new", OS: "ubuntu", CreatedAt: now.Add(-1 * 24 * time.Hour)},
+	}
+	store.publishedFiles["snap-old/ubuntu/dists/jammy/Release"] = "old-content"
+	store.publishedFiles["snap-new/ubuntu/dists/jammy/Release"] = "new-content"
+
+	if err := s.Cleanup(context.Background(), 0, 30*24*time.Hour, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, "snap-old/ubuntu/dists/jammy/Release") {
+		t.Errorf("expected snap-old to be pruned by age alone, deleted=%v", store.deleted)
+	}
+	if contains(store.deleted, "snap-new/ubuntu/dists/jammy/Release") {
+		t.Errorf("expected snap-new to be kept, deleted=%v", store.deleted)
+	}
+}
+
+func TestPruneSnapshots_CountOnly_AgeUnlimited(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	now := time.Now()
+	// maxSnapshotAge=0 (unlimited age): only the count axis should matter.
+	// All snapshots are recent, but the count limit of 1 should still prune down to it.
+	store.snapshots["ubuntu"] = []storage.SnapshotRef{
+		{ID: "snap-a", OS: "ubuntu", CreatedAt: now.Add(-3 * time.Hour)},
+		{ID: "snap-b", OS: "ubuntu", CreatedAt: now.Add(-2 * time.Hour)},
+		{ID: "snap-c", OS: "ubuntu", CreatedAt: now.Add(-1 * time.Hour)},
+	}
+	for _, id := range []string{"snap-a", "snap-b", "snap-c"} {
+		store.publishedFiles[id+"/ubuntu/dists/jammy/Release"] = "content"
+	}
+
+	if err := s.Cleanup(context.Background(), 1, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, "snap-a/ubuntu/dists/jammy/Release") {
+		t.Errorf("expected snap-a to be pruned by count alone, deleted=%v", store.deleted)
+	}
+	if !contains(store.deleted, "snap-b/ubuntu/dists/jammy/Release") {
+		t.Errorf("expected snap-b to be pruned by count alone, deleted=%v", store.deleted)
+	}
+	if contains(store.deleted, "snap-c/ubuntu/dists/jammy/Release") {
+		t.Errorf("expected snap-c (most recent) to be kept, deleted=%v", store.deleted)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tests: gcPool
 // ---------------------------------------------------------------------------
@@ -398,6 +497,66 @@ func TestGCPool_ReferencedByMetadataEntry_Kept(t *testing.T) {
 	}
 }
 
+// TestGCPool_SupersededVersion_NotProtected proves that once a newer version
+// of a package is indexed, the pool file for the OLD version is no longer
+// protected from GC forever -- buildPoolRefSet must only keep the highest
+// version per (os, codename, component, arch, package), matching the same
+// dedup publishing already applies (groupStanzas in syncer.go).
+func TestGCPool_SupersededVersion_NotProtected(t *testing.T) {
+	store := newMockStorage()
+	oldPath := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
+	newPath := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_2.0_amd64.deb"
+	idx := &mockIndex{
+		entries: []model.IndexEntry{
+			{OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64", Package: "libfoo", Version: "1.0", PoolPath: oldPath},
+			{OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64", Package: "libfoo", Version: "2.0", PoolPath: newPath},
+		},
+	}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	store.poolFiles[oldPath] = struct{}{}
+	store.poolFiles[newPath] = struct{}{}
+	now := time.Now()
+	store.poolMTimes[oldPath] = now.Add(-2 * time.Hour) // past the GC grace period
+	store.poolMTimes[newPath] = now.Add(-2 * time.Hour)
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, oldPath) {
+		t.Errorf("superseded version's pool file should be GC'd once a newer version is indexed, deleted=%v", store.deleted)
+	}
+	if contains(store.deleted, newPath) {
+		t.Errorf("current version's pool file must not be deleted, deleted=%v", store.deleted)
+	}
+}
+
+// TestCleanup_GCDoesNotCallStat proves gcPool/gcSrc get ModTime from
+// WalkPool/ListPublishedInfo directly instead of issuing a separate Stat per
+// orphan candidate.
+func TestCleanup_GCDoesNotCallStat(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	orphanPool := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
+	orphanSrc := "src/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0.orig.tar.gz"
+	store.poolFiles[orphanPool] = struct{}{}
+	store.publishedFiles[orphanSrc] = "orphan-data"
+
+	if err := s.Cleanup(context.Background(), 0, 0, time.Now()); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, orphanPool) || !contains(store.deleted, orphanSrc) {
+		t.Fatalf("test setup: expected both orphans deleted, deleted=%v", store.deleted)
+	}
+	if store.statCalls != 0 {
+		t.Errorf("expected zero Stat calls during GC, got %d", store.statCalls)
+	}
+}
+
 func TestGCPool_NotReferenced_Deleted(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
@@ -412,6 +571,94 @@ func TestGCPool_NotReferenced_Deleted(t *testing.T) {
 
 	if !contains(store.deleted, orphan) {
 		t.Errorf("orphaned pool file should have been deleted, deleted=%v", store.deleted)
+	}
+}
+
+// TestGCPool_RecentlyWritten_ProtectedByGracePeriod proves the TOCTOU fix:
+// a pool file that isn't in the ref set yet (e.g. because the metadata index
+// commit for it hasn't landed) but was written moments ago must survive a GC
+// pass instead of being deleted right after being cached.
+func TestGCPool_RecentlyWritten_ProtectedByGracePeriod(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	recent := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
+	store.poolFiles[recent] = struct{}{}
+	now := time.Now()
+	store.poolMTimes[recent] = now.Add(-1 * time.Minute) // written 1 minute ago
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if contains(store.deleted, recent) {
+		t.Errorf("recently-written unreferenced pool file should be protected by the grace period, deleted=%v", store.deleted)
+	}
+}
+
+// TestGCPool_OldUnreferenced_DeletedPastGracePeriod is the control case: once
+// a file is older than gcGracePeriod, an unreferenced file is still deleted.
+func TestGCPool_OldUnreferenced_DeletedPastGracePeriod(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	orphan := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
+	store.poolFiles[orphan] = struct{}{}
+	now := time.Now()
+	store.poolMTimes[orphan] = now.Add(-2 * time.Hour) // well past the grace period
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, orphan) {
+		t.Errorf("orphaned pool file older than the grace period should still be deleted, deleted=%v", store.deleted)
+	}
+}
+
+// TestGCPool_GCGraceConfigurable proves schedule.gc_grace actually changes GC
+// behavior: a file older than a configured 1ms grace period (but younger than
+// the 1h built-in default) is deleted.
+func TestGCPool_GCGraceConfigurable(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncerWithGCGrace(store, idx, "ubuntu", "jammy", "1ms")
+
+	orphan := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
+	store.poolFiles[orphan] = struct{}{}
+	now := time.Now()
+	store.poolMTimes[orphan] = now.Add(-10 * time.Millisecond) // > 1ms configured grace, < 1h default
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, orphan) {
+		t.Errorf("file older than the configured 1ms grace period should be deleted, deleted=%v", store.deleted)
+	}
+}
+
+// TestGCPool_GCGraceInvalidFallsBackToDefault proves an unparseable
+// schedule.gc_grace value falls back to the safe 1h default rather than
+// disabling grace-period protection entirely.
+func TestGCPool_GCGraceInvalidFallsBackToDefault(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncerWithGCGrace(store, idx, "ubuntu", "jammy", "not-a-duration")
+
+	recent := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
+	store.poolFiles[recent] = struct{}{}
+	now := time.Now()
+	store.poolMTimes[recent] = now.Add(-10 * time.Minute) // within the 1h default
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if contains(store.deleted, recent) {
+		t.Errorf("invalid schedule.gc_grace should fall back to the 1h default, not disable protection, deleted=%v", store.deleted)
 	}
 }
 

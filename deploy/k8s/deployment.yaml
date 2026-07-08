@@ -24,7 +24,10 @@ spec:
           image: patrickdk/debproxy:latest
           args: ["serve", "--config", "/etc/debproxy/config.yaml"]
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
           resources:
             requests:
               cpu: 100m

@@ -14,6 +14,21 @@ type arHeader struct {
 	Size int64
 }
 
+// parseARHeader decodes one 60-byte ar(5) member header into its name and
+// size, validating that the size is non-negative (a corrupted/malicious
+// header could otherwise drive a huge or negative allocation downstream).
+func parseARHeader(bh [60]byte) (name string, size int64, err error) {
+	name = strings.TrimSuffix(strings.TrimSpace(string(bh[0:16])), "/")
+	sizeStr := strings.TrimSpace(string(bh[48:58]))
+	if _, err := fmt.Sscanf(sizeStr, "%d", &size); err != nil {
+		return "", 0, fmt.Errorf("parse ar size: %w", err)
+	}
+	if size < 0 {
+		return "", 0, fmt.Errorf("ar member %q: invalid size %d", name, size)
+	}
+	return name, size, nil
+}
+
 func readAR(r io.Reader) ([]arHeader, error) {
 	var hdr [8]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -32,12 +47,9 @@ func readAR(r io.Reader) ([]arHeader, error) {
 			}
 			return nil, err
 		}
-		name := strings.TrimSpace(string(bh[0:16]))
-		name = strings.TrimSuffix(name, "/")
-		sizeStr := strings.TrimSpace(string(bh[48:58]))
-		var size int64
-		if _, err := fmt.Sscanf(sizeStr, "%d", &size); err != nil {
-			return nil, fmt.Errorf("parse ar size: %w", err)
+		name, size, err := parseARHeader(bh)
+		if err != nil {
+			return nil, err
 		}
 		members = append(members, arHeader{Name: name, Size: size})
 		if size%2 == 1 {
@@ -67,12 +79,9 @@ func openARMember(r io.ReadSeeker, memberName string) (io.Reader, error) {
 		if _, err := io.ReadFull(r, bh[:]); err != nil {
 			return nil, err
 		}
-		name := strings.TrimSpace(string(bh[0:16]))
-		name = strings.TrimSuffix(name, "/")
-		sizeStr := strings.TrimSpace(string(bh[48:58]))
-		var size int64
-		if _, err := fmt.Sscanf(sizeStr, "%d", &size); err != nil {
-			return nil, fmt.Errorf("parse ar size: %w", err)
+		name, size, err := parseARHeader(bh)
+		if err != nil {
+			return nil, err
 		}
 		if name == memberName {
 			data := make([]byte, size)

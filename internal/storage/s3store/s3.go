@@ -57,7 +57,10 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size int64) error {
-	key := s.s3Key(poolPath)
+	key, err := s.s3Key(poolPath)
+	if err != nil {
+		return err
+	}
 	acl, cacheControl, contentType := s3PutAttrs(poolPath)
 	input := &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
@@ -75,7 +78,7 @@ func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size 
 	if cacheControl != "" {
 		input.CacheControl = aws.String(cacheControl)
 	}
-	_, err := s.client.PutObject(ctx, input)
+	_, err = s.client.PutObject(ctx, input)
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return nil
@@ -86,7 +89,11 @@ func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size 
 }
 
 func (s *Store) Open(ctx context.Context, poolPath string) (io.ReadCloser, error) {
-	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.s3Key(poolPath))})
+	key, err := s.s3Key(poolPath)
+	if err != nil {
+		return nil, err
+	}
+	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +101,11 @@ func (s *Store) Open(ctx context.Context, poolPath string) (io.ReadCloser, error
 }
 
 func (s *Store) Stat(ctx context.Context, poolPath string) (storage.FileInfo, error) {
-	meta, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.s3Key(poolPath))})
+	key, err := s.s3Key(poolPath)
+	if err != nil {
+		return storage.FileInfo{}, err
+	}
+	meta, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
 		return storage.FileInfo{}, err
 	}
@@ -102,7 +113,11 @@ func (s *Store) Stat(ctx context.Context, poolPath string) (storage.FileInfo, er
 }
 
 func (s *Store) Exists(ctx context.Context, poolPath string) (bool, error) {
-	_, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.s3Key(poolPath))})
+	key, err := s.s3Key(poolPath)
+	if err != nil {
+		return false, err
+	}
+	_, err = s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err == nil {
 		return true, nil
 	}
@@ -113,7 +128,11 @@ func (s *Store) Exists(ctx context.Context, poolPath string) (bool, error) {
 }
 
 func (s *Store) Delete(ctx context.Context, poolPath string) error {
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.s3Key(poolPath))})
+	key, err := s.s3Key(poolPath)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	return err
 }
 
@@ -135,7 +154,22 @@ func (s *Store) ComputeChecksums(ctx context.Context, poolPath string) (model.Ch
 }
 
 func (s *Store) ListPublished(ctx context.Context, prefix string) ([]string, error) {
-	s3Prefix := s.s3Key(prefix)
+	infos, err := s.ListPublishedInfo(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, len(infos))
+	for i, fi := range infos {
+		paths[i] = fi.Path
+	}
+	return paths, nil
+}
+
+func (s *Store) ListPublishedInfo(ctx context.Context, prefix string) ([]storage.FileInfo, error) {
+	s3Prefix, err := s.s3Key(prefix)
+	if err != nil {
+		return nil, err
+	}
 	if s3Prefix != "" && !strings.HasSuffix(s3Prefix, "/") {
 		s3Prefix += "/"
 	}
@@ -147,7 +181,7 @@ func (s *Store) ListPublished(ctx context.Context, prefix string) ([]string, err
 		Bucket: aws.String(s.bucket),
 		Prefix: aws.String(s3Prefix),
 	})
-	var paths []string
+	var infos []storage.FileInfo
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
@@ -159,15 +193,22 @@ func (s *Store) ListPublished(ctx context.Context, prefix string) ([]string, err
 			}
 			rel := strings.TrimPrefix(aws.ToString(obj.Key), rootPrefix)
 			if rel != "" {
-				paths = append(paths, rel)
+				infos = append(infos, storage.FileInfo{
+					Path:    rel,
+					Size:    aws.ToInt64(obj.Size),
+					ModTime: aws.ToTime(obj.LastModified),
+				})
 			}
 		}
 	}
-	return paths, nil
+	return infos, nil
 }
 
-func (s *Store) WalkPool(ctx context.Context, fn func(poolPath string) error) error {
-	prefix := s.s3Key("pool/")
+func (s *Store) WalkPool(ctx context.Context, fn func(info storage.FileInfo) error) error {
+	prefix, err := s.s3Key("pool/")
+	if err != nil {
+		return err
+	}
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
@@ -192,7 +233,12 @@ func (s *Store) WalkPool(ctx context.Context, fn func(poolPath string) error) er
 			if rel == "" {
 				continue
 			}
-			if err := fn(path.Join("pool", rel)); err != nil {
+			info := storage.FileInfo{
+				Path:    path.Join("pool", rel),
+				Size:    aws.ToInt64(obj.Size),
+				ModTime: aws.ToTime(obj.LastModified),
+			}
+			if err := fn(info); err != nil {
 				return err
 			}
 		}
@@ -201,7 +247,10 @@ func (s *Store) WalkPool(ctx context.Context, fn func(poolPath string) error) er
 }
 
 func (s *Store) WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error {
-	key := s.s3Key(relPath)
+	key, err := s.s3Key(relPath)
+	if err != nil {
+		return err
+	}
 	acl, cacheControl, contentType := s3PutAttrs(relPath)
 	input := &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
@@ -218,12 +267,16 @@ func (s *Store) WriteFile(ctx context.Context, relPath string, r io.Reader, size
 	if cacheControl != "" {
 		input.CacheControl = aws.String(cacheControl)
 	}
-	_, err := s.client.PutObject(ctx, input)
+	_, err = s.client.PutObject(ctx, input)
 	return err
 }
 
 func (s *Store) DeletePublished(ctx context.Context, relPath string) error {
-	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.s3Key(relPath))})
+	key, err := s.s3Key(relPath)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	return err
 }
 
@@ -236,7 +289,10 @@ func (s *Store) StatPublished(ctx context.Context, relPath string) (storage.File
 }
 
 func (s *Store) ListSnapshots(ctx context.Context, osName string) ([]storage.SnapshotRef, error) {
-	rootPrefix := s.s3Key("")
+	rootPrefix, err := s.s3Key("")
+	if err != nil {
+		return nil, err
+	}
 	if rootPrefix != "" && !strings.HasSuffix(rootPrefix, "/") {
 		rootPrefix += "/"
 	}
@@ -333,19 +389,25 @@ func s3ContentType(relPath string) string {
 	}
 }
 
-func (s *Store) s3Key(key string) string {
-	clean := strings.TrimPrefix(strings.TrimSpace(key), "/")
+func (s *Store) s3Key(key string) (string, error) {
+	clean, err := storage.CleanRelPath(key)
+	if err != nil {
+		return "", err
+	}
 	if s.prefix == "" {
-		return clean
+		return clean, nil
 	}
 	if clean == "" {
-		return s.prefix
+		return s.prefix, nil
 	}
-	return path.Join(s.prefix, clean)
+	return path.Join(s.prefix, clean), nil
 }
 
 func (s *Store) snapshotHasOS(ctx context.Context, snapshotID, osName string) (bool, error) {
-	prefix := s.s3Key(path.Join(snapshotID, osName, ""))
+	prefix, err := s.s3Key(path.Join(snapshotID, osName, ""))
+	if err != nil {
+		return false, err
+	}
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}

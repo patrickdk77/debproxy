@@ -51,8 +51,8 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 func (s *Store) absPool(poolPath string) (string, error) {
-	clean := filepath.ToSlash(filepath.Clean(poolPath))
-	if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+	clean, err := storage.CleanRelPath(poolPath)
+	if err != nil {
 		return "", fmt.Errorf("invalid pool path %q", poolPath)
 	}
 	clean = strings.TrimPrefix(clean, "pool/")
@@ -60,8 +60,8 @@ func (s *Store) absPool(poolPath string) (string, error) {
 }
 
 func (s *Store) absPublished(relPath string) (string, error) {
-	clean := filepath.Clean(relPath)
-	if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
+	clean, err := storage.CleanRelPath(relPath)
+	if err != nil {
 		return "", fmt.Errorf("invalid published path %q", relPath)
 	}
 	return filepath.Join(s.root, filepath.FromSlash(clean)), nil
@@ -191,8 +191,8 @@ func (s *Store) ComputeChecksums(ctx context.Context, poolPath string) (model.Ch
 	}, nil
 }
 
-func (s *Store) WalkPool(ctx context.Context, fn func(poolPath string) error) error {
-	return filepath.WalkDir(s.poolRoot, func(path string, d fs.DirEntry, err error) error {
+func (s *Store) WalkPool(ctx context.Context, fn func(info storage.FileInfo) error) error {
+	return filepath.WalkDir(s.poolRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -205,20 +205,40 @@ func (s *Store) WalkPool(ctx context.Context, fn func(poolPath string) error) er
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".deb") {
 			return nil
 		}
-		rel, err := filepath.Rel(s.poolRoot, path)
+		rel, err := filepath.Rel(s.poolRoot, p)
 		if err != nil {
 			return err
 		}
-		return fn(filepath.Join("pool", filepath.ToSlash(rel)))
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return fn(storage.FileInfo{
+			Path:    filepath.Join("pool", filepath.ToSlash(rel)),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
 	})
 }
 
 func (s *Store) ListPublished(ctx context.Context, prefix string) ([]string, error) {
+	infos, err := s.ListPublishedInfo(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, len(infos))
+	for i, fi := range infos {
+		paths[i] = fi.Path
+	}
+	return paths, nil
+}
+
+func (s *Store) ListPublishedInfo(ctx context.Context, prefix string) ([]storage.FileInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	abs := filepath.Join(s.root, filepath.FromSlash(filepath.Clean(prefix)))
-	var paths []string
+	var infos []storage.FileInfo
 	err := filepath.WalkDir(abs, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			if os.IsNotExist(werr) {
@@ -233,10 +253,18 @@ func (s *Store) ListPublished(ctx context.Context, prefix string) ([]string, err
 		if err != nil {
 			return err
 		}
-		paths = append(paths, filepath.ToSlash(rel))
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		infos = append(infos, storage.FileInfo{
+			Path:    filepath.ToSlash(rel),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
 		return nil
 	})
-	return paths, err
+	return infos, err
 }
 
 func (s *Store) WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error {

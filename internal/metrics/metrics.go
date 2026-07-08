@@ -5,6 +5,8 @@
 package metrics
 
 import (
+	"runtime/debug"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -75,4 +77,29 @@ var (
 		Name: "debproxy_snapshots_pruned_total",
 		Help: "Total snapshot directories pruned by cleanup runs.",
 	})
+
+	// BuildInfo exposes the running binary's VCS revision as a gauge fixed at 1,
+	// labeled with revision info. Unlike the *Vec metrics above, it is set once
+	// here so it is always present in /metrics from process start, letting
+	// Grafana/Prometheus queries key off it (e.g. template variables) and
+	// correlate other series with the deployed version.
+	BuildInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "debproxy_build_info",
+		Help: "Build information about the running debproxy binary. Always 1.",
+	}, []string{"revision", "modified"})
 )
+
+func init() {
+	revision, modified := "unknown", "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				revision = s.Value
+			case "vcs.modified":
+				modified = s.Value
+			}
+		}
+	}
+	BuildInfo.WithLabelValues(revision, modified).Set(1)
+}

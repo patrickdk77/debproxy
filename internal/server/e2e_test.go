@@ -331,6 +331,202 @@ signing:
 	}
 }
 
+// TestLiveRejectsUnknownCombosWithoutRealWork proves the routing-layer fix:
+// requests for an os/codename/upstream combination that doesn't match any
+// configured layout are rejected with 404 before any real work is attempted
+// -- no upstream contact, no live-index build -- rather than being allowed
+// through and merely relabeled to a metrics sentinel afterward.
+func TestLiveRejectsUnknownCombosWithoutRealWork(t *testing.T) {
+	dir := t.TempDir()
+
+	upstreamPub := filepath.Join(dir, "upstream.pub.asc")
+	writeKeyPair(t, filepath.Join(dir, "upstream.priv.asc"), upstreamPub)
+	repoPriv := filepath.Join(dir, "repo.priv.asc")
+	writeKeyPair(t, repoPriv, "")
+
+	var upstreamHits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits = append(upstreamHits, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	writeConfig(t, cfgPath, dir, upstream.URL, upstreamPub, repoPriv)
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storagefactory.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := deb822store.New(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoKey, err := signing.Load(repoPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(server.New(cfg, store, index, repoKey, nil, nil, nil, nil).Handler())
+	defer srv.Close()
+
+	// The config only knows os=debian, codename=trixie, upstream=debian-main.
+	cases := []string{
+		srv.URL + "/live/bogus-os/pool/trixie/debian-main/main/h/hello/hello_1.0_amd64.deb",
+		srv.URL + "/live/debian/pool/bogus-codename/debian-main/main/h/hello/hello_1.0_amd64.deb",
+		srv.URL + "/live/debian/pool/trixie/bogus-upstream/main/h/hello/hello_1.0_amd64.deb",
+		srv.URL + "/live/debian/src/debian/bogus-codename/debian-main/main/h/hello/hello_1.0.orig.tar.gz",
+		srv.URL + "/live/bogus-os/dists/trixie/main/binary-amd64/Packages",
+		srv.URL + "/live/debian/dists/bogus-codename/main/binary-amd64/Packages",
+	}
+	for _, url := range cases {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s: status=%d, want 404", url, resp.StatusCode)
+		}
+	}
+
+	if len(upstreamHits) != 0 {
+		t.Errorf("expected zero upstream requests for unknown combinations, got %v", upstreamHits)
+	}
+}
+
+// TestLiveSourcePullThrough exercises a full /live source (deb-src)
+// pull-through: an upstream Sources index plus the actual .orig.tar.gz it
+// references, requested through the same URL shape debproxy itself emits in
+// the generated Sources index's Directory: field (which, like pool paths,
+// embeds the OS a second time -- see model.SourceDir/model.PoolPath).
+//
+// An earlier investigation suspected this path always failed with a 502
+// because pullThroughSource's parsing looks like it expects one more path
+// segment than handleLive's "src" branch supplies. That reasoning used a
+// hand-built URL missing the second (repeated) OS segment; with the correct,
+// server-generated URL shape the segment counts line up and this passes,
+// so that finding was a false positive from a wrong test URL, not a real bug.
+func TestLiveSourcePullThrough(t *testing.T) {
+	dir := t.TempDir()
+
+	upstreamPriv := filepath.Join(dir, "upstream.priv.asc")
+	upstreamPub := filepath.Join(dir, "upstream.pub.asc")
+	writeKeyPair(t, upstreamPriv, upstreamPub)
+	repoPriv := filepath.Join(dir, "repo.priv.asc")
+	writeKeyPair(t, repoPriv, "")
+
+	upstreamKey, err := signing.Load(upstreamPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origTar := []byte("fake orig tarball contents")
+	const upstreamDir = "pool/main/h/hello"
+	const filename = "hello_1.0.orig.tar.gz"
+
+	sourcesStanza := fmt.Sprintf(
+		"Package: hello\nVersion: 1.0\nDirectory: %s\nChecksums-Sha256:\n %s %d %s\n\n",
+		upstreamDir, sha256hex(origTar), len(origTar), filename)
+	sourcesGz := gzipBytes(t, []byte(sourcesStanza))
+
+	files := map[string][]byte{
+		"/" + upstreamDir + "/" + filename:     origTar,
+		"/dists/trixie/main/source/Sources":    []byte(sourcesStanza),
+		"/dists/trixie/main/source/Sources.gz": sourcesGz,
+	}
+
+	var release strings.Builder
+	release.WriteString("Origin: Test\nLabel: Test\nSuite: trixie\nCodename: trixie\n")
+	release.WriteString("Date: " + time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 UTC") + "\n")
+	release.WriteString("Architectures: amd64\nComponents: main\n")
+	release.WriteString("SHA256:\n")
+	fmt.Fprintf(&release, " %s %d main/source/Sources\n", sha256hex([]byte(sourcesStanza)), len(sourcesStanza))
+	fmt.Fprintf(&release, " %s %d main/source/Sources.gz\n", sha256hex(sourcesGz), len(sourcesGz))
+	inRelease, err := upstreamKey.SignInline([]byte(release.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files["/dists/trixie/InRelease"] = inRelease
+
+	var upstreamHits []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits = append(upstreamHits, r.URL.Path)
+		if data, ok := files[r.URL.Path]; ok {
+			_, _ = w.Write(data)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := fmt.Sprintf(`storage:
+  backend: filesystem
+  filesystem:
+    root: %s
+upstreams:
+  debian-main:
+    url: %s
+    keys: [%s]
+    auto_update: false
+layouts:
+  - os: debian
+    architectures: [amd64]
+    codenames:
+      - codename: trixie
+        components:
+          - component: main
+            upstreams: [debian-main]
+            sources: true
+signing:
+  private_key: %s
+`, filepath.Join(dir, "store"), upstream.URL, upstreamPub, repoPriv)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storagefactory.New(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := deb822store.New(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoKey, err := signing.Load(repoPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, nil, nil).Handler())
+	defer srv.Close()
+
+	// Matches what debproxy itself would emit: Directory: src/debian/trixie/debian-main/main/h/hello
+	url := srv.URL + "/live/debian/src/debian/trixie/debian-main/main/h/hello/" + filename
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s -> status=%d body=%q upstreamHits=%v", url, resp.StatusCode, body, upstreamHits)
+	}
+	if sha256hex(body) != sha256hex(origTar) {
+		t.Fatalf("live source pull-through returned wrong bytes")
+	}
+}
+
 func httpGet(t *testing.T, url string) []byte {
 	t.Helper()
 	resp, err := http.Get(url)

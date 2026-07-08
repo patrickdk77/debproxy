@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/debproxy/debproxy/internal/model"
+	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/storage/filesystem"
 )
 
@@ -43,6 +44,74 @@ func TestPutFileDedupAndDigest(t *testing.T) {
 	}
 	if checksums.SHA512 == "" {
 		t.Fatal("expected SHA512 digest")
+	}
+}
+
+func TestWalkPoolAndListPublishedInfoPopulateFileInfo(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	poolPath := model.PoolPath("debian", "trixie", "debian-main", "main", "apt", "2.6.1", "amd64")
+	data := []byte("fake deb content")
+	if err := store.PutFile(ctx, poolPath, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+
+	var walked []string
+	if err := store.WalkPool(ctx, func(info storage.FileInfo) error {
+		walked = append(walked, info.Path)
+		if info.Path != poolPath {
+			return nil
+		}
+		if info.Size != int64(len(data)) {
+			t.Errorf("WalkPool: Size = %d, want %d", info.Size, len(data))
+		}
+		if info.ModTime.IsZero() {
+			t.Error("WalkPool: ModTime is zero, want populated")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(walked) != 1 {
+		t.Fatalf("expected 1 pool file walked, got %d: %v", len(walked), walked)
+	}
+
+	if err := store.WriteFile(ctx, "current/debian/dists/trixie/main/binary-amd64/Packages", bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := store.ListPublishedInfo(ctx, "current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 published file, got %d: %v", len(infos), infos)
+	}
+	if infos[0].Size != int64(len(data)) {
+		t.Errorf("ListPublishedInfo: Size = %d, want %d", infos[0].Size, len(data))
+	}
+	if infos[0].ModTime.IsZero() {
+		t.Error("ListPublishedInfo: ModTime is zero, want populated")
+	}
+}
+
+func TestPutFileRejectsPathTraversal(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	data := []byte("malicious content")
+
+	if err := store.PutFile(ctx, "pool/../../../etc/passwd", bytes.NewReader(data), int64(len(data))); err == nil {
+		t.Fatal("expected PutFile to reject a path escaping the pool root, got nil error")
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(root), "etc", "passwd")); err == nil {
+		t.Fatal("traversal path must not have been written outside the store root")
 	}
 }
 

@@ -3,13 +3,35 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/debproxy/debproxy/internal/model"
 )
 
 var ErrNotImplemented = errors.New("storage backend not implemented")
+
+// CleanRelPath cleans a caller-supplied relative path and rejects any attempt
+// to escape upward (a leading ".." remaining after cleaning) via ".."
+// segments. A leading "/" is stripped rather than rejected, so callers get a
+// normalized relative path either way. Both storage backends (filesystem and
+// S3) call this before joining the result to their own root, so a
+// client/upstream-controlled path can never resolve outside of it -- neither
+// backend should reimplement this check independently.
+func CleanRelPath(p string) (string, error) {
+	trimmed := strings.TrimPrefix(strings.TrimSpace(p), "/")
+	clean := path.Clean(trimmed)
+	if clean == "." {
+		clean = ""
+	}
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("invalid path %q", p)
+	}
+	return clean, nil
+}
 
 // FileInfo describes a stored file.
 type FileInfo struct {
@@ -26,7 +48,11 @@ type FileStore interface {
 	Exists(ctx context.Context, poolPath string) (bool, error)
 	Delete(ctx context.Context, poolPath string) error
 	ComputeChecksums(ctx context.Context, poolPath string) (model.Checksums, error)
-	WalkPool(ctx context.Context, fn func(poolPath string) error) error
+	// WalkPool visits every pool file, passing its FileInfo (size, mod time)
+	// straight from the underlying listing (filesystem: fs.DirEntry.Info();
+	// S3: the ListObjectsV2 page) so callers that need that metadata don't
+	// have to issue a separate Stat per file.
+	WalkPool(ctx context.Context, fn func(info FileInfo) error) error
 }
 
 // Publisher manages write-once published dists trees and snapshot aliases.
@@ -36,6 +62,9 @@ type Publisher interface {
 	OpenPublished(ctx context.Context, relPath string) (io.ReadCloser, error)
 	StatPublished(ctx context.Context, relPath string) (FileInfo, error)
 	ListPublished(ctx context.Context, prefix string) ([]string, error)
+	// ListPublishedInfo is the FileInfo-returning analog of ListPublished, for
+	// callers that need mod times without a separate StatPublished per file.
+	ListPublishedInfo(ctx context.Context, prefix string) ([]FileInfo, error)
 	ListSnapshots(ctx context.Context, osName string) ([]SnapshotRef, error)
 	ResolveSnapshot(ctx context.Context, osName string, at time.Time) (string, error)
 }

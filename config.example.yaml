@@ -38,6 +38,15 @@ schedule:
   # Omit or set to "0" to disable  -- use `debproxy cleanup` to run manually.
   cleanup: "sunday@04:00"
 
+  # gc_grace is the minimum age a pool/src file must reach before pool/src GC
+  # will delete it as unreferenced. This guards against a race between a
+  # concurrent cache write and a GC pass building its "keep" set in between
+  # the file being written and its metadata index entry committing.
+  # Accepts a Go duration string (e.g. "30m", "2h"). Omit or set to "0" to use
+  # the built-in default of 1 hour -- this is a safety margin, not a feature
+  # to casually disable.
+  # gc_grace: 1h
+
 signing:
   private_key: /etc/debproxy/keys/debproxy-signing.asc
 

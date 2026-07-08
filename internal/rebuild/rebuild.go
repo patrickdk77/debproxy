@@ -48,7 +48,8 @@ func Run(ctx context.Context, cfg *config.Config, store storage.Storage, index m
 	fetcher := newLazyFetcher(cfg, opts.HTTPClient)
 
 	var files, entries int
-	err = store.WalkPool(ctx, func(poolPath string) error {
+	err = store.WalkPool(ctx, func(info storage.FileInfo) error {
+		poolPath := info.Path
 		rc, err := store.Open(ctx, poolPath)
 		if err != nil {
 			return err
@@ -66,10 +67,6 @@ func Run(ctx context.Context, cfg *config.Config, store storage.Storage, index m
 		}
 
 		checksums, err := store.ComputeChecksums(ctx, poolPath)
-		if err != nil {
-			return err
-		}
-		info, err := store.Stat(ctx, poolPath)
 		if err != nil {
 			return err
 		}

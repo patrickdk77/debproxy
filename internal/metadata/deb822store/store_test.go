@@ -2,12 +2,14 @@ package deb822store_test
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/debproxy/debproxy/internal/metadata"
 	"github.com/debproxy/debproxy/internal/metadata/deb822store"
 	"github.com/debproxy/debproxy/internal/model"
+	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/storage/filesystem"
 )
 
@@ -238,6 +240,152 @@ func TestFlushAndReload(t *testing.T) {
 	}
 	if st == nil || st.UpstreamVersion != "1.21" {
 		t.Fatalf("expected upstream state after reload, got %v", st)
+	}
+}
+
+// hookStorage wraps a real storage.Storage and calls onWriteFile synchronously
+// before delegating, letting a test inject a mutation at the exact moment a
+// write to the backend is in flight -- deterministically, with no goroutines
+// or sleeps needed.
+type hookStorage struct {
+	storage.Storage
+	onWriteFile func(relPath string)
+}
+
+func (h *hookStorage) WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error {
+	if h.onWriteFile != nil {
+		fn := h.onWriteFile
+		h.onWriteFile = nil // fire once so writing the second flush's data doesn't recurse
+		fn(relPath)
+	}
+	return h.Storage.WriteFile(ctx, relPath, r, size)
+}
+
+// TestFlushDoesNotLoseConcurrentUpsert proves the generation-counter fix for
+// the Flush/writeRelPath lost-update race: writeRelPath snapshots entries
+// under RLock, writes to the backend without holding any lock, and Flush used
+// to unconditionally clear the dirty flag afterward. A mutation landing in
+// that window used to be silently marked clean without ever being persisted.
+func TestFlushDoesNotLoseConcurrentUpsert(t *testing.T) {
+	root := t.TempDir()
+	fsBackend, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	hook := &hookStorage{Storage: fsBackend}
+	s, err := deb822store.New(ctx, hook)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpsertEntry(ctx, entry("apt", "1.0", "amd64")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fires while Flush's write for this key is in flight -- after
+	// writeRelPath already snapshotted the entries slice for writing.
+	hook.onWriteFile = func(relPath string) {
+		if err := s.UpsertEntry(ctx, entry("bash", "5.2", "amd64")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("first flush: %v", err)
+	}
+	// "bash" raced with the write and must still be marked dirty; a second
+	// flush should pick it up rather than it having been silently dropped.
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+
+	reloaded, err := deb822store.New(ctx, fsBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reloaded.ListEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotApt, gotBash bool
+	for _, e := range entries {
+		if e.Package == "apt" {
+			gotApt = true
+		}
+		if e.Package == "bash" {
+			gotBash = true
+		}
+	}
+	if !gotApt || !gotBash {
+		t.Fatalf("expected both apt and bash to survive the race, got entries=%v", entries)
+	}
+}
+
+// TestRefreshDoesNotDiscardPendingWriteOnExternalDelete proves evictFile no
+// longer wipes in-memory content for a key that still has an unflushed local
+// mutation. Refresh's own doc comment promises "no pending writes are lost";
+// evictFile used to violate that when the backing file disappeared externally
+// while a dirty (unflushed) mutation was pending for the same key.
+func TestRefreshDoesNotDiscardPendingWriteOnExternalDelete(t *testing.T) {
+	root := t.TempDir()
+	fs, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	s, err := deb822store.New(ctx, fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpsertEntry(ctx, entry("apt", "1.0", "amd64")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second local mutation, not yet flushed -- dirty[relPath] is true.
+	if err := s.UpsertEntry(ctx, entry("bash", "5.2", "amd64")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the backing file disappearing externally (e.g. another
+	// instance/process deleted it) while our pending write hasn't landed yet.
+	relPath := "metadata/index/debian/trixie/main/amd64.packages.zst"
+	if err := fs.DeletePublished(ctx, relPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected apt and bash to survive Refresh's eviction of a dirty key, got %v", entries)
+	}
+
+	// Flushing now must recreate the file with both entries.
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := deb822store.New(ctx, fs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := reloaded.ListEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 2 {
+		t.Fatalf("expected both entries to be recreated on disk after flush, got %v", after)
 	}
 }
 

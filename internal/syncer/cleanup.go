@@ -11,13 +11,15 @@ import (
 
 	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
+	"github.com/debproxy/debproxy/internal/storage"
 )
 
 // Cleanup prunes old snapshots and then removes orphaned pool files.
 //
-// A snapshot is eligible for deletion when BOTH conditions hold:
-//   - the total number of snapshots exceeds maxSnapshots (0 = no count limit)
-//   - the snapshot is older than maxSnapshotAge            (0 = no age limit)
+// A snapshot is eligible for deletion based on whichever limits are set:
+//   - if both maxSnapshots and maxSnapshotAge are set, BOTH must hold
+//   - if only one is set (the other is 0), pruning is based on that one alone
+//   - if both are 0, no pruning occurs (both axes are unconstrained)
 //
 // After pruning, pool files not referenced by any remaining snapshot or the
 // current metadata index are deleted.
@@ -29,14 +31,14 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 	slog.Info("cleanup: snapshots pruned", "deleted", deleted)
 	metrics.SnapshotsPrunedTotal.Add(float64(deleted))
 
-	gcDeleted, err := s.gcPool(ctx)
+	gcDeleted, err := s.gcPool(ctx, now)
 	if err != nil {
 		return err
 	}
 	slog.Info("cleanup: pool GC complete", "orphaned_files_deleted", gcDeleted)
 	metrics.GCFilesDeletedTotal.Add(float64(gcDeleted))
 
-	srcDeleted, err := s.gcSrc(ctx)
+	srcDeleted, err := s.gcSrc(ctx, now)
 	if err != nil {
 		return err
 	}
@@ -46,8 +48,8 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 }
 
 func (s *Syncer) pruneSnapshots(ctx context.Context, maxSnapshots int, maxSnapshotAge time.Duration, now time.Time) (int, error) {
-	// Both limits must be set; if either is zero no pruning occurs.
-	if maxSnapshots == 0 || maxSnapshotAge == 0 {
+	// Both axes unconstrained: nothing to prune.
+	if maxSnapshots == 0 && maxSnapshotAge == 0 {
 		return 0, nil
 	}
 
@@ -76,9 +78,15 @@ func (s *Syncer) pruneSnapshots(ctx context.Context, maxSnapshots int, maxSnapsh
 	// Newest first so index 0 is the most recent.
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].t.After(snaps[j].t) })
 
+	// Each axis defaults to "satisfied" when unconstrained (0), so an
+	// unconstrained axis never blocks pruning on the other axis alone. The
+	// both-unconstrained case that would make this trivially true for every
+	// snapshot is already handled by the early return above.
 	var toDelete []string
 	for i, sn := range snaps {
-		if i >= maxSnapshots && now.Sub(sn.t) > maxSnapshotAge {
+		countOK := maxSnapshots == 0 || i >= maxSnapshots
+		ageOK := maxSnapshotAge == 0 || now.Sub(sn.t) > maxSnapshotAge
+		if countOK && ageOK {
 			toDelete = append(toDelete, sn.id)
 		}
 	}
@@ -107,32 +115,77 @@ func (s *Syncer) deleteSnapshotTree(ctx context.Context, snapshotID string) erro
 	return nil
 }
 
+// gcGracePeriod protects files written moments ago from being deleted by a
+// concurrently-running GC pass. A pull-through/auto_update cache write does
+// store.PutFile followed some time later by a metadata index commit; if a GC
+// pass builds its "keep" reference set (from the index) in between those two
+// steps, the just-written file is invisible to the ref set even though it now
+// exists in storage, and would otherwise be deleted right after being cached.
+// Configurable via schedule.gc_grace; see gcGracePeriod.
+const defaultGCGracePeriod = 1 * time.Hour
+
+// gcGracePeriod resolves schedule.gc_grace, falling back to
+// defaultGCGracePeriod when unset, "0", or invalid. This is a safety margin
+// against the race described above, not a feature meant to be casually
+// disabled, so an empty/invalid value falls back to the safe default rather
+// than to no grace period at all.
+func (s *Syncer) gcGracePeriod() time.Duration {
+	raw := s.cfg.Schedule.GCGrace
+	if raw == "" || raw == "0" {
+		return defaultGCGracePeriod
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid schedule.gc_grace, using default", "value", raw, "default", defaultGCGracePeriod, "err", err)
+		return defaultGCGracePeriod
+	}
+	return d
+}
+
+// deleteOrphans deletes each candidate, skipping any candidate written within
+// the configured GC grace period (see gcGracePeriod) since it may be
+// mid-flight for a concurrent cache write. candidates carry the ModTime the
+// caller already has on hand from listing (WalkPool/ListPublishedInfo), so
+// this doesn't issue a separate Stat per file. kind labels log lines (e.g.
+// "pool file", "src file"). Returns the number of files actually deleted.
+func (s *Syncer) deleteOrphans(ctx context.Context, kind string, candidates []storage.FileInfo, now time.Time) int {
+	grace := s.gcGracePeriod()
+	deleted := 0
+	for _, fi := range candidates {
+		if now.Sub(fi.ModTime) < grace {
+			slog.Debug("cleanup: skipping recently-written "+kind+" this run", "path", fi.Path)
+			continue
+		}
+		if err := s.store.Delete(ctx, fi.Path); err != nil {
+			slog.Warn("cleanup: delete orphaned "+kind+" failed", "path", fi.Path, "err", err)
+			continue
+		}
+		slog.Debug("cleanup: deleted orphaned "+kind, "path", fi.Path)
+		deleted++
+	}
+	return deleted
+}
+
 // gcPool removes pool files not referenced by any remaining snapshot or the
-// metadata index, and returns the number of files deleted.
-func (s *Syncer) gcPool(ctx context.Context) (int, error) {
+// metadata index, and returns the number of files deleted. Candidates newer
+// than gcGracePeriod are skipped this run (see gcGracePeriod).
+func (s *Syncer) gcPool(ctx context.Context, now time.Time) (int, error) {
 	ref, err := s.buildPoolRefSet(ctx)
 	if err != nil {
 		return 0, err
 	}
 
-	var toDelete []string
-	if err := s.store.WalkPool(ctx, func(poolPath string) error {
-		if !ref[poolPath] {
-			toDelete = append(toDelete, poolPath)
+	var candidates []storage.FileInfo
+	if err := s.store.WalkPool(ctx, func(info storage.FileInfo) error {
+		if !ref[info.Path] {
+			candidates = append(candidates, info)
 		}
 		return nil
 	}); err != nil {
 		return 0, fmt.Errorf("walk pool: %w", err)
 	}
 
-	for _, p := range toDelete {
-		if err := s.store.Delete(ctx, p); err != nil {
-			slog.Warn("cleanup: delete orphaned file failed", "path", p, "err", err)
-		} else {
-			slog.Debug("cleanup: deleted orphaned pool file", "path", p)
-		}
-	}
-	return len(toDelete), nil
+	return s.deleteOrphans(ctx, "pool file", candidates, now), nil
 }
 
 // buildPoolRefSet returns the set of all pool Filename: paths that must be kept.
@@ -175,12 +228,23 @@ func (s *Syncer) buildPoolRefSet(ctx context.Context) (map[string]bool, error) {
 		}
 	}
 
-	// Also include every PoolPath known to the metadata index.
+	// Also include the pool path of the highest version of each package known
+	// to the metadata index (belt-and-suspenders for packages downloaded since
+	// the last snapshot). Superseded versions are deliberately excluded: once
+	// a newer version is indexed, the old one is never published again (see
+	// groupStanzas in syncer.go, which does the same highest-version dedup),
+	// so protecting its pool file here forever would only accumulate disk
+	// usage with no purpose -- EntryByDigest, the only mechanism that could
+	// have needed old-version entries for content-dedup, is unused.
 	entries, err := s.index.ListEntries(ctx, model.Selector{})
 	if err != nil {
 		return nil, fmt.Errorf("list metadata entries: %w", err)
 	}
-	for _, e := range entries {
+	type entryKey struct{ os, codename, comp, arch, pkg string }
+	best := highestVersionByKey(entries,
+		func(e model.IndexEntry) entryKey { return entryKey{e.OS, e.Codename, e.Component, e.Arch, e.Package} },
+		func(e model.IndexEntry) string { return e.Version })
+	for _, e := range best {
 		ref[e.PoolPath] = true
 	}
 
@@ -211,34 +275,29 @@ func (s *Syncer) scanPackagesRefs(ctx context.Context, relPath string, ref map[s
 }
 
 // gcSrc removes src/ files not referenced by any remaining snapshot or the
-// metadata source index, and returns the number of files deleted.
-func (s *Syncer) gcSrc(ctx context.Context) (int, error) {
+// metadata source index, and returns the number of files deleted. Candidates
+// newer than gcGracePeriod are skipped this run (see gcGracePeriod).
+func (s *Syncer) gcSrc(ctx context.Context, now time.Time) (int, error) {
 	ref, err := s.buildSrcRefSet(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	// src/ files are stored via FileStore (PutFile), so list them via
-	// ListPublished which walks the same storage root.
-	allSrc, err := s.store.ListPublished(ctx, "src")
+	// ListPublishedInfo which walks the same storage root.
+	allSrc, err := s.store.ListPublishedInfo(ctx, "src")
 	if err != nil {
 		return 0, fmt.Errorf("list src files: %w", err)
 	}
 
-	var toDelete []string
-	for _, p := range allSrc {
-		if !ref[p] {
-			toDelete = append(toDelete, p)
+	var candidates []storage.FileInfo
+	for _, fi := range allSrc {
+		if !ref[fi.Path] {
+			candidates = append(candidates, fi)
 		}
 	}
-	for _, p := range toDelete {
-		if err := s.store.Delete(ctx, p); err != nil {
-			slog.Warn("cleanup: delete orphaned src file failed", "path", p, "err", err)
-		} else {
-			slog.Debug("cleanup: deleted orphaned src file", "path", p)
-		}
-	}
-	return len(toDelete), nil
+
+	return s.deleteOrphans(ctx, "src file", candidates, now), nil
 }
 
 // buildSrcRefSet returns the set of src/ paths that must be kept.
@@ -278,12 +337,18 @@ func (s *Syncer) buildSrcRefSet(ctx context.Context) (map[string]bool, error) {
 		}
 	}
 
-	// Also include all src paths known to the metadata source index.
+	// Also include all src paths for the highest version of each source
+	// package known to the metadata index -- see buildPoolRefSet for why
+	// superseded versions are deliberately excluded.
 	srcEntries, err := s.index.ListSourceEntries(ctx, model.Selector{})
 	if err != nil {
 		return nil, fmt.Errorf("list source entries: %w", err)
 	}
-	for _, e := range srcEntries {
+	type srcKey struct{ os, codename, comp, pkg string }
+	bestSrc := highestVersionByKey(srcEntries,
+		func(e model.SourceEntry) srcKey { return srcKey{e.OS, e.Codename, e.Component, e.Package} },
+		func(e model.SourceEntry) string { return e.Version })
+	for _, e := range bestSrc {
 		for _, f := range e.Files {
 			ref[e.LocalDir+"/"+f.Filename] = true
 		}

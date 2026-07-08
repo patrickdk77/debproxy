@@ -128,7 +128,10 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 		debPrefix := "dists/" + codename + "/" + comp + "/deb/"
 		diskFiles := make(map[string]diskEntry)
 		_ = filepath.Walk(debDir, func(p string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".deb") {
+			if warnWalkErr("deb dir", p, err) {
+				return nil
+			}
+			if info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".deb") {
 				return nil
 			}
 			rel, _ := filepath.Rel(debDir, p)
@@ -204,7 +207,10 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 		srcDiskFiles := make(map[string]diskEntry)
 		if _, err := os.Stat(srcDir); err == nil {
 			_ = filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
-				if err != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".dsc") {
+				if warnWalkErr("source dir", p, err) {
+					return nil
+				}
+				if info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".dsc") {
 					return nil
 				}
 				rel, _ := filepath.Rel(srcDir, p)
@@ -477,6 +483,16 @@ func discoverArches(compPath string) []string {
 	return arches
 }
 
+// warnWalkErr logs a filepath.Walk error and reports whether the callback
+// should skip this entry (true) rather than continue processing it.
+func warnWalkErr(kind, p string, err error) bool {
+	if err == nil {
+		return false
+	}
+	slog.Warn("walk "+kind+": skipping entry", "path", p, "err", err)
+	return true
+}
+
 // subdirs returns names of immediate subdirectories within dir.
 func subdirs(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
@@ -632,7 +648,10 @@ func scanPool(poolDir string, force bool) (map[string][]*apt.Paragraph, error) {
 
 		diskFiles := make(map[string]diskEntry)
 		_ = filepath.Walk(compDir, func(p string, info os.FileInfo, err error) error {
-			if err != nil || info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".deb") {
+			if warnWalkErr("pool dir", p, err) {
+				return nil
+			}
+			if info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".deb") {
 				return nil
 			}
 			rel, _ := filepath.Rel(compDir, p)

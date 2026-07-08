@@ -5,6 +5,8 @@ metadata:
   namespace: debproxy
 data:
   config.yaml: |
+    metrics_addr: ":9090"
+
     schedule:
       refresh: 6h
       snapshot: sunday@03:00

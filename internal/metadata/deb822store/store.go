@@ -45,6 +45,7 @@ type Store struct {
 	sources      map[string][]model.SourceEntry          // key: "os/codename/component"
 	fileModTimes map[string]time.Time                    // relPath -> mod time at last load
 	dirty        map[string]bool                         // relPath -> needs flush
+	generation   map[string]uint64                       // relPath -> bumped on every mutation
 }
 
 // New loads all existing metadata from the storage backend into memory.
@@ -56,6 +57,7 @@ func New(ctx context.Context, backend storage.Storage) (*Store, error) {
 		sources:      map[string][]model.SourceEntry{},
 		fileModTimes: map[string]time.Time{},
 		dirty:        map[string]bool{},
+		generation:   map[string]uint64{},
 	}
 	if err := s.loadAll(ctx); err != nil {
 		return nil, err
@@ -177,6 +179,14 @@ func (s *Store) Refresh(ctx context.Context) error {
 // evictFile removes the in-memory data for a metadata file that no longer exists.
 // Must be called with s.mu held for writing.
 func (s *Store) evictFile(relPath string) {
+	if s.dirty[relPath] {
+		// A local mutation for this key hasn't been flushed yet. The backing
+		// file disappearing externally doesn't mean our in-memory content is
+		// stale -- discarding it here would mean the next Flush writes an
+		// empty file over whatever used to be there. Keep it; the pending
+		// write will recreate the file.
+		return
+	}
 	if strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, ".packages.zst") {
 		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), ".packages.zst")
 		delete(s.entries, key)
@@ -269,6 +279,9 @@ func (s *Store) Reset(ctx context.Context) error {
 	s.entries = map[string][]model.IndexEntry{}
 	s.states = map[string][]model.UpstreamPackageState{}
 	s.sources = map[string][]model.SourceEntry{}
+	s.dirty = map[string]bool{}
+	s.fileModTimes = map[string]time.Time{}
+	s.generation = map[string]uint64{}
 	return nil
 }
 
@@ -294,7 +307,9 @@ func (s *Store) UpsertEntry(_ context.Context, e model.IndexEntry) error {
 		entries = append(entries, e)
 	}
 	s.entries[key] = entries
-	s.dirty[path.Join(indexPrefix, e.OS, e.Codename, e.Component, e.Arch+".packages.zst")] = true
+	relPath := path.Join(indexPrefix, e.OS, e.Codename, e.Component, e.Arch+".packages.zst")
+	s.dirty[relPath] = true
+	s.generation[relPath]++
 	return nil
 }
 
@@ -408,7 +423,9 @@ func (s *Store) UpsertUpstreamState(_ context.Context, st model.UpstreamPackageS
 		states = append(states, st)
 	}
 	s.states[st.Upstream] = states
-	s.dirty[upstreamPrefix+st.Upstream+".state.zst"] = true
+	relPath := upstreamPrefix + st.Upstream + ".state.zst"
+	s.dirty[relPath] = true
+	s.generation[relPath]++
 	return nil
 }
 
@@ -442,18 +459,26 @@ func (s *Store) Flush(ctx context.Context) error {
 	s.mu.Unlock()
 
 	for relPath := range dirty {
-		if err := s.flushRelPath(ctx, relPath); err != nil {
+		gen, err := s.flushRelPath(ctx, relPath)
+		if err != nil {
 			return err
 		}
 		s.mu.Lock()
-		delete(s.dirty, relPath)
+		// Only clear dirty if nothing mutated this key since we captured the
+		// state we just wrote. Otherwise a concurrent Upsert* call that raced
+		// with the write would be silently dropped -- marked clean even though
+		// its change was never persisted. Leaving dirty set means the next
+		// Flush call picks up the newer state instead of losing it.
+		if s.generation[relPath] == gen {
+			delete(s.dirty, relPath)
+		}
 		s.mu.Unlock()
 	}
 	slog.Info("metadata saved", "files", len(dirty))
 	return nil
 }
 
-func (s *Store) flushRelPath(ctx context.Context, relPath string) error {
+func (s *Store) flushRelPath(ctx context.Context, relPath string) (uint64, error) {
 	// If the on-disk file is newer than when we last read it, another instance
 	// may have written changes we don't have in memory. Merge before overwriting
 	// so no data is lost when running multiple servers or a cronjob alongside.
@@ -468,8 +493,9 @@ func (s *Store) flushRelPath(ctx context.Context, relPath string) error {
 		}
 	}
 
-	if err := s.writeRelPath(ctx, relPath); err != nil {
-		return err
+	gen, err := s.writeRelPath(ctx, relPath)
+	if err != nil {
+		return 0, err
 	}
 
 	// Update fileModTimes so the next flush won't re-merge unnecessarily.
@@ -478,42 +504,47 @@ func (s *Store) flushRelPath(ctx context.Context, relPath string) error {
 		s.fileModTimes[relPath] = fi.ModTime
 		s.mu.Unlock()
 	}
-	return nil
+	return gen, nil
 }
 
 // writeRelPath serializes and writes the current in-memory state for relPath.
-// It copies the slice under the read lock then writes to the backend without
-// holding any lock, so slow storage calls don't block mutations.
-func (s *Store) writeRelPath(ctx context.Context, relPath string) error {
+// It copies the slice and the current generation counter under the same read
+// lock, then writes to the backend without holding any lock so slow storage
+// calls don't block mutations. The returned generation lets Flush detect a
+// mutation that raced with the write (see Flush).
+func (s *Store) writeRelPath(ctx context.Context, relPath string) (uint64, error) {
 	switch {
 	case strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, ".packages.zst"):
 		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), ".packages.zst")
 		parts := strings.SplitN(key, "/", 4)
 		if len(parts) != 4 {
-			return fmt.Errorf("invalid index key %q", key)
+			return 0, fmt.Errorf("invalid index key %q", key)
 		}
 		s.mu.RLock()
 		entries := append([]model.IndexEntry(nil), s.entries[key]...)
+		gen := s.generation[relPath]
 		s.mu.RUnlock()
-		return s.flushEntries(ctx, parts[0], parts[1], parts[2], parts[3], entries)
+		return gen, s.flushEntries(ctx, parts[0], parts[1], parts[2], parts[3], entries)
 	case strings.HasPrefix(relPath, indexPrefix) && strings.HasSuffix(relPath, sourcesSuffix):
 		key := strings.TrimSuffix(strings.TrimPrefix(relPath, indexPrefix), sourcesSuffix)
 		parts := strings.SplitN(key, "/", 3)
 		if len(parts) != 3 {
-			return fmt.Errorf("invalid sources key %q", key)
+			return 0, fmt.Errorf("invalid sources key %q", key)
 		}
 		s.mu.RLock()
 		srcs := append([]model.SourceEntry(nil), s.sources[key]...)
+		gen := s.generation[relPath]
 		s.mu.RUnlock()
-		return s.flushSources(ctx, parts[0], parts[1], parts[2], srcs)
+		return gen, s.flushSources(ctx, parts[0], parts[1], parts[2], srcs)
 	case strings.HasPrefix(relPath, upstreamPrefix) && strings.HasSuffix(relPath, ".state.zst"):
 		up := strings.TrimSuffix(strings.TrimPrefix(relPath, upstreamPrefix), ".state.zst")
 		s.mu.RLock()
 		states := append([]model.UpstreamPackageState(nil), s.states[up]...)
+		gen := s.generation[relPath]
 		s.mu.RUnlock()
-		return s.flushStates(ctx, up, states)
+		return gen, s.flushStates(ctx, up, states)
 	}
-	return nil
+	return 0, nil
 }
 
 // mergeFromDisk reads relPath from the backend and merges its contents into the
@@ -799,6 +830,7 @@ func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error 
 	}
 	s.sources[key] = srcs
 	s.dirty[relPath] = true
+	s.generation[relPath]++
 	return nil
 }
 

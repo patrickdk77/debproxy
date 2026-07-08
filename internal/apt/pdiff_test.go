@@ -340,3 +340,53 @@ func TestApplyEdPatch_BadAddress(t *testing.T) {
 		t.Fatal("expected error for bad address, got nil")
 	}
 }
+
+// TestApplyEdPatch_OutOfOrderOpsReturnsErrorNotPanic proves that a patch whose
+// ops are NOT in the descending-address order real "diff -e" output always
+// uses cannot panic. All ops in a patch are resolved against a single lineIdx
+// built from the ORIGINAL (pre-patch) stanza list, while items shrinks as
+// earlier ops in the same patch are applied; a later op's addresses can then
+// point past the end of the now-shorter slice. Before the bounds check this
+// paniced with "slice bounds out of range"; it must now return a clean error.
+func TestApplyEdPatch_OutOfOrderOpsReturnsErrorNotPanic(t *testing.T) {
+	// Three 2-line stanzas: lines 1-2, 4-5, 7-8 (3, 6, 9 are blank separators).
+	input := "Package: a\nVersion: 1\n\nPackage: b\nVersion: 1\n\nPackage: c\nVersion: 1\n\n"
+	pkgs := makePkgs(t, input)
+	if len(pkgs) != 3 {
+		t.Fatalf("test setup: expected 3 stanzas, got %d", len(pkgs))
+	}
+
+	// Ascending order (invalid for real diff -e, which always emits descending
+	// addresses): delete stanza 0 first, then try to delete stanza 2 using its
+	// address in the ORIGINAL numbering. After the first delete, items has only
+	// 2 elements, but the stale lineIdx still resolves "7,8d" to original
+	// stanza index 2 -- out of bounds for the shrunk slice.
+	patch := []byte("1,2d\n7,8d\n")
+
+	_, err := apt.ApplyEdPatch(pkgs, patch)
+	if err == nil {
+		t.Fatal("expected error for out-of-order/out-of-bounds ed ops, got nil (and no panic, which is the main thing being tested)")
+	}
+}
+
+// TestApplyEdPatch_OutOfOrderAppendReturnsError proves the 'a' (append) op is
+// bounds-checked the same way 'd'/'c' are: a stale insertion point past the
+// end of an already-shrunk items slice must be rejected, not silently
+// clamped into the wrong position by sliceInsert.
+func TestApplyEdPatch_OutOfOrderAppendReturnsError(t *testing.T) {
+	input := "Package: a\nVersion: 1\n\nPackage: b\nVersion: 1\n\nPackage: c\nVersion: 1\n\n"
+	pkgs := makePkgs(t, input)
+	if len(pkgs) != 3 {
+		t.Fatalf("test setup: expected 3 stanzas, got %d", len(pkgs))
+	}
+
+	// Delete stanza 0 first (items shrinks to 2), then append after original
+	// line 8 (stanza 2 in the stale lineIdx) -- insertion point 3 is out of
+	// bounds for the now 2-element items slice.
+	patch := []byte("1,2d\n8a\nPackage: d\nVersion: 1\n.\n")
+
+	_, err := apt.ApplyEdPatch(pkgs, patch)
+	if err == nil {
+		t.Fatal("expected error for out-of-bounds append insertion point, got nil")
+	}
+}

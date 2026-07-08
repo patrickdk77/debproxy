@@ -327,6 +327,21 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 }
 
 
+// highestVersionByKey groups items by key and keeps only the one with the
+// highest Version per key. Used wherever superseded package versions must be
+// excluded: publishing (groupStanzas, groupSourceStanzas) and pool/src GC
+// reference-set building (buildPoolRefSet, buildSrcRefSet in cleanup.go).
+func highestVersionByKey[K comparable, T any](items []T, keyOf func(T) K, versionOf func(T) string) map[K]T {
+	best := make(map[K]T, len(items))
+	for _, item := range items {
+		k := keyOf(item)
+		if existing, ok := best[k]; !ok || debversion.Compare(versionOf(item), versionOf(existing)) > 0 {
+			best[k] = item
+		}
+	}
+	return best
+}
+
 // groupSourceStanzas builds SourceStanzas[component] from source entries.
 // When the metadata holds multiple versions of the same source package, only
 // the highest version is included in the snapshot.
@@ -335,15 +350,10 @@ func groupSourceStanzas(entries []model.SourceEntry, components []string) map[st
 	if len(entries) == 0 {
 		return nil
 	}
-	// Keep only the highest version per (component, package).
 	type key struct{ comp, pkg string }
-	best := map[key]model.SourceEntry{}
-	for _, e := range entries {
-		k := key{e.Component, e.Package}
-		if existing, ok := best[k]; !ok || debversion.Compare(e.Version, existing.Version) > 0 {
-			best[k] = e
-		}
-	}
+	best := highestVersionByKey(entries,
+		func(e model.SourceEntry) key { return key{e.Component, e.Package} },
+		func(e model.SourceEntry) string { return e.Version })
 	out := map[string][]string{}
 	for _, comp := range components {
 		out[comp] = nil
@@ -363,13 +373,9 @@ func groupSourceStanzas(entries []model.SourceEntry, components []string) map[st
 func groupStanzas(entries []model.IndexEntry, components, arches []string) map[string]map[string][]string {
 	// Phase 1: for each (component, arch, package) keep only the highest version.
 	type key struct{ comp, arch, pkg string }
-	best := map[key]model.IndexEntry{}
-	for _, e := range entries {
-		k := key{e.Component, e.Arch, e.Package}
-		if existing, ok := best[k]; !ok || debversion.Compare(e.Version, existing.Version) > 0 {
-			best[k] = e
-		}
-	}
+	best := highestVersionByKey(entries,
+		func(e model.IndexEntry) key { return key{e.Component, e.Arch, e.Package} },
+		func(e model.IndexEntry) string { return e.Version })
 
 	// Phase 2: build output, fanning arch=all into every arch.
 	out := map[string]map[string][]string{}
