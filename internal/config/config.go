@@ -370,6 +370,8 @@ func (c *Config) resolveLayouts() error {
 						return fmt.Errorf("layout %s/%s/%s: unknown upstream %q", osLayout.OS, cn.Codename, comp.Component, upName)
 					}
 
+					url := expandPlaceholders(def.URL, osLayout.OS, cn.Codename, comp.Component)
+
 					suite := def.Suite
 					if suite == "" {
 						suite = "{codename}"
@@ -389,7 +391,7 @@ func (c *Config) resolveLayouts() error {
 
 					upstreams = append(upstreams, model.UpstreamSource{
 						Name:         upName,
-						URL:          def.URL,
+						URL:          url,
 						Suite:        suite,
 						Component:    component,
 						Archs:        upArchs,
