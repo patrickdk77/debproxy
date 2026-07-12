@@ -17,10 +17,12 @@ flowchart TD
   pool -.rebuild scan.-> meta
   meta -->|"sha256 -> canonical pool_path"| storage
 
-  meta -.valkey.enabled instead of deb822store.-> valkeystore["valkeystore\n(pool metadata index)"]
-  valkeystore --> vk["Valkey / Redis\n(optional shared cache, see design.md)"]
-  upstream["upstream.IndexCache"] -.shared availability cache.-> vk
-  livecache["server live cache"] -.shared compressed artifacts.-> vk
+  subgraph valkey["optional: valkey.enabled (see design.md)"]
+    vk[("Valkey / Redis")]
+    meta -.instead of deb822store.-> valkeystore["valkeystore\n(pool metadata index)"] --> vk
+    upstream["upstream.IndexCache"] -.shared availability cache.-> vk
+    livecache["server live cache"] -.shared compressed artifacts.-> vk
+  end
 ```
 
 ## Storage layout
