@@ -8,6 +8,7 @@ package valkeycache
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"github.com/valkey-io/valkey-go"
 )
@@ -19,11 +20,30 @@ import (
 // nodes (auto-detected at connect time), and "?master_set=name" for
 // Sentinel. All of that is handled by the driver; debproxy does not
 // implement any of its own topology or TLS logic.
-func NewClient(url string) (valkey.Client, error) {
-	opt, err := valkey.ParseURL(url)
+func NewClient(rawURL string) (valkey.Client, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse raw URL string: %w", err)
+	}
+	queryParams := parsedURL.Query()
+	sentinelUser := queryParams.Get("sentinel_username")
+	sentinelPass := queryParams.Get("sentinel_password")
+
+	queryParams.Del("sentinel_username")
+	queryParams.Del("sentinel_password")
+
+	parsedURL.RawQuery = queryParams.Encode()
+	opt, err := valkey.ParseURL(parsedURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("parse valkey url: %w", err)
 	}
+	if sentinelUser != "" {
+		opt.Sentinel.Username = sentinelUser
+	}
+	if sentinelPass != "" {
+		opt.Sentinel.Password = sentinelPass
+	}
+
 	client, err := valkey.NewClient(opt)
 	if err != nil {
 		return nil, fmt.Errorf("create valkey client: %w", err)
