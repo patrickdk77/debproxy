@@ -1,0 +1,379 @@
+package avail_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/klauspost/compress/gzip"
+	"github.com/valkey-io/valkey-go"
+
+	"github.com/debproxy/debproxy/internal/avail"
+	"github.com/debproxy/debproxy/internal/config"
+	"github.com/debproxy/debproxy/internal/model"
+	"github.com/debproxy/debproxy/internal/signing"
+	"github.com/debproxy/debproxy/internal/testsupport"
+	"github.com/debproxy/debproxy/internal/upstream"
+	"github.com/debproxy/debproxy/internal/valkeycache"
+)
+
+// testValkeyAddr is set by TestMain once the shared container is up.
+var testValkeyAddr string
+
+func TestMain(m *testing.M) {
+	addr, stop, err := testsupport.StartValkey()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "avail tests: %v\n", err)
+		fmt.Fprintln(os.Stderr, "avail tests require Docker with access to pull "+testsupport.ValkeyImage)
+		os.Exit(1)
+	}
+	testValkeyAddr = addr
+	code := m.Run()
+	stop()
+	os.Exit(code)
+}
+
+func testKey(t *testing.T) (*signing.Key, openpgp.EntityList) {
+	t.Helper()
+	dir := t.TempDir()
+	privPath := filepath.Join(dir, "test.asc")
+
+	entity, err := openpgp.NewEntity("test", "", "test@example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := armor.Encode(f, openpgp.PrivateKeyType, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := entity.SerializePrivate(w, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	_ = f.Close()
+
+	key, err := signing.Load(privPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring, err := key.PublicKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, keyring
+}
+
+// buildFakeUpstream returns the URL of an httptest server serving a minimal
+// signed repo for suite "trixie", component "main", arch "amd64", tagged
+// Cache-Control: no-cache so its Valkey-published copy is *never* considered
+// fresh by the normal Expires-based adopt path -- the only way a Build call
+// can avoid a real request is the layout-freshness mechanism under test,
+// with no timing-window confound from the ordinary freshness check. calls
+// counts every request the server receives, so tests can prove whether a
+// Build call touched the network at all.
+func buildFakeUpstream(t *testing.T, key *signing.Key) (srvURL string, calls *atomic.Int32) {
+	t.Helper()
+	calls = &atomic.Int32{}
+
+	packagesContent := []byte("Package: hello\nVersion: 1.0\nArchitecture: amd64\n")
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if _, err := gz.Write(packagesContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gzSum := sha256.Sum256(gzBuf.Bytes())
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages.gz\n",
+		hex.EncodeToString(gzSum[:]), gzBuf.Len(),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzBuf.Bytes())
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL, calls
+}
+
+// buildFakeUpstreamWithBreakableSources is buildFakeUpstream plus a Sources
+// endpoint whose failure can be toggled on demand, for testing what happens
+// when one data kind (Sources) keeps failing while the other (Index) keeps
+// succeeding for the same upstream.
+func buildFakeUpstreamWithBreakableSources(t *testing.T, key *signing.Key) (srvURL string, indexCalls *atomic.Int32, breakSources *atomic.Bool) {
+	t.Helper()
+	indexCalls = &atomic.Int32{}
+	breakSources = &atomic.Bool{}
+
+	packagesContent := []byte("Package: hello\nVersion: 1.0\nArchitecture: amd64\n")
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if _, err := gz.Write(packagesContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gzSum := sha256.Sum256(gzBuf.Bytes())
+
+	sourcesContent := []byte("Package: hello\nVersion: 1.0\nDirectory: pool/main/h/hello\n")
+	sourcesSum := sha256.Sum256(sourcesContent)
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages.gz\n %s %d main/source/Sources\n",
+		hex.EncodeToString(gzSum[:]), gzBuf.Len(),
+		hex.EncodeToString(sourcesSum[:]), len(sourcesContent),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		indexCalls.Add(1)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, _ *http.Request) {
+		indexCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzBuf.Bytes())
+	})
+	mux.HandleFunc("/dists/trixie/main/source/Sources", func(w http.ResponseWriter, r *http.Request) {
+		if breakSources.Load() {
+			// A genuine transport failure, not a status code -- a bad status
+			// for one variant is treated as "try the next variant", not a
+			// hard failure (matches internal/upstream's own fetchSourcesFile
+			// test for this exact distinction).
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					conn.Close()
+				}
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(sourcesContent)
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL, indexCalls, breakSources
+}
+
+func testConfigWithSources(srvURL string, keyring openpgp.EntityList) *config.Config {
+	src := model.UpstreamSource{
+		Name:         "test-upstream",
+		URL:          srvURL,
+		Suite:        "trixie",
+		Component:    "main",
+		Archs:        []string{"amd64"},
+		VerifyKeys:   keyring,
+		FetchSources: true,
+	}
+	return &config.Config{
+		Schedule: config.ScheduleConfig{Refresh: "1h"},
+		ResolvedLayouts: []model.Layout{
+			{OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"}, Upstreams: []model.UpstreamSource{src}},
+		},
+	}
+}
+
+func testConfig(srvURL string, keyring openpgp.EntityList) *config.Config {
+	src := model.UpstreamSource{
+		Name:       "test-upstream",
+		URL:        srvURL,
+		Suite:      "trixie",
+		Component:  "main",
+		Archs:      []string{"amd64"},
+		VerifyKeys: keyring,
+	}
+	return &config.Config{
+		// A real, positive schedule.refresh is required for
+		// MarkLayoutDataFresh to persist anything at all (ttl <= 0 is a
+		// deliberate no-op -- see its own doc comment).
+		Schedule: config.ScheduleConfig{Refresh: "1h"},
+		ResolvedLayouts: []model.Layout{
+			{OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"}, Upstreams: []model.UpstreamSource{src}},
+		},
+	}
+}
+
+func newRawTestClient(t *testing.T) valkey.Client {
+	t.Helper()
+	client, err := testsupport.NewClient(testValkeyAddr)
+	if err != nil {
+		t.Fatalf("connecting to test valkey: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Do(context.Background(), client.B().Flushdb().Build()).Error()
+		client.Close()
+	})
+	return client
+}
+
+// TestBuildEstablishesLayoutFreshnessAfterRealFetch proves the fix for the
+// original production symptom: a layout's freshness marker (see
+// upstream.IndexCache.MarkLayoutDataFresh) is established by *any* Build
+// call's own successful real fetch, not only by the periodic refresher's own
+// cycle -- which can otherwise be delayed by up to a full schedule.refresh
+// interval on a fresh deploy (see layoutSeedOffset in cmd/debproxy). The
+// upstream sends Cache-Control: no-cache, so the ordinary Expires-based
+// adopt path never applies here -- the only way a Build call can avoid a
+// real request is the layout-freshness mechanism under test.
+func TestBuildEstablishesLayoutFreshnessAfterRealFetch(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, calls := buildFakeUpstream(t, key)
+	cfg := testConfig(srvURL, keyring)
+
+	rawClient := newRawTestClient(t)
+	keys := valkeycache.Keys{Prefix: "test-avail-fresh:"}
+	ctx := context.Background()
+
+	cache := upstream.NewIndexCache()
+	cache.EnableValkey(rawClient, keys, time.Minute, 10*time.Second)
+
+	// First Build: nothing cached anywhere yet, so this must really fetch --
+	// and, on success, establish the layout as freshly synced on its own.
+	av1 := avail.Build(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	if len(av1.Pkgs["main"]["amd64"]) == 0 {
+		t.Fatal("expected packages after the first Build")
+	}
+	callsAfterFirst := calls.Load()
+	if callsAfterFirst == 0 {
+		t.Fatal("expected at least one real request on the first Build")
+	}
+
+	// Second Build, immediately after, no external seeding at all: since
+	// no-cache means the ordinary Expires-based adopt path never applies,
+	// zero additional requests here can only mean the first Build's own
+	// success already established this layout as fresh.
+	av2 := avail.Build(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	if calls.Load() != callsAfterFirst {
+		t.Fatalf("expected no additional requests once a prior Build call established freshness, got %d more",
+			calls.Load()-callsAfterFirst)
+	}
+	if av2.Pkgs["main"]["amd64"]["hello"].Version != av1.Pkgs["main"]["amd64"]["hello"].Version {
+		t.Fatalf("adopted package data mismatch: got %+v want %+v",
+			av2.Pkgs["main"]["amd64"]["hello"], av1.Pkgs["main"]["amd64"]["hello"])
+	}
+}
+
+// TestBuildTrustsAnotherReplicasLayoutFreshness proves the freshness marker
+// is genuinely shared across replicas: a brand new IndexCache (standing in
+// for a different debproxy process) that has never fetched anything itself
+// still adopts outright, purely because another cache instance already
+// established the layout as fresh in the same Valkey deployment.
+func TestBuildTrustsAnotherReplicasLayoutFreshness(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, calls := buildFakeUpstream(t, key)
+	cfg := testConfig(srvURL, keyring)
+
+	rawClient := newRawTestClient(t)
+	keys := valkeycache.Keys{Prefix: "test-avail-fresh-shared:"}
+	ctx := context.Background()
+
+	cache1 := upstream.NewIndexCache()
+	cache1.EnableValkey(rawClient, keys, time.Minute, 10*time.Second)
+	av1 := avail.Build(ctx, cfg, http.DefaultClient, cache1, "debian", "trixie")
+	if len(av1.Pkgs["main"]["amd64"]) == 0 {
+		t.Fatal("expected packages after the first replica's Build")
+	}
+	callsAfterFirst := calls.Load()
+	if callsAfterFirst == 0 {
+		t.Fatal("expected at least one real request on the first replica's Build")
+	}
+
+	// A second, independent replica: brand new local state, same Valkey.
+	cache2 := upstream.NewIndexCache()
+	cache2.EnableValkey(rawClient, keys, time.Minute, 10*time.Second)
+	av2 := avail.Build(ctx, cfg, http.DefaultClient, cache2, "debian", "trixie")
+	if calls.Load() != callsAfterFirst {
+		t.Fatalf("expected the second replica to adopt outright with no additional requests, got %d more",
+			calls.Load()-callsAfterFirst)
+	}
+	if av2.Pkgs["main"]["amd64"]["hello"].Version != av1.Pkgs["main"]["amd64"]["hello"].Version {
+		t.Fatalf("adopted package data mismatch: got %+v want %+v",
+			av2.Pkgs["main"]["amd64"]["hello"], av1.Pkgs["main"]["amd64"]["hello"])
+	}
+}
+
+// TestBuildDoesNotMarkFreshWhenSourcesFetchFails proves a real bug found in
+// review: a layout must not be marked fresh just because its Index fetch
+// succeeded if that same call's Sources fetch failed -- otherwise the next
+// Build call would adopt the Sources side outright too, permanently masking
+// a broken Sources upstream behind its sibling's success (since every future
+// call would keep re-marking the layout fresh without ever giving the
+// broken Sources fetch another real attempt).
+func TestBuildDoesNotMarkFreshWhenSourcesFetchFails(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, indexCalls, breakSources := buildFakeUpstreamWithBreakableSources(t, key)
+	cfg := testConfigWithSources(srvURL, keyring)
+
+	rawClient := newRawTestClient(t)
+	keys := valkeycache.Keys{Prefix: "test-avail-partial-fail:"}
+	ctx := context.Background()
+
+	cache := upstream.NewIndexCache()
+	cache.EnableValkey(rawClient, keys, time.Minute, 10*time.Second)
+
+	// First Build: Index succeeds, but Sources is broken for this call.
+	breakSources.Store(true)
+	av1 := avail.Build(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	if len(av1.Pkgs["main"]["amd64"]) == 0 {
+		t.Fatal("expected Index packages despite Sources failing")
+	}
+	if len(av1.Srcs["main"]) != 0 {
+		t.Fatal("expected no Sources entries while Sources is broken")
+	}
+	indexCallsAfterFirst := indexCalls.Load()
+	if indexCallsAfterFirst == 0 {
+		t.Fatal("expected at least one real Index request on the first Build")
+	}
+
+	// Second Build, Sources now fixed: if the layout was incorrectly marked
+	// fresh despite the first call's Sources failure, Index would now adopt
+	// outright (no new request) instead of fetching for real again.
+	breakSources.Store(false)
+	av2 := avail.Build(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	if indexCalls.Load() == indexCallsAfterFirst {
+		t.Fatal("expected a real Index request on the second Build -- the layout must not have been marked fresh after the first call's Sources failure")
+	}
+	if len(av2.Srcs["main"]) == 0 {
+		t.Fatal("expected Sources entries now that Sources is fixed")
+	}
+}

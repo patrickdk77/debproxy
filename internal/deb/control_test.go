@@ -50,10 +50,10 @@ func writeARMember(w *bytes.Buffer, name string, data []byte) {
 	for i := len(name) + 1; i < 16; i++ {
 		hdr[i] = ' '
 	}
-	copy(hdr[16:], "0           ")    // mtime
-	copy(hdr[28:], "0     ")          // uid
-	copy(hdr[34:], "0     ")          // gid
-	copy(hdr[40:], "100644  ")        // mode
+	copy(hdr[16:], "0           ") // mtime
+	copy(hdr[28:], "0     ")       // uid
+	copy(hdr[34:], "0     ")       // gid
+	copy(hdr[40:], "100644  ")     // mode
 	sz := len(data)
 	copy(hdr[48:], fmt.Sprintf("%-10d", sz))
 	hdr[58] = '`'
@@ -65,7 +65,7 @@ func writeARMember(w *bytes.Buffer, name string, data []byte) {
 	}
 }
 
-func TestControlParagraph_gz(t *testing.T) {
+func TestControlParagraphGz(t *testing.T) {
 	ar := buildDeb(t, func(w io.Writer) io.WriteCloser { gz, _ := gzip.NewWriterLevel(w, gzip.BestSpeed); return gz }, ".gz")
 	p, err := deb.ControlParagraph(bytes.NewReader(ar.Bytes()))
 	if err != nil {
@@ -76,7 +76,7 @@ func TestControlParagraph_gz(t *testing.T) {
 	}
 }
 
-func TestControlParagraph_xz(t *testing.T) {
+func TestControlParagraphXz(t *testing.T) {
 	ar := buildDeb(t, func(w io.Writer) io.WriteCloser {
 		xw, _ := xz.NewWriter(w)
 		return xw
@@ -95,7 +95,7 @@ func TestControlParagraph_xz(t *testing.T) {
 // io.LimitReader(*os.File, n), which is non-seekable  -- some xz streams fail
 // in the ulikunitz/xz streaming mode. The fix buffers the member into a
 // bytes.Reader so the decompressor gets a seekable reader.
-func TestControlParagraph_xz_file(t *testing.T) {
+func TestControlParagraphXzFile(t *testing.T) {
 	ar := buildDeb(t, func(w io.Writer) io.WriteCloser {
 		xw, _ := xz.NewWriter(w)
 		return xw

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"os"
 	"path"
@@ -52,8 +51,8 @@ type Server struct {
 	exists     *ingest.ExistsCache // shared with syncer; nil disables re-index
 
 	mu           sync.Mutex
-	liveCache    map[string]*liveEntry   // key: os/codename
-	liveBuilding map[string]chan struct{} // in-flight builds
+	liveCache    map[string]*liveEntry         // key: os/codename
+	liveBuilding map[string]chan struct{}      // in-flight builds
 	retryCancel  map[string]context.CancelFunc // background mismatch retries
 
 	// validOSCodename and validTriple bound metric-label cardinality to the
@@ -63,6 +62,11 @@ type Server struct {
 	// and unbounded, so they're never validated or used as metric labels.
 	validOSCodename map[string]bool
 	validTriple     map[string]bool
+
+	// valkey optionally backs /live's compressed serving artifacts with a
+	// shared Valkey deployment so multiple debproxy replicas avoid redundant
+	// compression work. Nil unless EnableValkey is called; see valkey.go.
+	valkey *serverValkeyBacking
 }
 
 const (
@@ -339,7 +343,7 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 			s.servePlainFromLive(w, r, key, entry)
 			return
 		}
-		serveBytes(w, r, key, data, entry.built)
+		serveBytes(w, r, key, data, entry.built, entry.hashes[key])
 		return
 	}
 	http.NotFound(w, r)
@@ -720,6 +724,42 @@ func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
 	return in.Cache(ctx, osName, codename, p)
 }
 
+// buildAvail runs avail.Build under s.indexCache's build lock, shared with
+// cmd/debproxy's periodic background refresher (both build through the same
+// IndexCache) -- so this build never runs concurrently with the refresher's
+// own build for some other layout, each of which could otherwise
+// independently hold a Valkey fetch lock and resident merge memory at the
+// same time.
+//
+// Only call this from a path that does NOT block a live client request:
+// rebuildLive and startMismatchRetry both run in a background goroutine
+// after a stale response has already been served, so waiting on this lock
+// costs nothing user-facing. getLive's cold-start build is different -- it
+// runs synchronously in front of the client, so it calls avail.Build
+// directly instead, trading the (rare, small) chance of a memory-overlap
+// with a background build for guaranteed low latency on every cold start.
+func (s *Server) buildAvail(ctx context.Context, osName, codename string) *avail.Available {
+	s.indexCache.Lock()
+	defer s.indexCache.Unlock()
+	return avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
+}
+
+// buildAvailBestEffort behaves like buildAvail, but never blocks: it takes
+// s.indexCache's build lock only if it's immediately free, and builds
+// unlocked otherwise. Used by getLive's cold-start path, which runs
+// synchronously in front of a live client request -- waiting on an
+// unrelated layout's in-progress build would add real, guaranteed latency
+// to every cold start, the wrong side of the tradeoff buildAvail's other
+// callers accept. Taking the lock whenever it's free still closes the
+// common case of the cross-layout memory overlap buildMu exists to
+// prevent, without the latency cost of ever waiting for it.
+func (s *Server) buildAvailBestEffort(ctx context.Context, osName, codename string) *avail.Available {
+	if s.indexCache.TryLock() {
+		defer s.indexCache.Unlock()
+	}
+	return avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
+}
+
 func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEntry, error) {
 	cacheKey := osName + "/" + codename
 
@@ -768,17 +808,24 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	buildCtx := context.WithoutCancel(ctx)
 	slog.Info("building live cache", "os", osName, "codename", codename)
 	buildStart := time.Now()
-	av := avail.Build(buildCtx, s.cfg, s.client, s.indexCache, osName, codename)
-	files, hashes, err := s.generateLiveFiles(buildCtx, av)
+	// Deliberately s.buildAvailBestEffort, not s.buildAvail: this is the
+	// cold-start, no-cached-data path, and it runs synchronously in front of
+	// a live client request (see the comment above). Blocking on the
+	// periodic refresher's unrelated-layout build would trade a rare, small
+	// memory-overlap risk for real, guaranteed client-facing latency on
+	// every cold start -- the wrong side of that tradeoff -- but taking the
+	// lock whenever it's already free costs nothing and closes that overlap
+	// window in the common case. rebuildLive and startMismatchRetry below
+	// are both background, non-blocking paths and always take the lock.
+	av := s.buildAvailBestEffort(buildCtx, osName, codename)
+	files, hashes, builtAt, expiry, err := s.buildOrAdoptLiveFiles(buildCtx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
 	if err == nil {
-		now := time.Now()
-		jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
-		entry = &liveEntry{av: av, files: files, hashes: hashes, built: now, expiry: now.Add(liveTTLBase + jitter)}
-		s.sweepExpiredLiveCache(now)
+		entry = &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
+		s.sweepExpiredLiveCache(time.Now())
 		s.liveCache[cacheKey] = entry
 		slog.Info("live cache built", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
@@ -806,18 +853,16 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 	defer cancel()
 
 	buildStart := time.Now()
-	av := avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
-	files, hashes, err := s.generateLiveFiles(ctx, av)
+	av := s.buildAvail(ctx, osName, codename)
+	files, hashes, builtAt, expiry, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
 	swapped := err == nil
 	if err == nil {
-		now := time.Now()
-		jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
-		newEntry := &liveEntry{av: av, files: files, hashes: hashes, built: now, expiry: now.Add(liveTTLBase + jitter)}
-		s.sweepExpiredLiveCache(now)
+		newEntry := &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
+		s.sweepExpiredLiveCache(time.Now())
 		s.liveCache[cacheKey] = newEntry
 		slog.Debug("live cache refreshed in background", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
@@ -877,16 +922,14 @@ func (s *Server) startMismatchRetry(osName, codename string) {
 			s.client.CloseIdleConnections()
 			slog.Info("retrying live build after digest mismatch",
 				"os", osName, "codename", codename, "attempt", i+1, "delay", delay)
-			av := avail.Build(ctx, s.cfg, s.client, s.indexCache, osName, codename)
+			av := s.buildAvail(ctx, osName, codename)
 			if !av.HasStaleMismatch {
-				files, hashes, err := s.generateLiveFiles(ctx, av)
+				files, hashes, builtAt, expiry, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
 				if err != nil {
 					slog.Error("mismatch retry: live file generation failed", "os", osName, "codename", codename, "err", err)
 					continue
 				}
-				now := time.Now()
-				jitter := time.Duration(rand.Int63n(int64(liveTTLJitter)))
-				entry := &liveEntry{av: av, files: files, hashes: hashes, built: now, expiry: now.Add(liveTTLBase + jitter)}
+				entry := &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
 				s.mu.Lock()
 				s.liveCache[key] = entry
 				s.mu.Unlock()
@@ -907,8 +950,8 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 
 	type comboKey struct{ comp, arch string }
 	type comboResult struct {
-		key   comboKey
-		list  []string
+		key  comboKey
+		list []string
 	}
 	var combos []comboKey
 	for _, comp := range components {
@@ -1009,7 +1052,6 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 	}
 	return sink.files, hashes, nil
 }
-
 
 type memSink struct {
 	files map[string][]byte
@@ -1131,10 +1173,19 @@ func decompressBytes(suffix string, data []byte) ([]byte, error) {
 	}
 }
 
-func serveBytes(w http.ResponseWriter, r *http.Request, name string, data []byte, modtime time.Time) {
-	sum := sha256.Sum256(data)
+// serveBytes serves data as-is, ETagged with etag if the caller already has
+// one (see entry.hashes -- populated once per live cache build rather than
+// re-hashing potentially several MB of compressed data on every request).
+// Falls back to hashing data itself only when the caller has nothing
+// precomputed (e.g. Release/InRelease, which aren't listed in their own
+// Release document and so have no entry in entry.hashes).
+func serveBytes(w http.ResponseWriter, r *http.Request, name string, data []byte, modtime time.Time, etag string) {
+	if etag == "" {
+		sum := sha256.Sum256(data)
+		etag = fmt.Sprintf("%x", sum)
+	}
 	w.Header().Set("Cache-Control", httpCacheControl(r.URL.Path))
-	w.Header().Set("ETag", fmt.Sprintf(`"%x"`, sum))
+	w.Header().Set("ETag", `"`+etag+`"`)
 	w.Header().Set("Content-Type", contentType(name))
 	http.ServeContent(w, r, path.Base(name), modtime, bytes.NewReader(data))
 }

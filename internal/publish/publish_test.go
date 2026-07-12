@@ -67,7 +67,7 @@ const (
 // TestGenerateSuite_GZipLevels proves gzip is skipped when disabled (0) and,
 // for every level 1-9, produces a valid .gz file that decompresses back to
 // the exact original content.
-func TestGenerateSuite_GZipLevels(t *testing.T) {
+func TestGenerateSuiteGZipLevels(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		files := generate(t, publish.Compression{GZip: 0})
 		if _, ok := files[relGz]; ok {
@@ -103,7 +103,7 @@ func TestGenerateSuite_GZipLevels(t *testing.T) {
 // the exact original content -- exercising zstd.EncoderLevelFromZstd's
 // best-match bucketing (raw levels 1-9 map onto 4 internal presets) for the
 // whole range, not just a single sample level.
-func TestGenerateSuite_ZStdLevels(t *testing.T) {
+func TestGenerateSuiteZStdLevels(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		files := generate(t, publish.Compression{ZStd: 0})
 		if _, ok := files[relZst]; ok {
@@ -140,7 +140,7 @@ func TestGenerateSuite_ZStdLevels(t *testing.T) {
 // level in publish.Compression (see internal/config's ResolveLive/Snapshot --
 // the underlying xz library has no adjustable preset either), so only
 // enabled/disabled applies here.
-func TestGenerateSuite_XZEnabledDisabled(t *testing.T) {
+func TestGenerateSuiteXZEnabledDisabled(t *testing.T) {
 	files := generate(t, publish.Compression{XZ: false})
 	if _, ok := files[relXz]; ok {
 		t.Error("XZ: false should not produce a .xz file")

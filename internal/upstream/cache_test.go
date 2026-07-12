@@ -3,6 +3,8 @@ package upstream
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,6 +27,52 @@ func TestIndexCacheHitAndMiss(t *testing.T) {
 	}
 	if got != entry {
 		t.Fatal("got different entry than stored")
+	}
+}
+
+func TestIndexCacheLockSerializesCallers(t *testing.T) {
+	c := NewIndexCache()
+	var active int32
+	var maxObserved int32
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Lock()
+			defer c.Unlock()
+			n := atomic.AddInt32(&active, 1)
+			for {
+				m := atomic.LoadInt32(&maxObserved)
+				if n <= m || atomic.CompareAndSwapInt32(&maxObserved, m, n) {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+			atomic.AddInt32(&active, -1)
+		}()
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(&maxObserved); got != 1 {
+		t.Fatalf("expected at most 1 concurrent Lock holder, observed max %d", got)
+	}
+}
+
+func TestIndexCacheTryLockSucceedsWhenFree(t *testing.T) {
+	c := NewIndexCache()
+	if !c.TryLock() {
+		t.Fatal("expected TryLock to succeed on a free lock")
+	}
+	c.Unlock()
+}
+
+func TestIndexCacheTryLockFailsWhenHeld(t *testing.T) {
+	c := NewIndexCache()
+	c.Lock()
+	defer c.Unlock()
+
+	if c.TryLock() {
+		t.Fatal("expected TryLock to fail while another caller holds the lock")
 	}
 }
 

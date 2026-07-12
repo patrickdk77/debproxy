@@ -26,7 +26,7 @@ func resolveCompression(t *testing.T, yamlSnippet string) (snapshot, live resolv
 	return
 }
 
-func TestCompressionXZ_UnsetVsExplicitTrue(t *testing.T) {
+func TestCompressionXZUnsetVsExplicitTrue(t *testing.T) {
 	// Nothing set at all: live.xz must default to disabled, snapshot.xz to enabled.
 	_, live := resolveCompression(t, ``)
 	if live.XZ {
@@ -63,7 +63,7 @@ func TestCompressionXZ_UnsetVsExplicitTrue(t *testing.T) {
 	}
 }
 
-func TestCompressionGZipZStd_UnsetVsTrueBehaveTheSame(t *testing.T) {
+func TestCompressionGZipZStdUnsetVsTrueBehaveTheSame(t *testing.T) {
 	// For GZip/ZStd, absent and explicit true both mean "use the mode's
 	// built-in default level" -- this must keep working under the pointer
 	// refactor exactly as it did before.
@@ -83,7 +83,7 @@ func TestCompressionGZipZStd_UnsetVsTrueBehaveTheSame(t *testing.T) {
 // expected in both modes: explicit true enables at the mode's default level
 // (nonzero), explicit false disables (resolves to 0, which publish.go treats
 // as "don't produce this variant" -- see GenerateSuite's `> 0` checks).
-func TestCompressionGZipZStd_TrueEnablesFalseDisables(t *testing.T) {
+func TestCompressionGZipZStdTrueEnablesFalseDisables(t *testing.T) {
 	for _, mode := range []string{"snapshot", "live"} {
 		trueYAML := mode + ":\n  gzip: true\n  zstd: true\n"
 		falseYAML := mode + ":\n  gzip: false\n  zstd: false\n"

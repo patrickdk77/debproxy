@@ -83,6 +83,25 @@ DEBPROXY_STORAGE_BACKEND=s3
 DEBPROXY_STORAGE_FILESYSTEM_ROOT=/data/debproxy
 ```
 
+## Multi-replica deployments
+
+Running more than one debproxy replica requires a storage backend that
+supports concurrent writes (S3, or a filesystem backend on an RWX volume --
+see [docs/architecture.md](docs/architecture.md#kubernetes)). By default each
+replica is otherwise fully independent: every replica fetches every upstream
+and compresses its own `/live` artifacts separately, so memory and upstream
+load scale linearly with replica count (see [docs/memory.md](docs/memory.md)).
+
+Set `valkey.enabled: true` (see the `valkey:` block in `config.example.yaml`)
+to have replicas share that work through a Valkey/Redis deployment instead --
+only one replica fetches a given upstream at a time, and compressed `/live`
+artifacts are shared rather than independently regenerated. This cuts each
+replica's own memory usage by roughly 8x in steady state. See
+[docs/design.md](docs/design.md#optional-valkey-backed-shared-cache-multi-replica-deployments)
+for how it works and [docs/memory.md](docs/memory.md#valkey-backed-shared-cache)
+for the memory profile. Entirely optional -- a single-replica deployment
+needs none of this.
+
 ## Docker Compose
 
 ```bash

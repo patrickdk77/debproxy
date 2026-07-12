@@ -11,8 +11,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"path"
 	"log/slog"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -307,7 +307,7 @@ func (s *Store) UpsertEntry(_ context.Context, e model.IndexEntry) error {
 		entries = append(entries, e)
 	}
 	s.entries[key] = entries
-	relPath := path.Join(indexPrefix, e.OS, e.Codename, e.Component, e.Arch+".packages.zst")
+	relPath := IndexRelPath(e.OS, e.Codename, e.Component, e.Arch)
 	s.dirty[relPath] = true
 	s.generation[relPath]++
 	return nil
@@ -423,7 +423,7 @@ func (s *Store) UpsertUpstreamState(_ context.Context, st model.UpstreamPackageS
 		states = append(states, st)
 	}
 	s.states[st.Upstream] = states
-	relPath := upstreamPrefix + st.Upstream + ".state.zst"
+	relPath := StateRelPath(st.Upstream)
 	s.dirty[relPath] = true
 	s.generation[relPath]++
 	return nil
@@ -673,10 +673,9 @@ func (s *Store) StartPeriodicFlush(ctx context.Context, interval time.Duration) 
 	}
 }
 
-
 func (s *Store) flushEntries(ctx context.Context, osName, codename, component, arch string, entries []model.IndexEntry) error {
-	relPath := path.Join(indexPrefix, osName, codename, component, arch+".packages.zst")
-	data, err := serializeEntries(entries)
+	relPath := IndexRelPath(osName, codename, component, arch)
+	data, err := SerializeEntries(entries)
 	if err != nil {
 		return err
 	}
@@ -684,15 +683,18 @@ func (s *Store) flushEntries(ctx context.Context, osName, codename, component, a
 }
 
 func (s *Store) flushStates(ctx context.Context, upstream string, states []model.UpstreamPackageState) error {
-	relPath := upstreamPrefix + upstream + ".state.zst"
-	data, err := serializeStates(states)
+	relPath := StateRelPath(upstream)
+	data, err := SerializeStates(states)
 	if err != nil {
 		return err
 	}
 	return s.backend.WriteFile(ctx, relPath, bytes.NewReader(data), int64(len(data)))
 }
 
-func serializeEntries(entries []model.IndexEntry) ([]byte, error) {
+// SerializeEntries encodes entries into the zstd-compressed deb822 format
+// deb822store writes to (and reads from) storage -- exported so other
+// MetadataIndex backends (e.g. valkeystore) can write a compatible backup.
+func SerializeEntries(entries []model.IndexEntry) ([]byte, error) {
 	paras := make([]*apt.Paragraph, len(entries))
 	for i, e := range entries {
 		paras[i] = entryToParagraph(e)
@@ -700,7 +702,8 @@ func serializeEntries(entries []model.IndexEntry) ([]byte, error) {
 	return compress(paras)
 }
 
-func serializeStates(states []model.UpstreamPackageState) ([]byte, error) {
+// SerializeStates is the model.UpstreamPackageState counterpart of SerializeEntries.
+func SerializeStates(states []model.UpstreamPackageState) ([]byte, error) {
 	paras := make([]*apt.Paragraph, len(states))
 	for i, st := range states {
 		paras[i] = stateToParagraph(st)
@@ -708,9 +711,19 @@ func serializeStates(states []model.UpstreamPackageState) ([]byte, error) {
 	return compress(paras)
 }
 
+// compressBufPool reuses the scratch buffer compress() writes compressed
+// output into, instead of letting every call grow and then discard its own
+// -- a real cost when this runs repeatedly (e.g. once per component in a
+// Backuper's per-layout save, see valkeystore.Backup). The returned []byte is
+// a copy, safe to retain after the pooled buffer goes back for reuse.
+var compressBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 func compress(paras []*apt.Paragraph) ([]byte, error) {
-	var buf bytes.Buffer
-	zw, err := zstd.NewWriter(&buf)
+	buf := compressBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer compressBufPool.Put(buf)
+
+	zw, err := zstd.NewWriter(buf)
 	if err != nil {
 		return nil, err
 	}
@@ -723,7 +736,9 @@ func compress(paras []*apt.Paragraph) ([]byte, error) {
 	if err := zw.Close(); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out, nil
 }
 
 // --- deb822 conversion ---
@@ -809,7 +824,7 @@ func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error 
 		e.FirstSeen = metadata.Now()
 	}
 	key := sourceKey(e.OS, e.Codename, e.Component)
-	relPath := sourceRelPath(e.OS, e.Codename, e.Component)
+	relPath := SourceRelPath(e.OS, e.Codename, e.Component)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -940,15 +955,16 @@ func readSourceEntries(ctx context.Context, backend storage.Storage, relPath, os
 }
 
 func (s *Store) flushSources(ctx context.Context, osName, codename, component string, srcs []model.SourceEntry) error {
-	relPath := sourceRelPath(osName, codename, component)
-	data, err := serializeSources(srcs)
+	relPath := SourceRelPath(osName, codename, component)
+	data, err := SerializeSources(srcs)
 	if err != nil {
 		return err
 	}
 	return s.backend.WriteFile(ctx, relPath, bytes.NewReader(data), int64(len(data)))
 }
 
-func serializeSources(srcs []model.SourceEntry) ([]byte, error) {
+// SerializeSources is the model.SourceEntry counterpart of SerializeEntries.
+func SerializeSources(srcs []model.SourceEntry) ([]byte, error) {
 	paras := make([]*apt.Paragraph, len(srcs))
 	for i, e := range srcs {
 		paras[i] = sourceEntryToParagraph(e)
@@ -1060,6 +1076,21 @@ func splitSourceKey(key string) (osName, codename, component string, ok bool) {
 	return parts[0], parts[1], parts[2], true
 }
 
-func sourceRelPath(osName, codename, component string) string {
+// SourceRelPath returns the storage path for one (os, codename, component)'s
+// source-entry file. Exported so other MetadataIndex backends can write (or
+// locate) a backup compatible with deb822store's own file layout.
+func SourceRelPath(osName, codename, component string) string {
 	return path.Join(indexPrefix, osName, codename, component) + sourcesSuffix
+}
+
+// IndexRelPath returns the storage path for one (os, codename, component,
+// arch)'s package-entry file. Exported for the same reason as SourceRelPath.
+func IndexRelPath(osName, codename, component, arch string) string {
+	return path.Join(indexPrefix, osName, codename, component, arch+".packages.zst")
+}
+
+// StateRelPath returns the storage path for one upstream's package-state
+// file. Exported for the same reason as SourceRelPath.
+func StateRelPath(upstream string) string {
+	return upstreamPrefix + upstream + ".state.zst"
 }

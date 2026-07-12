@@ -1,6 +1,6 @@
 # Memory Usage
 
-debproxy holds two categories of data in RAM: the upstream package cache (raw stanzas fetched from upstream mirrors) and the live cache (merged, compressed Packages files served to apt clients). At the reference configuration described below, total RSS sits around **4.8 GB**.
+debproxy holds two categories of data in RAM: the upstream package cache (raw stanzas fetched from upstream mirrors) and the live cache (merged, compressed Packages files served to apt clients). At the reference configuration described below, total RSS sits around **4.8 GB** per instance -- see [Valkey-backed shared cache](#valkey-backed-shared-cache) below for how a multi-replica deployment avoids paying this cost once per replica.
 
 ## Upstream package cache
 
@@ -61,6 +61,51 @@ Reducing the number of active codenames has a roughly linear effect on both cate
 ## Rebuild spike
 
 During a background live cache rebuild the old and new entries coexist in memory until the swap completes. Peak usage is therefore steady state plus one additional live cache: ~4.8 GB + ~1.1 GB = ~5.9 GB. The old entry is dereferenced at swap and collected on the next GC cycle, so the spike is brief but real. Provision at least 6 GB to avoid OOM during a rebuild.
+
+## Valkey-backed shared cache
+
+Everything above describes one self-contained instance: every replica in a
+multi-replica deployment independently fetches every upstream and independently
+holds its own full copy of the upstream package cache and the live cache. Add a
+second replica and both numbers double; the memory cost scales linearly with
+replica count for no benefit, since every replica is redundantly doing and
+storing the same thing.
+
+Enabling `valkey:` (see `config.example.yaml`) moves both of these off the heap
+of every debproxy process and into a shared Valkey/Redis deployment instead --
+see [Optional Valkey-backed shared cache](design.md#optional-valkey-backed-shared-cache-multi-replica-deployments)
+in the design doc for the full mechanism (distributed fetch lock, freshness
+tracking, live-artifact pub/sub). The practical memory effect:
+
+- **Valkey's own memory usage is about the same as one non-Valkey debproxy
+  instance's total** -- ~4.8 GB at the reference configuration above. It is
+  holding the same underlying data (parsed upstream stanzas plus compressed
+  live artifacts); the difference is that it holds **one shared copy** instead
+  of one copy per replica.
+- **Each debproxy replica's own memory usage drops to roughly 1/8th** of the
+  non-Valkey figure -- around **600 MB** at the reference configuration,
+  instead of ~4.8 GB. A replica that finds Valkey's copy fresh adopts it
+  directly (a handful of Valkey round trips) rather than fetching from
+  upstream and parsing/compressing locally, and evicts its own local copy of
+  an upstream's data once a refresh cycle is done with it
+  (`IndexCache.EvictUpstream`) instead of holding every upstream's stanzas
+  resident for the life of the process.
+- **Except during a rebuild action.** Whenever a replica is the one actually
+  doing real work -- the periodic background refresh for a layout, or an
+  on-demand `/live` build that can't adopt a fresh copy from Valkey (cold
+  start with nothing cached yet, or Valkey's copy has expired) -- that
+  replica must hold the full merged data resident to parse and (for `/live`)
+  compress it, the same as the non-Valkey path. Memory on that one replica
+  temporarily approaches the non-Valkey per-instance figures above for the
+  duration of that rebuild, then drops back to the ~1/8th steady state once
+  the result is evicted/adopted-from-Valkey again. Provision each replica for
+  the **non-Valkey steady-state figure**, not the ~600 MB typical figure, so an
+  in-progress rebuild on any one replica doesn't OOM it.
+
+Net effect for an N-replica deployment: without Valkey, total memory is
+roughly `N x 4.8 GB`. With Valkey, it's roughly `4.8 GB (Valkey) + N x 600 MB`
+in steady state, with each replica still provisioned to absorb its own
+rebuild spike.
 
 ## Configuration recommendations
 

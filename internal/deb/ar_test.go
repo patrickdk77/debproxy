@@ -26,7 +26,7 @@ func buildArHeader(name, size string) []byte {
 // negative ar member size returns an error instead of panicking (previously
 // `make([]byte, size)` with a negative size would panic with
 // "makeslice: len out of range").
-func TestControlParagraph_NegativeArSize(t *testing.T) {
+func TestControlParagraphNegativeArSize(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("!<arch>\n")
 	buf.Write(buildArHeader("control.tar.gz", "-1"))
@@ -38,7 +38,7 @@ func TestControlParagraph_NegativeArSize(t *testing.T) {
 }
 
 // TestParseControl_NegativeArSize is the same scenario through ParseControl.
-func TestParseControl_NegativeArSize(t *testing.T) {
+func TestParseControlNegativeArSize(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("!<arch>\n")
 	buf.Write(buildArHeader("control.tar.gz", "-1"))

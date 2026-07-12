@@ -4,6 +4,7 @@ package apt
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -61,6 +62,39 @@ func (p *Paragraph) Keys() []string {
 // LKeys returns pre-lowercased field names in the same order as Keys.
 func (p *Paragraph) LKeys() []string {
 	return append([]string(nil), p.lkeys...)
+}
+
+// paragraphField is one ordered key/value pair, used only for JSON encoding.
+type paragraphField struct {
+	K string `json:"k"`
+	V string `json:"v"`
+}
+
+// MarshalJSON encodes the paragraph as an ordered list of key/value pairs.
+// Plain field-by-field struct encoding isn't available here: keys, lkeys, and
+// values are unexported (deliberately -- Set enforces the keys/lkeys/values
+// invariant), so a marshaler that preserves field order is added explicitly
+// rather than exporting the fields.
+func (p *Paragraph) MarshalJSON() ([]byte, error) {
+	fields := make([]paragraphField, len(p.keys))
+	for i, k := range p.keys {
+		fields[i] = paragraphField{K: k, V: p.values[p.lkeys[i]]}
+	}
+	return json.Marshal(fields)
+}
+
+// UnmarshalJSON decodes a paragraph from the format produced by MarshalJSON.
+func (p *Paragraph) UnmarshalJSON(data []byte) error {
+	var fields []paragraphField
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	np := NewParagraph()
+	for _, f := range fields {
+		np.Set(f.K, f.V)
+	}
+	*p = *np
+	return nil
 }
 
 // WriteTo renders the paragraph in deb822 form (without trailing blank line).

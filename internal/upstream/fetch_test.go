@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -276,6 +277,69 @@ func TestFetchIndex304ReusesCache(t *testing.T) {
 	}
 }
 
+// TestFetchIndexFastFallbackTimeoutBoundsHangingUpstream proves a hung
+// upstream (as opposed to one that errors quickly, like
+// TestFetchIndexStaleFallbackOnError) degrades to the stale fallback within
+// fastFallbackTimeout instead of the full retry budget NewHTTPClient
+// otherwise allows (up to ~4 attempts x 30s each).
+func TestFetchIndexFastFallbackTimeoutBoundsHangingUpstream(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, _, _ := buildFakeUpstream(t, key)
+
+	var hang atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hang.Load() {
+			<-r.Context().Done()
+			return
+		}
+		resp, err := http.Get(srvURL + r.RequestURI)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		var buf bytes.Buffer
+		buf.ReadFrom(resp.Body)
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	src := makeSource(t, srv.URL, keyring)
+	cache := upstream.NewIndexCache()
+	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient(""), cache)
+	ctx := context.Background()
+
+	// First fetch succeeds and warms the cache with real archPkgs.
+	idx1, err := f.FetchIndex(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force revalidation next time, then make the upstream hang instead of
+	// erroring quickly.
+	cache.ExpireAll()
+	hang.Store(true)
+
+	start := time.Now()
+	idx2, err := f.FetchIndex(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected stale fallback, got error: %v", err)
+	}
+	if elapsed > 8*time.Second {
+		t.Fatalf("expected fastFallbackTimeout (~5s) to bound the hung request, took %v instead", elapsed)
+	}
+	if len(idx2.ByArch["amd64"]) != len(idx1.ByArch["amd64"]) {
+		t.Fatal("stale fallback returned wrong package data")
+	}
+}
+
 func TestFetchIndexStaleFallbackOnError(t *testing.T) {
 	key, keyring := testKey(t)
 	srvURL, _, _ := buildFakeUpstream(t, key)
@@ -325,6 +389,126 @@ func TestFetchIndexStaleFallbackOnError(t *testing.T) {
 	}
 	if len(idx1.ByArch["amd64"]) != len(idx2.ByArch["amd64"]) {
 		t.Fatal("stale fallback returned wrong package data")
+	}
+}
+
+// TestFetchSourcesStaleFallbackOnDownloadError proves FetchSources falls back
+// to its cached srcs when the Sources file download itself fails (as opposed
+// to InRelease failing, which TestFetchIndexStaleFallbackOnError's FetchIndex
+// analog covers) -- this specific fallback was missing entirely before: the
+// download loop returned the network error straight to the caller with no
+// stale-data fallback at all, unlike FetchIndex's per-arch Packages fallback.
+func TestFetchSourcesStaleFallbackOnDownloadError(t *testing.T) {
+	key, keyring := testKey(t)
+
+	packagesContent := []byte("Package: hello\nVersion: 1.0\nArchitecture: amd64\n")
+	var pkgGZBuf bytes.Buffer
+	pkgGZ := gzip.NewWriter(&pkgGZBuf)
+	if _, err := pkgGZ.Write(packagesContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := pkgGZ.Close(); err != nil {
+		t.Fatal(err)
+	}
+	packagesSum := sha256.Sum256(pkgGZBuf.Bytes())
+
+	sourcesContentA := []byte("Package: hello\nVersion: 1.0\nDirectory: pool/main/h/hello\n")
+	sourcesContentB := []byte("Package: hello\nVersion: 2.0\nDirectory: pool/main/h/hello\n")
+	sumA := sha256.Sum256(sourcesContentA)
+	sumB := sha256.Sum256(sourcesContentB)
+
+	buildInRelease := func(sourcesSum [32]byte, sourcesLen int) []byte {
+		releaseBytes := []byte(fmt.Sprintf(
+			"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages.gz\n %s %d main/source/Sources\n",
+			hex.EncodeToString(packagesSum[:]), pkgGZBuf.Len(),
+			hex.EncodeToString(sourcesSum[:]), sourcesLen,
+		))
+		inRelease, err := key.SignInline(releaseBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inRelease
+	}
+	inReleaseA := buildInRelease(sumA, len(sourcesContentA))
+	inReleaseB := buildInRelease(sumB, len(sourcesContentB))
+
+	var useVersionB, sourcesFail atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		// no-cache forces revalidation on every call instead of the 5-minute
+		// no-headers fallback expiry letting the second round's FetchIndex/
+		// FetchSources skip the network (and so never see version B) via the
+		// "still fresh" fast path.
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		if useVersionB.Load() {
+			_, _ = w.Write(inReleaseB)
+		} else {
+			_, _ = w.Write(inReleaseA)
+		}
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(pkgGZBuf.Bytes())
+	})
+	mux.HandleFunc("/dists/trixie/main/source/Sources", func(w http.ResponseWriter, _ *http.Request) {
+		if sourcesFail.Load() {
+			// Simulate a genuine transport-level failure (matching the
+			// production "timeout awaiting response headers" symptom) rather
+			// than an HTTP status -- a bad status for one variant is treated
+			// as "try the next variant" by fetchSourcesFile, not a hard
+			// failure, so it wouldn't exercise the fallback this test targets.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				conn.Close()
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(sourcesContentA)
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	src := makeSource(t, srv.URL, keyring)
+	cache := upstream.NewIndexCache()
+	f := upstream.NewFetcherWithCache(src, &http.Client{}, cache)
+	ctx := context.Background()
+
+	// Warm the cache with version A.
+	if _, err := f.FetchIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srcs1, err := f.FetchSources(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(srcs1) == 0 || srcs1[0].Version != "1.0" {
+		t.Fatalf("expected version 1.0 source entry, got %+v", srcs1)
+	}
+
+	// Upstream now publishes version B (a new Sources SHA256, forcing past
+	// the "unchanged" fast path) but the Sources file endpoint itself starts
+	// failing -- simulating exactly the observed production symptom (a
+	// mirror timing out mid-download after InRelease already succeeded).
+	useVersionB.Store(true)
+	sourcesFail.Store(true)
+	if _, err := f.FetchIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	srcs2, err := f.FetchSources(ctx)
+	if err != nil {
+		t.Fatalf("expected stale fallback instead of a hard error, got: %v", err)
+	}
+	if len(srcs2) == 0 || srcs2[0].Version != "1.0" {
+		t.Fatalf("expected stale version 1.0 fallback, got %+v", srcs2)
 	}
 }
 

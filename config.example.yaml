@@ -10,10 +10,26 @@
 schedule:
   # refresh controls how often the server re-fetches upstream package
   # indices in the background, keeping the live-path cache warm between requests.
-  # The first refresh runs 2 minutes after startup (plus random jitter).
-  # Subsequent refreshes run every interval plus up to 5 minutes of random jitter.
+  # Each os/codename layout refreshes on its own independent schedule (not a
+  # single shared timer for all of them), so different layouts naturally
+  # spread out over time instead of firing in one synchronized burst --
+  # helpful in a multi-replica deployment, where a burst would mean every
+  # replica hitting every upstream's fetch lock at the same few moments.
+  # The first refresh for a given layout runs 2 minutes after startup, plus
+  # up to 60s of shared startup jitter, plus that layout's own deterministic
+  # offset spread across the refresh interval. Subsequent refreshes for that
+  # layout run every interval plus refresh_jitter (below). Only one layout's
+  # refresh+update cycle actually runs at a time even if two happen to want
+  # to fire together, bounding peak memory the same way a single sequential
+  # loop would.
   # Use a Go duration string (e.g. "6h", "12h", "24h"). Omit or set to "0" to disable.
   refresh: 6h
+
+  # refresh_jitter is the maximum random delay added on top of refresh on
+  # every cycle (each layout draws its own, independently). Omit for the
+  # built-in default of 5 minutes; set to "0" to disable jitter entirely and
+  # fire exactly every `refresh` interval.
+  # refresh_jitter: 5m
 
   # controls when the server automatically publishes snapshots
   # while running in serve mode. Three formats are accepted:
@@ -47,6 +63,16 @@ schedule:
   # to casually disable.
   # gc_grace: 1h
 
+  # metadata_flush controls how often the server persists the metadata index
+  # to the storage backend while running in serve mode. Accepts a Go duration
+  # string (e.g. "5m", "1h"). Set to "0" to disable it entirely. Omit to use
+  # a backend-dependent default: 5m normally (just flushes recently-dirty
+  # keys, cheap), or 1h when valkey.enabled is true (pulls the ENTIRE current
+  # index out of Valkey and writes it to storage in the same file format --
+  # more expensive, and it's Valkey-backed metadata's only file-based backup,
+  # since Valkey itself already has the data durably).
+  # metadata_flush: 5m
+
 signing:
   private_key: /etc/debproxy/keys/debproxy-signing.asc
 
@@ -72,6 +98,22 @@ storage:
   #     gzip: false
   #     zstd: 3
   #     xz: false
+
+# valkey configures an OPTIONAL shared Valkey/Redis deployment. When enabled,
+# a cluster of debproxy replicas share the pool metadata index instead of
+# each holding it fully in memory, and coordinate upstream fetches so only
+# one replica fetches a given upstream at a time. Leave disabled (the
+# default) for a single-replica deployment -- nothing else changes.
+# valkey:
+#   enabled: true
+#   # Accepts redis:// or valkey:// (rediss:// / valkeys:// for TLS), repeated
+#   # "?addr=host:port" for additional Cluster nodes, and "?master_set=name"
+#   # for Sentinel. A "$VAR" segment anywhere in the URL (e.g. in the password)
+#   # is expanded from the environment at load time.
+#   url: "valkey://user:$VALKEY_PASSWORD@localhost:6379/0"
+#   # key_prefix is prepended to every key debproxy writes, so a single Valkey
+#   # deployment can safely be shared with other applications.
+#   key_prefix: "debproxy:"
 
 upstreams:
   # --- Debian ---

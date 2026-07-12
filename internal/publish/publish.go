@@ -168,6 +168,13 @@ func hashBytes(data []byte, types []string) hashedFile {
 	return hf
 }
 
+// variantBufPool reuses the scratch buffers each compression variant writes
+// into below, instead of letting every (component, arch) combo -- and every
+// source component -- allocate and discard its own. The []byte handed to
+// callers is always a copy taken before the buffer goes back to the pool, so
+// it stays valid after reuse.
+var variantBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
 // GenerateSuite writes the dists/ tree for a suite under prefix (e.g.
 // "2026-04-30/debian"), signing Release with key.
 func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteInput, key *signing.Key) error {
@@ -306,10 +313,19 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 				defer batchWg.Done()
 				stanzas := in.Stanzas[c.comp][c.arch]
 
-				varBufs := make([]bytes.Buffer, len(variants))
+				varBufs := make([]*bytes.Buffer, len(variants))
+				for i := range variants {
+					varBufs[i] = variantBufPool.Get().(*bytes.Buffer)
+					varBufs[i].Reset()
+				}
+				defer func() {
+					for _, b := range varBufs {
+						variantBufPool.Put(b)
+					}
+				}()
 				varWCs := make([]io.WriteCloser, len(variants))
 				for i, v := range variants {
-					wc, err := v.newWriter(&varBufs[i])
+					wc, err := v.newWriter(varBufs[i])
 					if err != nil {
 						batchResults[j] = jobResult{err: fmt.Errorf("open %s: %w", v.suffix, err)}
 						return
@@ -329,7 +345,10 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 					compressed: make([]compFile, len(variants)),
 				}
 				for i, v := range variants {
-					data := varBufs[i].Bytes()
+					// Copied out of varBufs[i] before the deferred Put returns it to
+					// the pool for reuse -- data must stay valid after this goroutine
+					// returns, since the outer loop writes it to sink later.
+					data := append([]byte(nil), varBufs[i].Bytes()...)
 					cfhf := hashBytes(data, hashTypes)
 					cfhf.rel = c.base + "/Packages" + v.suffix
 					jr.compressed[i] = compFile{
@@ -367,11 +386,21 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		if len(stanzas) == 0 {
 			continue
 		}
-		varBufs := make([]bytes.Buffer, len(variants))
+		varBufs := make([]*bytes.Buffer, len(variants))
+		for i := range variants {
+			varBufs[i] = variantBufPool.Get().(*bytes.Buffer)
+			varBufs[i].Reset()
+		}
+		returnBufs := func() {
+			for _, b := range varBufs {
+				variantBufPool.Put(b)
+			}
+		}
 		varWCs := make([]io.WriteCloser, len(variants))
 		for i, v := range variants {
-			wc, err := v.newWriter(&varBufs[i])
+			wc, err := v.newWriter(varBufs[i])
 			if err != nil {
+				returnBufs()
 				return fmt.Errorf("open %s for sources: %w", v.suffix, err)
 			}
 			varWCs[i] = wc
@@ -379,6 +408,7 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 
 		ph, err := streamStanzas(stanzas, varWCs)
 		if err != nil {
+			returnBufs()
 			return err
 		}
 		ph.rel = comp + "/source/Sources"
@@ -387,14 +417,20 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		}
 
 		for i, v := range variants {
+			// Unlike the binary-Packages goroutines above, data is only ever used
+			// synchronously within this same iteration (hashed, then written to
+			// sink before the next component starts), so no defensive copy is
+			// needed before returning the buffer to the pool.
 			data := varBufs[i].Bytes()
 			hf := hashBytes(data, hashTypes)
 			hf.rel = comp + "/source/Sources" + v.suffix
 			if err := sink.WriteFile(ctx, path.Join(distRoot, hf.rel), bytes.NewReader(data), hf.size); err != nil {
+				returnBufs()
 				return err
 			}
 			files = append(files, hf)
 		}
+		returnBufs()
 	}
 
 	release := buildRelease(in, files)
@@ -495,5 +531,3 @@ func buildRelease(in SuiteInput, files []hashedFile) string {
 	out, _ := apt.StanzaString(p)
 	return out
 }
-
-

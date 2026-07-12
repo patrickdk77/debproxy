@@ -38,6 +38,16 @@ type UpstreamSource struct {
 	Password string
 }
 
+// DedupKey returns a key identifying which upstream mirror u fetches from --
+// URL, Suite, and Component together, since the same mirror can be resolved
+// into more than one UpstreamSource (e.g. shared across components or
+// layouts) but only needs fetching once. Name/Archs/etc. are deliberately
+// excluded: they vary per resolved UpstreamSource without changing what's
+// actually fetched from upstream.
+func (u UpstreamSource) DedupKey() string {
+	return u.URL + "\x00" + u.Suite + "\x00" + u.Component
+}
+
 // Layout identifies a merged repository view: os / codename / component.
 type Layout struct {
 	OS        string

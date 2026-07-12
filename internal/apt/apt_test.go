@@ -2,6 +2,8 @@ package apt_test
 
 import (
 	"bytes"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -31,6 +33,61 @@ func TestParseParagraphsAndRoundTrip(t *testing.T) {
 	}
 	if len(reparsed) != 2 || reparsed[1].Get("Package") != "bash" {
 		t.Fatalf("round trip failed: %+v", reparsed)
+	}
+}
+
+func TestParagraphJSONRoundTrip(t *testing.T) {
+	input := "Package: apt\nVersion: 2.6.1\nDepends: libc6, libgcc-s1\n"
+	paras, err := apt.ParseParagraphs(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := paras[0]
+
+	data, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+
+	var got apt.Paragraph
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("UnmarshalJSON: %v", err)
+	}
+
+	if got.Get("Package") != "apt" || got.Get("Version") != "2.6.1" || got.Get("Depends") != "libc6, libgcc-s1" {
+		t.Fatalf("unexpected fields after round trip: %+v", got)
+	}
+	if !reflect.DeepEqual(got.Keys(), orig.Keys()) {
+		t.Fatalf("field order not preserved: got %v want %v", got.Keys(), orig.Keys())
+	}
+}
+
+func TestReleaseJSONRoundTrip(t *testing.T) {
+	input := `Origin: Debian
+Suite: trixie
+SHA256:
+ aaaa 100 main/binary-amd64/Packages
+`
+	rel, err := apt.ParseRelease(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := json.Marshal(rel)
+	if err != nil {
+		t.Fatalf("marshal release: %v", err)
+	}
+
+	var got apt.Release
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal release: %v", err)
+	}
+	if got.Get("Origin") != "Debian" || got.Get("Suite") != "trixie" {
+		t.Fatalf("unexpected release fields: %+v", got)
+	}
+	entry, ok := got.Files["main/binary-amd64/Packages"]
+	if !ok || entry.SHA256 != "aaaa" || entry.Size != 100 {
+		t.Fatalf("unexpected file entry: %+v", entry)
 	}
 }
 

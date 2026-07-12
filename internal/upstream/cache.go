@@ -16,7 +16,38 @@ import (
 type IndexCache struct {
 	mu      sync.Mutex
 	entries map[string]*indexCacheEntry
+	// valkey optionally backs this cache with a shared Valkey deployment so
+	// multiple debproxy replicas avoid redundant upstream fetches. Nil
+	// unless EnableValkey is called; see valkey.go.
+	valkey *valkeyBacking
+
+	// buildMu serializes avail.Build (and the upstream fetches/Valkey fetch
+	// locks it can trigger via FetchIndex/FetchSources) across every caller
+	// sharing this cache. A single debproxy process builds through the same
+	// IndexCache from more than one place -- the periodic background
+	// refresher and on-demand /live request handling (cold-start build,
+	// background rebuild-when-stale, digest-mismatch retry) -- and without
+	// this, a live request's build could run fully concurrently with the
+	// refresher's own build for a different layout, each independently
+	// holding a Valkey fetch lock and resident merge memory at the same
+	// time. This is intentionally distinct from mu above: mu protects this
+	// cache's own entries map for concurrent reads/writes (a much
+	// finer-grained, unrelated concern); buildMu is a coarser, whole-build
+	// serialization point.
+	buildMu sync.Mutex
 }
+
+// Lock and Unlock implement sync.Locker, serializing avail.Build across
+// every caller sharing this cache. See buildMu.
+func (c *IndexCache) Lock()   { c.buildMu.Lock() }
+func (c *IndexCache) Unlock() { c.buildMu.Unlock() }
+
+// TryLock acquires buildMu only if it's immediately free, returning false
+// without blocking otherwise. Used by callers that must never wait on an
+// unrelated build already in progress (see server.go's cold-start live
+// build) but still want to close the common, uncontended case of the same
+// cross-layout memory overlap buildMu exists to prevent.
+func (c *IndexCache) TryLock() bool { return c.buildMu.TryLock() }
 
 type indexCacheEntry struct {
 	// HTTP re-validation handles
@@ -59,6 +90,26 @@ func (c *IndexCache) store(key string, e *indexCacheEntry) {
 	} else {
 		c.entries[key] = e
 	}
+	c.mu.Unlock()
+}
+
+// EvictUpstream removes the cache entry for one upstream+suite+component
+// (the same key FetchIndex/FetchSources use), if this cache is Valkey-backed
+// -- a no-op otherwise, since without Valkey this cache is the only copy of
+// the data, and evicting it would force a full re-fetch (GPG verify,
+// decompress, parse) on the next use instead of a cheap Valkey read. Called
+// once a refresh cycle is done using an upstream's data (see
+// refreshLayoutGroup) so a long-lived process doesn't keep every layout's
+// fetched Packages/Sources resident between refreshes -- Valkey remains the
+// durable copy, and FetchIndex/FetchSources re-adopt a fresh or
+// comparison-only copy from it on the next call (see adoptFromValkey and
+// adoptFromValkeyForComparison in valkey.go).
+func (c *IndexCache) EvictUpstream(inReleaseURL, component string) {
+	if c.valkey == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.entries, inReleaseURL+"\x00"+component)
 	c.mu.Unlock()
 }
 

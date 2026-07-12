@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -13,22 +14,25 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/valkey-io/valkey-go"
 
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/metadata"
 	"github.com/debproxy/debproxy/internal/metadatafactory"
+	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/rebuild"
 	"github.com/debproxy/debproxy/internal/server"
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/storagefactory"
-	"github.com/debproxy/debproxy/internal/model"
 	syncerpkg "github.com/debproxy/debproxy/internal/syncer"
 	"github.com/debproxy/debproxy/internal/upstream"
+	"github.com/debproxy/debproxy/internal/valkeycache"
 	"github.com/debproxy/debproxy/internal/webhook"
 )
 
@@ -136,12 +140,75 @@ func withTimeout10s(fn func(context.Context) error) error {
 	return fn(ctx)
 }
 
+// defaultLockTTL / defaultLockRenewInterval configure the distributed
+// upstream-fetch lock. Deliberately not configurable: renew_interval must
+// stay meaningfully smaller than TTL for the "renew while a fetch is in
+// flight" mechanism to do anything, and a bad pair would fail silently (the
+// lock would just expire before ever being renewed, with nothing to notice
+// or warn) -- not a knob worth the risk of misconfiguration.
+const (
+	defaultLockTTL           = 2 * time.Minute
+	defaultLockRenewInterval = 30 * time.Second
+)
+
+// Defaults for schedule.metadata_flush; see ScheduleConfig.MetadataFlush.
+// The Valkey default is longer because a Backuper pulls the entire current
+// index on every save rather than just recently-dirty keys.
+const (
+	defaultMetadataFlushInterval       = 5 * time.Minute
+	defaultMetadataFlushIntervalValkey = time.Hour
+)
+
+// resolveMetadataFlushInterval resolves schedule.metadata_flush. "0" here is
+// a meaningful, distinct value (explicitly disable periodic metadata
+// persistence) rather than "unset".
+func resolveMetadataFlushInterval(cfg *config.Config) time.Duration {
+	def := defaultMetadataFlushInterval
+	if cfg.Valkey.Enabled {
+		def = defaultMetadataFlushIntervalValkey
+	}
+	raw := cfg.Schedule.MetadataFlush
+	if raw == "" {
+		return def
+	}
+	if raw == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid schedule.metadata_flush, using default", "value", raw, "default", def, "err", err)
+		return def
+	}
+	return d
+}
+
+// Default for schedule.refresh_jitter; see ScheduleConfig.RefreshJitter.
+const defaultRefreshJitter = 5 * time.Minute
+
+// resolveRefreshJitter resolves schedule.refresh_jitter. "0" here is a
+// meaningful, distinct value (disable jitter entirely) rather than "unset".
+func resolveRefreshJitter(cfg *config.Config) time.Duration {
+	raw := cfg.Schedule.RefreshJitter
+	if raw == "" {
+		return defaultRefreshJitter
+	}
+	if raw == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid schedule.refresh_jitter, using default", "value", raw, "default", defaultRefreshJitter, "err", err)
+		return defaultRefreshJitter
+	}
+	return d
+}
+
 func openBackends(ctx context.Context, cfg *config.Config) (storage.Storage, metadata.MetadataIndex, error) {
 	store, err := storagefactory.New(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	index, err := metadatafactory.New(ctx, store)
+	index, err := metadatafactory.New(ctx, store, cfg)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -500,6 +567,21 @@ func runServe(args []string) int {
 	httpClient := upstream.NewHTTPClient(cfg.UserAgent)
 	indexCache := upstream.NewIndexCache()
 
+	// vclient is shared between the upstream fetch cache/lock (below) and the
+	// /live serving-artifact cache (wired into server.New's result further
+	// down) -- one shared client for the whole process rather than a second
+	// connection, since valkey-go's Client is safe for concurrent use.
+	var vclient valkey.Client
+	if cfg.Valkey.Enabled {
+		var err error
+		vclient, err = valkeycache.NewClient(cfg.Valkey.URL)
+		if err != nil {
+			slog.Error("connect to valkey", "err", err)
+			return 1
+		}
+		indexCache.EnableValkey(vclient, valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix}, defaultLockTTL, defaultLockRenewInterval)
+	}
+
 	notifier, err := buildNotifier(cfg)
 	if err != nil {
 		slog.Error("webhook config", "err", err)
@@ -536,13 +618,31 @@ func runServe(args []string) int {
 		slog.Warn("preload pool exists cache", "err", err)
 	}
 
-	// Flush dirty metadata every 5 minutes. On graceful shutdown the stop func
-	// does one final flush. SIGKILL cannot be caught; the 5-minute interval
-	// limits how much index data is lost in that case (it can be rebuilt with
-	// `debproxy rebuild` if needed).
-	stopFlush := startPeriodicFlush(index, 5*time.Minute)
+	// Persist metadata periodically either way -- losing everything since the
+	// last save on a crash is not acceptable for either backend. A
+	// Backuper-backed index (valkeystore) saves per layout grouping, per
+	// component, as each finishes its own refresh cycle (see
+	// saveLayoutMetadata, wired into startIndexRefresher below), so it needs
+	// no separate ticker here. Any other index (deb822store) keeps its
+	// original periodic Flush ticker (startPeriodicMetadataFlush), unchanged.
+	// On graceful shutdown that ticker's stop func does one final save.
+	// SIGKILL cannot be caught; the interval bounds how much is lost in that
+	// case (the index can also be rebuilt with `debproxy rebuild`).
+	metadataFlushInterval := resolveMetadataFlushInterval(cfg)
+	stopFlush := startPeriodicMetadataFlush(index, metadataFlushInterval)
 	stopMerge := startPeriodicMerge(index, time.Hour)
-	stopRefresher := startIndexRefresher(cfg, httpClient, indexCache, refreshInterval, syncr)
+	stopRefresher := startIndexRefresher(cfg, refreshDeps{
+		client:        httpClient,
+		cache:         indexCache,
+		syncr:         syncr,
+		index:         index,
+		store:         store,
+		interval:      refreshInterval,
+		jitter:        resolveRefreshJitter(cfg),
+		flushInterval: metadataFlushInterval,
+		vclient:       vclient,
+		vkeys:         valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix},
+	})
 	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched)
 	stopCleaner := startPeriodicCleanup(syncr, cleanupSched, cfg)
 
@@ -556,7 +656,13 @@ func runServe(args []string) int {
 		}()
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: server.New(cfg, store, index, key, httpClient, indexCache, notifier, syncr.ExistsCache()).Handler()}
+	webServer := server.New(cfg, store, index, key, httpClient, indexCache, notifier, syncr.ExistsCache())
+	stopLiveValkey := func() {}
+	if cfg.Valkey.Enabled {
+		stopLiveValkey = webServer.EnableValkey(context.Background(), vclient, valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix})
+	}
+
+	srv := &http.Server{Addr: *addr, Handler: webServer.Handler()}
 	go func() {
 		slog.Info("listening", "addr", *addr, "layouts", len(cfg.ResolvedLayouts))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -578,6 +684,7 @@ func runServe(args []string) int {
 		slog.Error("http shutdown", "err", err)
 	}
 
+	stopLiveValkey()
 	stopRefresher()
 	stopSnapshotter()
 	stopCleaner()
@@ -586,54 +693,15 @@ func runServe(args []string) int {
 	return 0
 }
 
-// startIndexRefresher pre-warms the upstream index cache shortly after startup,
-// then re-fetches all upstream indices every interval (if > 0). After each
-// refresh it calls syncr.UpdateWithCache to pull any newer auto_update packages.
-// Initial delay is 2 minutes plus up to 60 seconds of random jitter.
-// Each periodic refresh adds up to 5 minutes of random jitter.
-// Returns a stop function that cancels any in-progress refresh and waits for it to finish.
-func startIndexRefresher(cfg *config.Config, client *http.Client, cache *upstream.IndexCache, interval time.Duration, syncr *syncerpkg.Syncer) func() {
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		initialDelay := 2*time.Minute + time.Duration(rand.Intn(61))*time.Second
-		select {
-		case <-time.After(initialDelay):
-		case <-stop:
-			return
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		go func() { <-stop; cancel() }()
-		refreshIndexes(ctx, cfg, client, cache, syncr)
-		if interval <= 0 {
-			return
-		}
-		for {
-			jitter := time.Duration(rand.Intn(301)) * time.Second
-			select {
-			case <-time.After(interval + jitter):
-				refreshIndexes(ctx, cfg, client, cache, syncr)
-			case <-stop:
-				return
-			}
-		}
-	}()
-	return func() {
-		close(stop)
-		<-done
-	}
-}
+// layoutKey identifies one (os, codename) layout grouping -- a downstream
+// repository view, per model.Layout's own doc comment -- for scheduling
+// purposes.
+type layoutKey struct{ os, codename string }
 
-// refreshIndexes fetches each upstream index into the cache one codename at a
-// time, running a GC pass between codenames to bound peak allocation. After all
-// codenames are fetched it runs the auto-update check against the fresh data.
-// Within each codename, upstreams are deduplicated by (URL, suite, component).
-func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client, cache *upstream.IndexCache, syncr *syncerpkg.Syncer) {
-	// Collect upstreams per (os, codename) in config order.
-	type layoutKey struct{ os, codename string }
-	var keys []layoutKey
-	byKey := map[layoutKey][]model.UpstreamSource{}
+// layoutUpstreamGroups collects every layout's upstreams per (os, codename),
+// in config order, matching Syncer.layoutsByOSCodename's own grouping.
+func layoutUpstreamGroups(cfg *config.Config) (keys []layoutKey, byKey map[layoutKey][]model.UpstreamSource) {
+	byKey = map[layoutKey][]model.UpstreamSource{}
 	for _, layout := range cfg.ResolvedLayouts {
 		k := layoutKey{layout.OS, layout.Codename}
 		if _, exists := byKey[k]; !exists {
@@ -641,39 +709,253 @@ func refreshIndexes(ctx context.Context, cfg *config.Config, client *http.Client
 		}
 		byKey[k] = append(byKey[k], layout.Upstreams...)
 	}
+	return keys, byKey
+}
 
-	totalSeen := 0
+// layoutSeedOffset returns a deterministic offset within [0, interval) for
+// key, derived from a hash of its own identity. The same layout always gets
+// the same offset -- stable across restarts, and identical across every
+// replica running the same config -- while different layouts land at
+// well-distributed points across the interval. This is what lets each
+// layout's refresh schedule drift apart from the others instead of all
+// firing in one synchronized burst every cycle: in a multi-replica
+// deployment, that burst would otherwise mean every replica hammering every
+// upstream's fetch lock at the same few moments, rather than spreading lock
+// contention and upstream load out continuously. It also makes it possible
+// to reason about a Valkey freshness TTL relative to one layout's own,
+// predictable cadence instead of a shared global one.
+func layoutSeedOffset(key layoutKey, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(key.os + "/" + key.codename))
+	return time.Duration(h.Sum64() % uint64(interval))
+}
+
+// refreshDeps bundles the dependencies shared by startIndexRefresher and
+// every function it calls into for one layout's refresh cycle
+// (runLayoutRefreshLoop/refreshLayoutGroup/saveLayoutMetadata), so adding a
+// new shared dependency doesn't require editing every signature in the
+// chain. key/upstreams stay separate function parameters since they vary
+// per call, not per refresher.
+type refreshDeps struct {
+	client        *http.Client
+	cache         *upstream.IndexCache
+	syncr         *syncerpkg.Syncer
+	index         metadata.MetadataIndex
+	store         storage.Storage
+	interval      time.Duration
+	jitter        time.Duration
+	flushInterval time.Duration
+	tracker       *layoutSaveTracker
+	vclient       valkey.Client
+	vkeys         valkeycache.Keys
+}
+
+// startIndexRefresher spins up one independent refresh goroutine per
+// (os, codename) layout grouping (see layoutKey), each pre-warming its own
+// upstream index cache shortly after startup and then re-fetching every
+// interval (if > 0). After each refresh it calls
+// syncr.UpdateLayoutWithCache to pull any newer auto_update packages for
+// just that layout. Each goroutine's initial delay is 2 minutes, plus up to
+// 60 seconds of shared startup jitter, plus that layout's own deterministic
+// seed offset (see layoutSeedOffset) so layouts don't all fire together.
+// Each periodic refresh after that adds up to jitter (see
+// resolveRefreshJitter) of random delay, same as before this was split per
+// layout.
+//
+// Independent schedules mean two layouts' fetch/update/GC cycles could land
+// at the same moment by chance (or drift into alignment over time, since
+// each cycle's jitter is redrawn independently). cache.Lock/Unlock (see
+// upstream.IndexCache) ensures only one layout's cycle actually runs at a
+// time -- and, since /live request handling in internal/server builds
+// through this same cache, also that a live request's own build never runs
+// concurrently with this refresher's -- restoring the same "one at a time,
+// GC in between" bound on peak allocation the old strictly-sequential loop
+// had, while still letting each layout's own timer fire independently
+// rather than gating on a global clock.
+//
+// Returns a stop function that cancels every layout's in-progress refresh
+// and waits for all of them to finish.
+func startIndexRefresher(cfg *config.Config, deps refreshDeps) func() {
+	keys, byKey := layoutUpstreamGroups(cfg)
+	deps.tracker = &layoutSaveTracker{client: deps.vclient, keys: deps.vkeys}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var wg sync.WaitGroup
 	for _, k := range keys {
+		wg.Add(1)
+		k := k
+		go func() {
+			defer wg.Done()
+			runLayoutRefreshLoop(stop, k, byKey[k], deps)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
+// runLayoutRefreshLoop is one layout grouping's independent refresh
+// schedule; see startIndexRefresher.
+func runLayoutRefreshLoop(stop <-chan struct{}, key layoutKey, upstreams []model.UpstreamSource, deps refreshDeps) {
+	startupJitter := time.Duration(rand.Intn(61)) * time.Second
+	initialDelay := 2*time.Minute + startupJitter + layoutSeedOffset(key, deps.interval)
+	select {
+	case <-time.After(initialDelay):
+	case <-stop:
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-stop; cancel() }()
+
+	runRefreshLocked := func() {
+		// Every replica's own local timer fires independently, but only one
+		// of them should actually do the work each interval -- claim it
+		// first (see valkeycache.Keys.RefreshClaim). If another replica
+		// already refreshed this layout within the current interval, its
+		// claim is still held and this attempt fails cleanly (no error): skip
+		// entirely rather than redundantly repeating the same upstream
+		// fetches and auto-update pulls. A real error acquiring the claim
+		// (e.g. Valkey unreachable) fails open -- refresh directly rather
+		// than silently skipping a layout because coordination is down.
+		if deps.vclient != nil && deps.interval > 0 {
+			_, claimed, err := valkeycache.AcquireLock(ctx, deps.vclient, deps.vkeys.RefreshClaim(key.os, key.codename), deps.interval)
+			if err != nil {
+				slog.Warn("valkey refresh claim unavailable, refreshing directly", "os", key.os, "codename", key.codename, "err", err)
+			} else if !claimed {
+				slog.Debug("layout already refreshed by another replica this interval, skipping", "os", key.os, "codename", key.codename)
+				return
+			}
+		}
+		deps.cache.Lock()
+		defer deps.cache.Unlock()
+		refreshLayoutGroup(ctx, key, upstreams, deps)
+	}
+
+	runRefreshLocked()
+	if deps.interval > 0 {
+		for {
+			cycleJitter := valkeycache.RandDuration(deps.jitter)
+			select {
+			case <-time.After(deps.interval + cycleJitter):
+				runRefreshLocked()
+			case <-stop:
+				return
+			}
+		}
+	}
+
+	// schedule.refresh is disabled for this layout: upstream indexes are
+	// never re-fetched again after the one run above, but the pool can still
+	// change independently (on-demand pull-through), so a Backuper-backed
+	// index (valkeystore) still needs its own periodic save on
+	// schedule.metadata_flush's own cadence. deb822store already gets one
+	// from its own ticker regardless of schedule.refresh (see
+	// startPeriodicMetadataFlush), so this loop is specifically for the
+	// Backuper case.
+	if _, ok := deps.index.(metadata.Backuper); !ok || deps.flushInterval <= 0 {
+		return
+	}
+	saveOnlyLocked := func() {
+		deps.cache.Lock()
+		defer deps.cache.Unlock()
 		if ctx.Err() != nil {
 			return
 		}
-		seen := map[string]bool{}
-		for _, src := range byKey[k] {
-			srcKey := src.URL + "\x00" + src.Suite + "\x00" + src.Component
-			if seen[srcKey] {
-				continue
-			}
-			seen[srcKey] = true
-			if ctx.Err() != nil {
-				return
-			}
-			slog.Info("refreshing upstream index", "upstream", src.Name, "suite", src.Suite, "component", src.Component)
-			f := upstream.NewFetcherWithCache(src, client, cache)
-			if _, err := f.FetchIndex(ctx); err != nil {
-				slog.Warn("upstream index refresh failed", "upstream", src.Name, "suite", src.Suite, "component", src.Component, "err", err)
-			}
-		}
-		totalSeen += len(seen)
-		debug.FreeOSMemory()
+		saveLayoutMetadata(ctx, key, upstreams, deps)
 	}
-	slog.Info("upstream index refresh complete", "sources", totalSeen)
+	for {
+		select {
+		case <-time.After(deps.flushInterval + valkeycache.RandDuration(deps.jitter)):
+			saveOnlyLocked()
+		case <-stop:
+			return
+		}
+	}
+}
 
+// refreshLayoutGroup fetches every upstream index feeding one (os, codename)
+// layout grouping into the cache concurrently (upstreams deduplicated by
+// URL/suite/component, since the same upstream mirror can back multiple
+// components, then fetched in parallel the same way avail.Build fetches a
+// layout's upstreams), then runs the auto-update check scoped to just that
+// layout, then saves that layout's own slice of the metadata index (see
+// saveLayoutMetadata), then frees whatever that pass allocated.
+func refreshLayoutGroup(ctx context.Context, key layoutKey, upstreams []model.UpstreamSource, deps refreshDeps) {
 	if ctx.Err() != nil {
 		return
 	}
-	if err := syncr.UpdateWithCache(ctx, cache); err != nil {
-		slog.Warn("post-refresh update failed", "err", err)
+	seen := map[string]bool{}
+	var uniq []model.UpstreamSource
+	for _, src := range upstreams {
+		srcKey := src.DedupKey()
+		if seen[srcKey] {
+			continue
+		}
+		seen[srcKey] = true
+		uniq = append(uniq, src)
 	}
+
+	fetchers := make([]*upstream.Fetcher, len(uniq))
+	var wg sync.WaitGroup
+	for i, src := range uniq {
+		wg.Add(1)
+		go func(i int, src model.UpstreamSource) {
+			defer wg.Done()
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Info("refreshing upstream index", "os", key.os, "codename", key.codename, "upstream", src.Name, "suite", src.Suite, "component", src.Component)
+			f := upstream.NewFetcherWithCache(src, deps.client, deps.cache)
+			fetchers[i] = f
+			if _, err := f.FetchIndex(ctx); err != nil {
+				slog.Warn("upstream index refresh failed", "upstream", src.Name, "suite", src.Suite, "component", src.Component, "err", err)
+			}
+		}(i, src)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		debug.FreeOSMemory()
+		return
+	}
+	slog.Info("upstream index refresh complete", "os", key.os, "codename", key.codename, "sources", len(uniq))
+
+	if err := deps.syncr.UpdateLayoutWithCache(ctx, deps.cache, key.os, key.codename); err != nil {
+		slog.Warn("post-refresh update failed", "os", key.os, "codename", key.codename, "err", err)
+	}
+	if ctx.Err() == nil {
+		saveLayoutMetadata(ctx, key, upstreams, deps)
+	}
+	// Evict this cycle's fetched upstream data from the local cache now that
+	// this layout is done using it (auto-update check and metadata save both
+	// already ran above) -- a no-op unless cache is Valkey-backed, in which
+	// case Valkey remains the durable copy and the next cycle (here or via a
+	// live request elsewhere) re-adopts fresh or comparison data from it (see
+	// IndexCache.EvictUpstream) rather than this process holding every
+	// layout's Packages/Sources resident for its entire lifetime.
+	for _, f := range fetchers {
+		deps.cache.EvictUpstream(f.InReleaseURL(), f.Component())
+	}
+	// Marking the layout freshly synced (see upstream.IndexCache.
+	// MarkLayoutDataFresh) is avail.Build's own responsibility, not this
+	// function's: UpdateLayoutWithCache above calls avail.Build internally,
+	// which already marks freshness itself, correctly gated on both the
+	// Index *and* Sources fetches it does succeeding -- this loop only
+	// fetches Index data and only pre-warms the cache so avail.Build's own
+	// per-upstream fetches (which don't dedupe shared upstreams across this
+	// layout's components the way the loop above does) hit the fast path
+	// instead of re-fetching. Marking fresh here too, gated only on this
+	// loop's own Index-only success, would let a real Sources failure
+	// elsewhere in the same cycle go unnoticed.
+	debug.FreeOSMemory()
 }
 
 // writeSnapshotName records the snapshot ID in a file named "snapshot-name" in
@@ -874,9 +1156,115 @@ func startPeriodicMerge(index metadata.MetadataIndex, interval time.Duration) fu
 	}
 }
 
-// startPeriodicFlush calls index.Flush every interval. The returned stop
-// function triggers one final flush and blocks until it completes.
-func startPeriodicFlush(index metadata.MetadataIndex, interval time.Duration) func() {
+// layoutSaveTracker coordinates, across every replica sharing the same
+// Valkey deployment, which one of them saves a given layout grouping's
+// metadata each schedule.metadata_flush interval -- see claim. Every replica
+// runs its own independent, jittered refresh schedule (see
+// startIndexRefresher), so without this, every one of them would
+// redundantly re-pull and re-write the same layout's metadata each interval.
+type layoutSaveTracker struct {
+	client valkey.Client
+	keys   valkeycache.Keys
+}
+
+// claim reports whether this replica should save key's metadata this
+// interval, by attempting to acquire a Valkey SET-NX-PX claim key
+// (valkeycache.Keys.MetadataFlushClaim) with a TTL of interval. The lock is
+// deliberately never renewed or released: letting it expire naturally is
+// what marks the layout due for its next save, one interval later,
+// regardless of which replica happens to claim it that time. interval <= 0
+// means "never due" -- metadata_flush: "0" disables per-layout saving
+// entirely.
+func (t *layoutSaveTracker) claim(ctx context.Context, key layoutKey, interval time.Duration) bool {
+	if t == nil || t.client == nil || interval <= 0 {
+		return false
+	}
+	_, acquired, err := valkeycache.AcquireLock(ctx, t.client, t.keys.MetadataFlushClaim(key.os, key.codename), interval)
+	if err != nil {
+		slog.Warn("valkey metadata flush claim failed", "os", key.os, "codename", key.codename, "err", err)
+		return false
+	}
+	return acquired
+}
+
+// saveLayoutMetadata persists key's own slice of the metadata index -- its
+// own (os, codename) package/source entries plus upstream-fetch state for
+// the upstreams that feed it -- if index supports it (see metadata.Backuper)
+// and this replica successfully claims responsibility for this interval's
+// save of key (see layoutSaveTracker.claim; in a multi-replica deployment,
+// exactly one replica's claim succeeds per interval, so the others skip this
+// entirely rather than redundantly repeating the same pull-and-write).
+// Called after refreshLayoutGroup finishes each layout's own refresh cycle,
+// so different layouts' independently-jittered schedules (see
+// startIndexRefresher) naturally stagger these saves instead of all layouts
+// saving at once. Within one layout, components (main, contrib, non-free,
+// ...) are saved one at a time, in a serial loop -- deb822store's compress
+// step now reuses a pooled scratch buffer rather than allocating fresh per
+// call, so this loop no longer needs its own debug.FreeOSMemory() per
+// component; refreshLayoutGroup's own call at the end of its cycle already
+// covers whatever this whole loop allocated. Backends without this
+// capability (deb822store) are untouched here -- see
+// startPeriodicMetadataFlush instead.
+func saveLayoutMetadata(ctx context.Context, key layoutKey, upstreams []model.UpstreamSource, deps refreshDeps) {
+	b, ok := deps.index.(metadata.Backuper)
+	if !ok || !deps.tracker.claim(ctx, key, deps.flushInterval) {
+		return
+	}
+
+	var components []string
+	seenComponent := map[string]bool{}
+	namesByComponent := map[string][]string{}
+	seenName := map[string]map[string]bool{}
+	for _, u := range upstreams {
+		if !seenComponent[u.Component] {
+			seenComponent[u.Component] = true
+			components = append(components, u.Component)
+		}
+		if seenName[u.Component] == nil {
+			seenName[u.Component] = map[string]bool{}
+		}
+		if !seenName[u.Component][u.Name] {
+			seenName[u.Component][u.Name] = true
+			namesByComponent[u.Component] = append(namesByComponent[u.Component], u.Name)
+		}
+	}
+
+	allOK := true
+	for _, component := range components {
+		if ctx.Err() != nil {
+			allOK = false
+			break
+		}
+		scope := metadata.BackupScope{OS: key.os, Codename: key.codename, Component: component, Upstreams: namesByComponent[component]}
+		if err := b.Backup(ctx, deps.store, scope); err != nil {
+			slog.Warn("layout metadata save failed", "os", key.os, "codename", key.codename, "component", component, "err", err)
+			allOK = false
+			continue
+		}
+	}
+	if !allOK {
+		return
+	}
+	slog.Info("layout metadata saved", "os", key.os, "codename", key.codename, "components", len(components))
+}
+
+// startPeriodicMetadataFlush persists a non-Backuper index (deb822store) to
+// store every interval, exactly as this project's periodic metadata save
+// always has, plus once more when stopped. interval <= 0 disables it
+// entirely, including the final save at stop. A Backuper-backed index
+// (valkeystore) is saved per layout instead, right after each layout's own
+// refresh cycle (see saveLayoutMetadata, wired into startIndexRefresher) --
+// that already happens periodically on each layout's own schedule, so this
+// function is a no-op for it rather than running a second, redundant
+// whole-index save on its own separate clock.
+func startPeriodicMetadataFlush(index metadata.MetadataIndex, interval time.Duration) func() {
+	if interval <= 0 {
+		return func() {}
+	}
+	if _, ok := index.(metadata.Backuper); ok {
+		return func() {}
+	}
+
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -887,13 +1275,13 @@ func startPeriodicFlush(index metadata.MetadataIndex, interval time.Duration) fu
 			select {
 			case <-t.C:
 				if err := index.Flush(context.Background()); err != nil {
-					slog.Warn("metadata flush", "err", err)
+					slog.Warn("periodic metadata flush", "err", err)
 				}
 			case <-stop:
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				if err := index.Flush(ctx); err != nil {
-					slog.Warn("metadata final flush", "err", err)
+					slog.Warn("final metadata flush", "err", err)
 				}
 				return
 			}

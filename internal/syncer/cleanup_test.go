@@ -171,11 +171,11 @@ func (m *mockIndex) ListSourceEntries(ctx context.Context, sel model.Selector) (
 
 // Stubs for the remaining MetadataIndex interface methods.
 
-func (m *mockIndex) Ping(ctx context.Context) error                   { return nil }
-func (m *mockIndex) Migrate(ctx context.Context) error                { return nil }
-func (m *mockIndex) Reset(ctx context.Context) error                  { return nil }
-func (m *mockIndex) Refresh(ctx context.Context) error                { return nil }
-func (m *mockIndex) Flush(ctx context.Context) error                  { return nil }
+func (m *mockIndex) Ping(ctx context.Context) error    { return nil }
+func (m *mockIndex) Migrate(ctx context.Context) error { return nil }
+func (m *mockIndex) Reset(ctx context.Context) error   { return nil }
+func (m *mockIndex) Refresh(ctx context.Context) error { return nil }
+func (m *mockIndex) Flush(ctx context.Context) error   { return nil }
 func (m *mockIndex) UpsertEntry(ctx context.Context, entry model.IndexEntry) error {
 	panic("not implemented: UpsertEntry")
 }
@@ -244,7 +244,7 @@ func contains(sl []string, s string) bool {
 // Tests: pruneSnapshots
 // ---------------------------------------------------------------------------
 
-func TestPruneSnapshots_ZeroLimits(t *testing.T) {
+func TestPruneSnapshotsZeroLimits(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -271,7 +271,7 @@ func TestPruneSnapshots_ZeroLimits(t *testing.T) {
 // pruneSnapshots is called via Cleanup; we call it indirectly.
 // Use a helper that calls the full Cleanup to exercise pruneSnapshots.
 
-func TestPruneSnapshots_CountWithinLimit(t *testing.T) {
+func TestPruneSnapshotsCountWithinLimit(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -293,7 +293,7 @@ func TestPruneSnapshots_CountWithinLimit(t *testing.T) {
 	}
 }
 
-func TestPruneSnapshots_CountExceedsButAgeTooYoung(t *testing.T) {
+func TestPruneSnapshotsCountExceedsButAgeTooYoung(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -318,7 +318,7 @@ func TestPruneSnapshots_CountExceedsButAgeTooYoung(t *testing.T) {
 	}
 }
 
-func TestPruneSnapshots_CountAndAgeExceed(t *testing.T) {
+func TestPruneSnapshotsCountAndAgeExceed(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -353,7 +353,7 @@ func TestPruneSnapshots_CountAndAgeExceed(t *testing.T) {
 	}
 }
 
-func TestPruneSnapshots_DeletedCountMatchesDeleted(t *testing.T) {
+func TestPruneSnapshotsDeletedCountMatchesDeleted(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -391,7 +391,7 @@ func TestPruneSnapshots_DeletedCountMatchesDeleted(t *testing.T) {
 	}
 }
 
-func TestPruneSnapshots_AgeOnly_CountUnlimited(t *testing.T) {
+func TestPruneSnapshotsAgeOnlyCountUnlimited(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -417,7 +417,7 @@ func TestPruneSnapshots_AgeOnly_CountUnlimited(t *testing.T) {
 	}
 }
 
-func TestPruneSnapshots_CountOnly_AgeUnlimited(t *testing.T) {
+func TestPruneSnapshotsCountOnlyAgeUnlimited(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -453,7 +453,7 @@ func TestPruneSnapshots_CountOnly_AgeUnlimited(t *testing.T) {
 // Tests: gcPool
 // ---------------------------------------------------------------------------
 
-func TestGCPool_ReferencedByPackagesIndex_Kept(t *testing.T) {
+func TestGCPoolReferencedByPackagesIndexKept(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -476,7 +476,7 @@ func TestGCPool_ReferencedByPackagesIndex_Kept(t *testing.T) {
 	}
 }
 
-func TestGCPool_ReferencedByMetadataEntry_Kept(t *testing.T) {
+func TestGCPoolReferencedByMetadataEntryKept(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{
 		entries: []model.IndexEntry{
@@ -502,7 +502,7 @@ func TestGCPool_ReferencedByMetadataEntry_Kept(t *testing.T) {
 // protected from GC forever -- buildPoolRefSet must only keep the highest
 // version per (os, codename, component, arch, package), matching the same
 // dedup publishing already applies (groupStanzas in syncer.go).
-func TestGCPool_SupersededVersion_NotProtected(t *testing.T) {
+func TestGCPoolSupersededVersionNotProtected(t *testing.T) {
 	store := newMockStorage()
 	oldPath := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_1.0_amd64.deb"
 	newPath := "pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_2.0_amd64.deb"
@@ -535,7 +535,7 @@ func TestGCPool_SupersededVersion_NotProtected(t *testing.T) {
 // TestCleanup_GCDoesNotCallStat proves gcPool/gcSrc get ModTime from
 // WalkPool/ListPublishedInfo directly instead of issuing a separate Stat per
 // orphan candidate.
-func TestCleanup_GCDoesNotCallStat(t *testing.T) {
+func TestCleanupGCDoesNotCallStat(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -557,7 +557,7 @@ func TestCleanup_GCDoesNotCallStat(t *testing.T) {
 	}
 }
 
-func TestGCPool_NotReferenced_Deleted(t *testing.T) {
+func TestGCPoolNotReferencedDeleted(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -578,7 +578,7 @@ func TestGCPool_NotReferenced_Deleted(t *testing.T) {
 // a pool file that isn't in the ref set yet (e.g. because the metadata index
 // commit for it hasn't landed) but was written moments ago must survive a GC
 // pass instead of being deleted right after being cached.
-func TestGCPool_RecentlyWritten_ProtectedByGracePeriod(t *testing.T) {
+func TestGCPoolRecentlyWrittenProtectedByGracePeriod(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -599,7 +599,7 @@ func TestGCPool_RecentlyWritten_ProtectedByGracePeriod(t *testing.T) {
 
 // TestGCPool_OldUnreferenced_DeletedPastGracePeriod is the control case: once
 // a file is older than gcGracePeriod, an unreferenced file is still deleted.
-func TestGCPool_OldUnreferenced_DeletedPastGracePeriod(t *testing.T) {
+func TestGCPoolOldUnreferencedDeletedPastGracePeriod(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -621,7 +621,7 @@ func TestGCPool_OldUnreferenced_DeletedPastGracePeriod(t *testing.T) {
 // TestGCPool_GCGraceConfigurable proves schedule.gc_grace actually changes GC
 // behavior: a file older than a configured 1ms grace period (but younger than
 // the 1h built-in default) is deleted.
-func TestGCPool_GCGraceConfigurable(t *testing.T) {
+func TestGCPoolGCGraceConfigurable(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncerWithGCGrace(store, idx, "ubuntu", "jammy", "1ms")
@@ -643,7 +643,7 @@ func TestGCPool_GCGraceConfigurable(t *testing.T) {
 // TestGCPool_GCGraceInvalidFallsBackToDefault proves an unparseable
 // schedule.gc_grace value falls back to the safe 1h default rather than
 // disabling grace-period protection entirely.
-func TestGCPool_GCGraceInvalidFallsBackToDefault(t *testing.T) {
+func TestGCPoolGCGraceInvalidFallsBackToDefault(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncerWithGCGrace(store, idx, "ubuntu", "jammy", "not-a-duration")
@@ -662,7 +662,7 @@ func TestGCPool_GCGraceInvalidFallsBackToDefault(t *testing.T) {
 	}
 }
 
-func TestGCPool_EmptyPool_NothingDeleted(t *testing.T) {
+func TestGCPoolEmptyPoolNothingDeleted(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -676,7 +676,7 @@ func TestGCPool_EmptyPool_NothingDeleted(t *testing.T) {
 	}
 }
 
-func TestGCPool_SnapshotPackagesIndex_Protects(t *testing.T) {
+func TestGCPoolSnapshotPackagesIndexProtects(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -707,7 +707,7 @@ func TestGCPool_SnapshotPackagesIndex_Protects(t *testing.T) {
 // Tests: gcSrc
 // ---------------------------------------------------------------------------
 
-func TestGCSrc_ReferencedBySourcesIndex_Kept(t *testing.T) {
+func TestGCSrcReferencedBySourcesIndexKept(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")
@@ -730,7 +730,7 @@ func TestGCSrc_ReferencedBySourcesIndex_Kept(t *testing.T) {
 	}
 }
 
-func TestGCSrc_ReferencedByMetadataSourceEntry_Kept(t *testing.T) {
+func TestGCSrcReferencedByMetadataSourceEntryKept(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{
 		srcEntries: []model.SourceEntry{
@@ -754,7 +754,7 @@ func TestGCSrc_ReferencedByMetadataSourceEntry_Kept(t *testing.T) {
 	}
 }
 
-func TestGCSrc_NotReferenced_Deleted(t *testing.T) {
+func TestGCSrcNotReferencedDeleted(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}
 	s := newTestSyncer(store, idx, "ubuntu", "jammy")

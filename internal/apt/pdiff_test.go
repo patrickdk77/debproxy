@@ -9,7 +9,7 @@ import (
 
 // ---- ParsePDiffIndex --------------------------------------------------------
 
-func TestParsePDiffIndex_Valid(t *testing.T) {
+func TestParsePDiffIndexValid(t *testing.T) {
 	input := `SHA256-Current:
  aabbccdd 1234
 SHA256-History:
@@ -37,14 +37,14 @@ SHA256-Patches:
 	}
 }
 
-func TestParsePDiffIndex_EmptyInput(t *testing.T) {
+func TestParsePDiffIndexEmptyInput(t *testing.T) {
 	_, err := apt.ParsePDiffIndex(strings.NewReader(""))
 	if err == nil {
 		t.Fatal("expected error on empty input, got nil")
 	}
 }
 
-func TestParsePDiffIndex_MissingCurrentField(t *testing.T) {
+func TestParsePDiffIndexMissingCurrentField(t *testing.T) {
 	input := `SHA256-History:
  00112233 1000 2024-01-14-0000.00
 `
@@ -56,7 +56,7 @@ func TestParsePDiffIndex_MissingCurrentField(t *testing.T) {
 
 // ---- PatchChain -------------------------------------------------------------
 
-func TestPatchChain_FoundAtIndex0(t *testing.T) {
+func TestPatchChainFoundAtIndex0(t *testing.T) {
 	idx := &apt.PDiffIndex{
 		CurrentSHA256: "current",
 		Patches: []apt.PDiffPatch{
@@ -74,7 +74,7 @@ func TestPatchChain_FoundAtIndex0(t *testing.T) {
 	}
 }
 
-func TestPatchChain_FoundAtIndex1(t *testing.T) {
+func TestPatchChainFoundAtIndex1(t *testing.T) {
 	idx := &apt.PDiffIndex{
 		CurrentSHA256: "current",
 		Patches: []apt.PDiffPatch{
@@ -92,7 +92,7 @@ func TestPatchChain_FoundAtIndex1(t *testing.T) {
 	}
 }
 
-func TestPatchChain_NotFound(t *testing.T) {
+func TestPatchChainNotFound(t *testing.T) {
 	idx := &apt.PDiffIndex{
 		CurrentSHA256: "current",
 		Patches: []apt.PDiffPatch{
@@ -105,7 +105,7 @@ func TestPatchChain_NotFound(t *testing.T) {
 	}
 }
 
-func TestPatchChain_EmptyHistoryNotFound(t *testing.T) {
+func TestPatchChainEmptyHistoryNotFound(t *testing.T) {
 	idx := &apt.PDiffIndex{
 		CurrentSHA256: "current",
 		Patches:       []apt.PDiffPatch{},
@@ -116,7 +116,7 @@ func TestPatchChain_EmptyHistoryNotFound(t *testing.T) {
 	}
 }
 
-func TestPatchChain_LastEntryReturnsSingleElement(t *testing.T) {
+func TestPatchChainLastEntryReturnsSingleElement(t *testing.T) {
 	idx := &apt.PDiffIndex{
 		CurrentSHA256: "current",
 		Patches: []apt.PDiffPatch{
@@ -138,7 +138,7 @@ func TestPatchChain_LastEntryReturnsSingleElement(t *testing.T) {
 
 const twoStanzaPkgs = "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\nPackage: bash\nVersion: 5.2\nArchitecture: amd64\n\n"
 
-func TestSerializeRawPkgs_RoundTrip(t *testing.T) {
+func TestSerializeRawPkgsRoundTrip(t *testing.T) {
 	pkgs, err := apt.ParsePackageRaws(strings.NewReader(twoStanzaPkgs))
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestSerializeRawPkgs_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestSerializeRawPkgs_StanzaEndsWithDoubleNewline(t *testing.T) {
+func TestSerializeRawPkgsStanzaEndsWithDoubleNewline(t *testing.T) {
 	pkgs, err := apt.ParsePackageRaws(strings.NewReader(twoStanzaPkgs))
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +177,7 @@ func TestSerializeRawPkgs_StanzaEndsWithDoubleNewline(t *testing.T) {
 
 const twoStanzaSrcs = "Package: apt\nVersion: 2.6.1\nDirectory: pool/main/a/apt\n\nPackage: bash\nVersion: 5.2\nDirectory: pool/main/b/bash\n\n"
 
-func TestSerializeRawSrcs_RoundTrip(t *testing.T) {
+func TestSerializeRawSrcsRoundTrip(t *testing.T) {
 	srcs, err := apt.ParseSourceRaws(strings.NewReader(twoStanzaSrcs))
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestSerializeRawSrcs_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestSerializeRawSrcs_StanzaEndsWithDoubleNewline(t *testing.T) {
+func TestSerializeRawSrcsStanzaEndsWithDoubleNewline(t *testing.T) {
 	srcs, err := apt.ParseSourceRaws(strings.NewReader(twoStanzaSrcs))
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +213,7 @@ func makePkgs(t *testing.T, raw string) []apt.RawPkg {
 	return pkgs
 }
 
-func TestApplyEdPatch_Delete(t *testing.T) {
+func TestApplyEdPatchDelete(t *testing.T) {
 	// Two stanzas; patch deletes all lines of the first stanza (lines 1-3) plus
 	// its trailing blank separator (line 4).
 	input := "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\nPackage: bash\nVersion: 5.2\nArchitecture: amd64\n\n"
@@ -233,7 +233,7 @@ func TestApplyEdPatch_Delete(t *testing.T) {
 	}
 }
 
-func TestApplyEdPatch_Append(t *testing.T) {
+func TestApplyEdPatchAppend(t *testing.T) {
 	input := "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\n"
 	pkgs := makePkgs(t, input)
 
@@ -251,7 +251,7 @@ func TestApplyEdPatch_Append(t *testing.T) {
 	}
 }
 
-func TestApplyEdPatch_FullStanzaChange(t *testing.T) {
+func TestApplyEdPatchFullStanzaChange(t *testing.T) {
 	// Two stanzas; change all lines of the first stanza (lines 1-3).
 	input := "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\nPackage: bash\nVersion: 5.2\nArchitecture: amd64\n\n"
 	pkgs := makePkgs(t, input)
@@ -269,7 +269,7 @@ func TestApplyEdPatch_FullStanzaChange(t *testing.T) {
 	}
 }
 
-func TestApplyEdPatch_PartialStanzaChange_RebuildPath(t *testing.T) {
+func TestApplyEdPatchPartialStanzaChangeRebuildPath(t *testing.T) {
 	// Three-line stanza; patch changes only line 2 (Version).
 	// This exercises the rebuildStanza path (s1 == s2, partial overlap).
 	input := "Package: apt\nVersion: 2.6.1\nFilename: pool/main/a/apt/apt_2.6.1_amd64.deb\n\n"
@@ -295,7 +295,7 @@ func TestApplyEdPatch_PartialStanzaChange_RebuildPath(t *testing.T) {
 	}
 }
 
-func TestApplyEdPatch_SequentialPatches(t *testing.T) {
+func TestApplyEdPatchSequentialPatches(t *testing.T) {
 	input := "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\n"
 	pkgs := makePkgs(t, input)
 
@@ -325,7 +325,7 @@ func TestApplyEdPatch_SequentialPatches(t *testing.T) {
 	}
 }
 
-func TestApplyEdPatch_UnknownCommand(t *testing.T) {
+func TestApplyEdPatchUnknownCommand(t *testing.T) {
 	pkgs := makePkgs(t, "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\n")
 	_, err := apt.ApplyEdPatch(pkgs, []byte("1z\n"))
 	if err == nil {
@@ -333,7 +333,7 @@ func TestApplyEdPatch_UnknownCommand(t *testing.T) {
 	}
 }
 
-func TestApplyEdPatch_BadAddress(t *testing.T) {
+func TestApplyEdPatchBadAddress(t *testing.T) {
 	pkgs := makePkgs(t, "Package: apt\nVersion: 2.6.1\nArchitecture: amd64\n\n")
 	_, err := apt.ApplyEdPatch(pkgs, []byte("xd\n"))
 	if err == nil {
@@ -348,7 +348,7 @@ func TestApplyEdPatch_BadAddress(t *testing.T) {
 // earlier ops in the same patch are applied; a later op's addresses can then
 // point past the end of the now-shorter slice. Before the bounds check this
 // paniced with "slice bounds out of range"; it must now return a clean error.
-func TestApplyEdPatch_OutOfOrderOpsReturnsErrorNotPanic(t *testing.T) {
+func TestApplyEdPatchOutOfOrderOpsReturnsErrorNotPanic(t *testing.T) {
 	// Three 2-line stanzas: lines 1-2, 4-5, 7-8 (3, 6, 9 are blank separators).
 	input := "Package: a\nVersion: 1\n\nPackage: b\nVersion: 1\n\nPackage: c\nVersion: 1\n\n"
 	pkgs := makePkgs(t, input)
@@ -373,7 +373,7 @@ func TestApplyEdPatch_OutOfOrderOpsReturnsErrorNotPanic(t *testing.T) {
 // bounds-checked the same way 'd'/'c' are: a stale insertion point past the
 // end of an already-shrunk items slice must be rejected, not silently
 // clamped into the wrong position by sliceInsert.
-func TestApplyEdPatch_OutOfOrderAppendReturnsError(t *testing.T) {
+func TestApplyEdPatchOutOfOrderAppendReturnsError(t *testing.T) {
 	input := "Package: a\nVersion: 1\n\nPackage: b\nVersion: 1\n\nPackage: c\nVersion: 1\n\n"
 	pkgs := makePkgs(t, input)
 	if len(pkgs) != 3 {

@@ -7,7 +7,7 @@ import (
 	"github.com/debproxy/debproxy/internal/apt"
 )
 
-func TestRawPkgWithFilename_MiddleField(t *testing.T) {
+func TestRawPkgWithFilenameMiddleField(t *testing.T) {
 	pkg := apt.RawPkg{Raw: "Package: hello\nFilename: pool/old.deb\nVersion: 1.0\n"}
 	got := pkg.WithFilename("pool/new.deb")
 	want := "Package: hello\nFilename: pool/new.deb\nVersion: 1.0\n"
@@ -16,7 +16,7 @@ func TestRawPkgWithFilename_MiddleField(t *testing.T) {
 	}
 }
 
-func TestRawPkgWithFilename_FirstField(t *testing.T) {
+func TestRawPkgWithFilenameFirstField(t *testing.T) {
 	pkg := apt.RawPkg{Raw: "Filename: pool/old.deb\nPackage: hello\nVersion: 1.0\n"}
 	got := pkg.WithFilename("pool/new.deb")
 	want := "Filename: pool/new.deb\nPackage: hello\nVersion: 1.0\n"
@@ -28,7 +28,7 @@ func TestRawPkgWithFilename_FirstField(t *testing.T) {
 	}
 }
 
-func TestRawPkgWithFilename_FirstFieldOnly(t *testing.T) {
+func TestRawPkgWithFilenameFirstFieldOnly(t *testing.T) {
 	pkg := apt.RawPkg{Raw: "Filename: pool/old.deb"}
 	got := pkg.WithFilename("pool/new.deb")
 	want := "Filename: pool/new.deb"
@@ -37,7 +37,7 @@ func TestRawPkgWithFilename_FirstFieldOnly(t *testing.T) {
 	}
 }
 
-func TestRawPkgWithFilename_NoExistingField(t *testing.T) {
+func TestRawPkgWithFilenameNoExistingField(t *testing.T) {
 	pkg := apt.RawPkg{Raw: "Package: hello\nVersion: 1.0\n"}
 	got := pkg.WithFilename("pool/new.deb")
 	want := "Filename: pool/new.deb\nPackage: hello\nVersion: 1.0\n"

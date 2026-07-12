@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/config"
@@ -103,6 +104,26 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 		}
 	}
 
+	// If some replica already established this layout as fresh within the
+	// last schedule.refresh interval (see upstream.IndexCache.LayoutDataFresh),
+	// trust Valkey's published data outright for every upstream feeding it,
+	// rather than gating each one on its own Cache-Control-derived Expires
+	// (which mirrors that send no caching headers default to a bare 5
+	// minutes -- far shorter than any real refresh interval, and would
+	// otherwise force a real upstream touch on nearly every call). One
+	// Valkey check for the whole layout, not per upstream.
+	layoutDataFresh := cache != nil && cache.LayoutDataFresh(ctx, osName, codename)
+	refreshInterval := cfg.Schedule.RefreshInterval()
+	// didRealFetch/realFetchFailed track every upstream job that didn't take
+	// the outright-adopt shortcut (Index and Sources alike -- see below).
+	// Marking the layout fresh at the end requires at least one such
+	// validation AND zero failures among them: one upstream's real fetch
+	// succeeding must never paper over a different upstream's real fetch
+	// failing, or that second upstream's stale data could keep getting
+	// served indefinitely, propped up by its siblings' successes re-marking
+	// the layout fresh every cycle without ever giving it a real recheck.
+	var didRealFetch, realFetchFailed atomic.Bool
+
 	// Fetch all upstreams concurrently.
 	results := make([]upstreamResult, len(jobs))
 	var wg sync.WaitGroup
@@ -111,11 +132,22 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 		go func(i int, j work) {
 			defer wg.Done()
 			f := upstream.NewFetcherWithCache(j.src, client, cache)
-			slog.Debug("fetching upstream index", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
-			idx, err := f.FetchIndex(ctx)
-			if err != nil {
-				slog.Error("upstream index unavailable, skipping", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
-				return
+			var idx *upstream.Index
+			if layoutDataFresh {
+				idx, _ = f.AdoptFromValkeyOutright(ctx)
+			}
+			if idx != nil {
+				slog.Debug("upstream index adopted from valkey outright", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
+			} else {
+				slog.Debug("upstream index outright-adopt miss, falling through to normal fetch path", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "layout_data_fresh", layoutDataFresh)
+				var err error
+				idx, err = f.FetchIndex(ctx)
+				if err != nil {
+					slog.Error("upstream index unavailable, skipping", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
+					realFetchFailed.Store(true)
+					return
+				}
+				didRealFetch.Store(true)
 			}
 			var total int
 			for _, stanzas := range idx.ByArch {
@@ -250,13 +282,24 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			srcWg.Add(1)
 			go func(i int, j srcWork) {
 				defer srcWg.Done()
-				slog.Debug("fetching upstream Sources", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
 				f := upstream.NewFetcherWithCache(j.src, client, cache)
-				raws, err := f.FetchSources(ctx)
-				if err != nil {
-					slog.Warn("upstream Sources unavailable, skipping",
-						"upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
-					return
+				var raws []apt.RawSrc
+				if layoutDataFresh {
+					raws, _ = f.AdoptSourcesFromValkeyOutright(ctx)
+				}
+				if raws != nil {
+					slog.Debug("upstream Sources adopted from valkey outright", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
+				} else {
+					slog.Debug("upstream Sources outright-adopt miss, falling through to normal fetch path", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "layout_data_fresh", layoutDataFresh)
+					var err error
+					raws, err = f.FetchSources(ctx)
+					if err != nil {
+						slog.Warn("upstream Sources unavailable, skipping",
+							"upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
+						realFetchFailed.Store(true)
+						return
+					}
+					didRealFetch.Store(true)
 				}
 				slog.Debug("fetched upstream Sources", "upstream", j.src.Name, "component", j.src.Component, "packages", len(raws))
 				srcResults[i] = srcResult{j.component, j.src, raws}
@@ -294,6 +337,40 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 					StanzaStr:   raw.WithDirectory(localDir),
 				}
 			}
+		}
+	}
+
+	// Now that every upstream's data has been merged into av, evict it from
+	// the shared local cache -- a no-op unless cache is Valkey-backed (see
+	// IndexCache.EvictUpstream), in which case Valkey remains the durable
+	// copy and the next Build call (whether the periodic refresher's own
+	// cycle or a /live rebuild triggered independently by a client request --
+	// both call Build, on entirely different schedules, through this same
+	// shared cache) re-adopts a fresh or comparison-only copy from it instead
+	// of every layout's fetched Packages/Sources staying resident between
+	// every caller's use of it for as long as the process runs.
+	if cache != nil {
+		evicted := map[string]bool{}
+		for _, j := range jobs {
+			k := j.src.DedupKey()
+			if evicted[k] {
+				continue
+			}
+			evicted[k] = true
+			f := upstream.NewFetcher(j.src, nil)
+			cache.EvictUpstream(f.InReleaseURL(), f.Component())
+		}
+		// Only mark the layout fresh if at least one real fetch happened this
+		// call AND none of them failed -- if every upstream was itself
+		// adopted outright, extending the window would let trust drift
+		// forever without ever checking upstream again (see
+		// IndexCache.MarkLayoutDataFresh's own doc comment); if even one
+		// upstream's real fetch failed, marking fresh anyway would let that
+		// one upstream's stale data ride indefinitely on its siblings'
+		// success, since every subsequent call would adopt it outright too
+		// without ever giving it its own chance to recheck upstream.
+		if didRealFetch.Load() && !realFetchFailed.Load() {
+			cache.MarkLayoutDataFresh(ctx, osName, codename, refreshInterval)
 		}
 	}
 

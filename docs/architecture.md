@@ -11,11 +11,16 @@ flowchart TD
   storage --> pub["per-snapshot dists/\n(write-once signed metadata)"]
   storage --> mfiles["metadata/index/{os}/{codename}/{component}/{arch}.packages.zst"]
   pub -->|"Packages Filename -> pool/..."| pool
-  meta --> deb822["deb822store\n(in-memory + zstd files via storage backend)"]
+  meta --> deb822["deb822store (default)\n(in-memory + zstd files via storage backend)"]
   mfiles -.load on startup.-> deb822
   deb822 -.flush/commit.-> mfiles
   pool -.rebuild scan.-> meta
   meta -->|"sha256 -> canonical pool_path"| storage
+
+  meta -.valkey.enabled instead of deb822store.-> valkeystore["valkeystore\n(pool metadata index)"]
+  valkeystore --> vk["Valkey / Redis\n(optional shared cache, see design.md)"]
+  upstream["upstream.IndexCache"] -.shared availability cache.-> vk
+  livecache["server live cache"] -.shared compressed artifacts.-> vk
 ```
 
 ## Storage layout
@@ -89,15 +94,17 @@ internal/
   deb/                        -- .deb ar container reading (control.tar extraction)
   ingest/                     -- download + verify + store .deb, record IndexEntry
   metadata/
-    metadata.go               -- MetadataIndex interface
+    metadata.go               -- MetadataIndex interface, Backuper (optional file-based backup capability)
     deb822store/store.go      -- in-memory index backed by zstd deb822 files; Flush/Refresh/merge-before-write
-  metadatafactory/factory.go  -- always returns deb822store.Store
+    valkeystore/              -- Valkey-backed MetadataIndex + Backup (writes deb822store's file layout)
+  metadatafactory/factory.go  -- deb822store.Store, or valkeystore.Store when valkey.enabled
   model/model.go              -- domain types: Digest, Checksums, IndexEntry, UpstreamSource, Layout, ...
   publish/                    -- generate Packages (plain/gz/zst), Release, InRelease, Release.gpg
   rebuild/rebuild.go          -- scan pool/, parse .deb control, repopulate index
   server/
     server.go                 -- HTTP handler: snapshot/live/pool/keys routing, pull-through
     middleware.go             -- Apache Combined Log Format access logging, response compression
+    valkey.go                 -- optional: adopt/publish compressed /live artifacts via Valkey
   signing/signing.go          -- load private key, sign/verify InRelease and Release.gpg, publish public key
   storage/
     storage.go                -- Storage interface (FileStore + Publisher)
@@ -109,6 +116,8 @@ internal/
     fetch.go                  -- fetch + GPG-verify InRelease/Release, SHA256-verify Packages and .deb
     cache.go                  -- IndexCache: ETag/304 conditional re-fetch, Cache-Control expiry
     transport.go              -- tuned HTTP client, 3 retries on 5xx with idle-connection flush
+    valkey.go                 -- optional: shared upstream availability cache, distributed fetch lock
+  valkeycache/                -- optional: Valkey client wrapper, distributed lock, pub/sub, key naming (see design.md)
 ```
 
 ## Dependencies
@@ -122,6 +131,7 @@ All compression and cryptography runs in-process; no external binaries (`gpg`, `
 | `github.com/ProtonMail/go-crypto/openpgp` | load keyrings, verify InRelease/Release.gpg, sign snapshots |
 | `github.com/blakesmith/ar` | read the `ar` container of `.deb` files during rebuild |
 | `github.com/aws/aws-sdk-go-v2` | S3 storage backend |
+| `github.com/valkey-io/valkey-go` | optional shared Valkey/Redis cache (see design.md) |
 | `gopkg.in/yaml.v3` | config parsing |
 | stdlib `log/slog` | structured application logging |
 
@@ -162,6 +172,20 @@ deploy/k8s/service.yaml     -- ClusterIP on port 8080
 deploy/k8s/ingress.yaml     -- ingress for apt clients
 ```
 
-**Scaling:** the filesystem backend with an RWO PVC requires `replicas: 1` and a
-`Recreate` update strategy. To run multiple replicas, switch to the S3 backend (no
-PVC, scales freely) or back the PVC with an RWX volume (NFS/EFS).
+**Scaling** is two independent decisions:
+
+1. **Storage backend** determines whether concurrent replicas can safely write
+   to the pool at all. The filesystem backend with an RWO PVC requires
+   `replicas: 1` and a `Recreate` update strategy -- only one node can mount
+   it. To run more than one replica, switch to the S3 backend (no PVC, scales
+   freely) or back the PVC with an RWX volume (NFS/EFS).
+2. **`valkey.enabled`** (optional, orthogonal to the above) determines whether
+   those replicas share upstream-fetch and `/live`-compression work instead of
+   each doing it independently. Without it, N replicas behind S3/RWX works,
+   but each one redundantly fetches every upstream and holds its own full
+   memory footprint (see [memory.md](memory.md)) -- technically scalable, but
+   each added replica costs as much upstream load and memory as the first.
+   With it, replicas adopt each other's fetched data and compressed artifacts
+   from Valkey, so adding replicas no longer multiplies upstream load or
+   memory. See [design.md](design.md#optional-valkey-backed-shared-cache-multi-replica-deployments)
+   for the mechanism.

@@ -114,6 +114,80 @@ in `signing.private_key` and is never published.
 
 Publishing happens automatically on `serve` startup and via `debproxy publish-key`.
 
+## Optional Valkey-backed shared cache (multi-replica deployments)
+
+Every debproxy instance is fully self-contained by default: it independently
+fetches every configured upstream, independently holds the parsed result in
+memory, and independently compresses its own copy of the `/live` serving
+artifacts. Running N replicas behind a shared storage backend means N
+redundant upstream fetches, N times the memory, and N times the compression
+work for output that is byte-identical across replicas. Enabling `valkey:`
+(see `config.example.yaml`) lets a cluster of replicas share that work
+instead through a common Valkey/Redis deployment -- see
+[memory.md](memory.md#valkey-backed-shared-cache) for the resulting memory
+profile. This is entirely optional and additive: with `valkey.enabled` unset,
+every code path below is a no-op and debproxy behaves exactly as it did
+before Valkey support existed.
+
+Three distinct data sets move through Valkey, each independently:
+
+- **Upstream availability cache** -- what a given upstream mirror currently
+  has (parsed `Release`/`Packages`/`Sources`), keyed by upstream+suite+
+  component. Feeds `avail.Build` and auto-update version comparisons.
+- **Pool metadata index** -- what debproxy has actually pulled into its own
+  pool. `internal/metadata/valkeystore` implements the same
+  `metadata.MetadataIndex` interface as `deb822store` (see "The metadata
+  index is persistent but rebuildable" above); `metadatafactory` picks one or
+  the other based on `valkey.enabled`. A `debproxy rebuild` repopulates a
+  valkeystore-backed index from the pool exactly as it does for deb822store.
+- **Live serving artifacts** -- the final, merged, compressed, signed bytes
+  for one `(os, codename)`'s `/live` view. This is the one thing that only
+  ever existed in a single process's memory before Valkey support: a plain
+  `map[string][]byte` per layout, rebuilt independently by every replica on
+  its own TTL.
+
+### Coordination mechanisms
+
+- **Distributed fetch lock** (`lock:fetch:{upstream:suite:component}`, Valkey
+  `SET NX PX` with a renew loop): only one replica fetches a given upstream
+  at a time. A replica that loses the race serves its own stale data (or
+  falls through and fetches anyway if it has nothing at all) rather than
+  blocking on the lock -- availability wins over strict single-fetcher
+  exclusivity.
+- **Freshness trust, not just TTL adoption.** A per-upstream Valkey copy is
+  normally only served outright while still fresh per that upstream's own
+  (often absent, defaulting to a bare 5 minute) `Cache-Control`. That's far
+  shorter than any real `schedule.refresh` interval, so on its own it would
+  still force a real upstream touch on nearly every call. `LayoutFresh` is a
+  separate, per-layout flag set only after a genuine real fetch succeeds
+  (`IndexCache.MarkLayoutDataFresh`, TTL'd to `schedule.refresh`); while it's
+  set, every upstream feeding that layout is trusted outright from Valkey
+  regardless of its own `Cache-Control`, via
+  `Fetcher.AdoptFromValkeyOutright`/`AdoptSourcesFromValkeyOutright`. A
+  confirmed **absence** of data is just as trustworthy as its presence: if a
+  cached `Release` itself proves an upstream serves none of the configured
+  architectures, or lists no Sources index at all, that is a permanent fact
+  about that upstream, not "not yet checked" -- it's adopted outright rather
+  than triggering a real fetch that would only re-derive the same "nothing
+  here" answer.
+- **Pub/sub as an optimization only, never the source of truth.**
+  `events:live-updated` notifies other replicas that a fresher compressed
+  `/live` artifact is available so they can invalidate a local cache entry
+  early rather than waiting out its own TTL. Valkey pub/sub is
+  fire-and-forget: a replica that's offline or mid-restart simply misses
+  the message, and its own next request or refresh cycle re-checks Valkey per
+  the mechanisms above regardless, so a missed message costs at most one
+  stale-TTL window, never a permanent miss.
+- **Per-layout independent refresh scheduling.** Each `(os, codename)` layout
+  runs its own refresh goroutine on its own jittered schedule (see
+  `schedule.refresh`'s comment in `config.example.yaml`) rather than one
+  global timer walking every layout in lockstep -- in a multi-replica
+  deployment, a synchronized burst would mean every replica hammering every
+  upstream's fetch lock at the same few moments. A `RefreshClaim` key (same
+  `SET NX PX` shape as the fetch lock, TTL'd to the refresh interval) ensures
+  only one replica actually does a given layout's refresh+auto-update cycle
+  each interval; the others skip it, having already trusted `LayoutFresh`.
+
 ## HTTP caching headers
 
 Responses carry `Cache-Control` headers matched to mutability:

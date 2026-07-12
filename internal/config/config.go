@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"gopkg.in/yaml.v3"
@@ -23,14 +24,15 @@ const (
 
 // Config is the top-level application configuration.
 type Config struct {
-	LogLevel        string                 `yaml:"log_level"`
-	Storage         StorageConfig          `yaml:"storage"`
-	UserAgent       string                 `yaml:"user_agent"`
-	Webhooks        []webhook.Def          `yaml:"webhooks"`
-	Upstreams       map[string]UpstreamDef `yaml:"upstreams"`
-	Layouts         []OSLayout             `yaml:"layouts"`
-	Signing         SigningConfig          `yaml:"signing"`
-	Schedule        ScheduleConfig         `yaml:"schedule"`
+	LogLevel  string                 `yaml:"log_level"`
+	Storage   StorageConfig          `yaml:"storage"`
+	UserAgent string                 `yaml:"user_agent"`
+	Webhooks  []webhook.Def          `yaml:"webhooks"`
+	Upstreams map[string]UpstreamDef `yaml:"upstreams"`
+	Layouts   []OSLayout             `yaml:"layouts"`
+	Signing   SigningConfig          `yaml:"signing"`
+	Schedule  ScheduleConfig         `yaml:"schedule"`
+	Valkey    ValkeyConfig           `yaml:"valkey"`
 	// MetricsAddr is the listen address for the Prometheus metrics endpoint
 	// (e.g. ":9090"). The endpoint is exposed at /metrics on this address.
 	// Leave empty to disable metrics.
@@ -39,12 +41,40 @@ type Config struct {
 	ResolvedLayouts []model.Layout `yaml:"-"`
 }
 
+// ValkeyConfig configures the optional shared Valkey/Redis cache and
+// metadata index. When Enabled, a cluster of debproxy replicas share the
+// pool metadata index (instead of each holding it fully in memory) and
+// coordinate upstream fetches through Valkey; see the design doc for the
+// full architecture. Disabled by default, in which case debproxy behaves
+// exactly as it did before this existed (deb822store, no cross-replica
+// coordination).
+type ValkeyConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// URL accepts the full grammar of valkey.ParseURL: redis:// or valkey://
+	// (rediss:// / valkeys:// for TLS), repeated "?addr=host:port" query
+	// params for additional Cluster nodes, and "?master_set=name" for
+	// Sentinel. If the password portion starts with "$", it is treated as an
+	// environment variable name and expanded at load time, matching
+	// UpstreamDef.Password.
+	URL string `yaml:"url"`
+	// KeyPrefix is prepended to every Valkey key debproxy writes (e.g.
+	// "debproxy:"), so a single Valkey deployment can safely be shared with
+	// other applications. Empty is valid (no prefix).
+	KeyPrefix string `yaml:"key_prefix"`
+}
+
 // ScheduleConfig holds all periodic scheduling settings.
 type ScheduleConfig struct {
 	// Refresh controls how often the server re-fetches upstream package indices
 	// in the background. Accepts a Go duration string (e.g. "6h", "12h").
 	// Empty string or "0" disables periodic background refreshing.
 	Refresh string `yaml:"refresh"`
+	// RefreshJitter is the maximum random delay added on top of Refresh on
+	// every periodic cycle (each layout draws its own, independently, so
+	// they don't stay in lockstep with each other). Accepts a Go duration
+	// string (e.g. "5m"). Empty uses the built-in default of 5 minutes; "0"
+	// disables jitter entirely (fire exactly every Refresh interval).
+	RefreshJitter string `yaml:"refresh_jitter"`
 	// Snapshot controls when the server automatically publishes snapshots while
 	// running in serve mode. Three formats are accepted:
 	//   "daily@HH:MM"      every day at a fixed UTC time (e.g. "daily@03:00")
@@ -72,6 +102,35 @@ type ScheduleConfig struct {
 	// "30m", "2h"). Empty string or "0" uses the built-in default of 1 hour --
 	// this is a safety margin, not a feature to casually disable.
 	GCGrace string `yaml:"gc_grace"`
+	// MetadataFlush controls how often the server persists the metadata index
+	// to the storage backend while running in serve mode. Accepts a Go
+	// duration string (e.g. "5m", "1h"). "0" disables it entirely. Empty uses
+	// a backend-dependent default: 5m for the in-memory deb822store backend
+	// (where this just flushes recently-dirty keys, cheap), or 1h when
+	// valkey.enabled is true (where it instead pulls the ENTIRE current index
+	// out of Valkey and writes it to storage in deb822store's own file
+	// format, since Valkey has no separate "dirty" tracking of its own --
+	// see metadata.Backuper). This is metadata's only file-based durability
+	// when Valkey is enabled; disabling it (or Valkey data loss before the
+	// first backup) means recovery falls back to `debproxy rebuild`.
+	MetadataFlush string `yaml:"metadata_flush"`
+}
+
+// RefreshInterval parses Refresh into a time.Duration. Empty, "0", or an
+// invalid value all resolve to 0 (disabled) -- this is a lenient runtime
+// resolver for callers like avail.Build that need a best-effort duration and
+// have no reasonable way to fail a request over a config typo; cmd/debproxy's
+// own startup validation of schedule.refresh is separate and stricter (it
+// exits on an invalid value rather than silently treating it as disabled).
+func (s ScheduleConfig) RefreshInterval() time.Duration {
+	if s.Refresh == "" || s.Refresh == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(s.Refresh)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 // CompressionLevel is a YAML-compatible compression setting.
@@ -189,10 +248,10 @@ func (c CompressionConfig) ResolveLive() publish.Compression {
 }
 
 type StorageConfig struct {
-	Backend     string              `yaml:"backend"`
-	Filesystem  FilesystemConfig    `yaml:"filesystem"`
-	S3          S3Config            `yaml:"s3"`
-	Compression CompressionConfig   `yaml:"compression"`
+	Backend     string            `yaml:"backend"`
+	Filesystem  FilesystemConfig  `yaml:"filesystem"`
+	S3          S3Config          `yaml:"s3"`
+	Compression CompressionConfig `yaml:"compression"`
 }
 
 type FilesystemConfig struct {
@@ -260,6 +319,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyEnvOverrides(cfg)
+	cfg.Valkey.URL = expandURLEnvRefs(cfg.Valkey.URL)
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -309,6 +369,9 @@ func (c *Config) validate() error {
 	}
 	if len(c.Layouts) == 0 {
 		return fmt.Errorf("at least one layout is required")
+	}
+	if c.Valkey.Enabled && c.Valkey.URL == "" {
+		return fmt.Errorf("valkey.url is required when valkey.enabled is true")
 	}
 	return nil
 }
@@ -493,6 +556,15 @@ func expandEnvRef(s string) string {
 		return os.Getenv(strings.TrimPrefix(s, "$"))
 	}
 	return s
+}
+
+// expandURLEnvRefs expands any "$VAR" or "${VAR}" references embedded within
+// s, unlike expandEnvRef which only handles the whole value being a single
+// reference. Used for valkey.url, where a credential is typically embedded
+// inside a larger URL (e.g. "valkey://user:$VALKEY_PASSWORD@host:6379/0")
+// rather than standing alone.
+func expandURLEnvRefs(s string) string {
+	return os.Expand(s, os.Getenv)
 }
 
 func loadKeyring(paths []string) (openpgp.EntityList, error) {

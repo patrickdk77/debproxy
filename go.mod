@@ -11,6 +11,7 @@ require (
 	github.com/klauspost/compress v1.19.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/ulikunitz/xz v0.5.15
+	github.com/valkey-io/valkey-go v1.0.76
 	gopkg.in/yaml.v3 v3.0.1
 )
 

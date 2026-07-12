@@ -108,23 +108,38 @@ func (s *Syncer) Update(ctx context.Context) error {
 	// Expire all entries so this call always re-validates against upstream, but
 	// keep the cached archPkgs so FetchIndex can use PDiff when packages change.
 	s.indexCache.ExpireAll()
-	return s.runUpdate(ctx, s.indexCache)
+	return s.runUpdate(ctx, s.indexCache, nil)
 }
 
 // UpdateWithCache runs the same update logic as Update but reuses an already-
 // populated index cache (e.g. from a background refresh) instead of fetching
 // from scratch.
 func (s *Syncer) UpdateWithCache(ctx context.Context, cache *upstream.IndexCache) error {
-	return s.runUpdate(ctx, cache)
+	return s.runUpdate(ctx, cache, nil)
 }
 
-func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache) error {
+// UpdateLayoutWithCache is UpdateWithCache scoped to a single (os, codename)
+// layout grouping, for callers that refresh each layout independently (see
+// cmd/debproxy's per-layout refresh scheduler) rather than all of them in one
+// pass.
+func (s *Syncer) UpdateLayoutWithCache(ctx context.Context, cache *upstream.IndexCache, osName, codename string) error {
+	only := osCodename{osName, codename}
+	return s.runUpdate(ctx, cache, &only)
+}
+
+// runUpdate scans every layout (or, if only is non-nil, just that one) for
+// auto_update packages/sources with a newer version available upstream, and
+// caches them.
+func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache, only *osCodename) error {
 	if err := s.index.Refresh(ctx); err != nil {
 		return fmt.Errorf("refresh index: %w", err)
 	}
 	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
 
 	for k := range s.layoutsByOSCodename() {
+		if only != nil && k != *only {
+			continue
+		}
 		av := avail.Build(ctx, s.cfg, s.client, cache, k.osName, k.codename)
 
 		// Snapshot current source versions only when at least one source has
@@ -325,7 +340,6 @@ func (s *Syncer) publishSuite(ctx context.Context, sink publish.FileSink, prefix
 	}
 	return publish.GenerateSuite(ctx, sink, prefix, in, s.key)
 }
-
 
 // highestVersionByKey groups items by key and keeps only the one with the
 // highest Version per key. Used wherever superseded package versions must be
