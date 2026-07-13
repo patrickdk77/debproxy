@@ -33,6 +33,7 @@ import (
 	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/publish"
+	"github.com/debproxy/debproxy/internal/safego"
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/upstream"
@@ -51,9 +52,10 @@ type Server struct {
 	exists     *ingest.ExistsCache // shared with syncer; nil disables re-index
 
 	mu           sync.Mutex
-	liveCache    map[string]*liveEntry         // key: os/codename
-	liveBuilding map[string]chan struct{}      // in-flight builds
-	retryCancel  map[string]context.CancelFunc // background mismatch retries
+	liveCache    map[string]*liveEntry          // key: os/codename
+	liveBuilding map[string]chan struct{}       // in-flight builds
+	retryCancel  map[string]context.CancelFunc  // background mismatch retries
+	retiredLive  map[string][]*retiredLiveEntry // key: os/codename; see retireLiveEntryLocked
 
 	// validOSCodename and validTriple bound metric-label cardinality to the
 	// configured universe. Keys are "os/codename" and "os/codename/upstream"
@@ -74,14 +76,59 @@ const (
 	liveTTLJitter = 5 * time.Minute
 )
 
+// liveRetiredRetention bounds how long a superseded live generation's files
+// remain fetchable after being retired (see retireLiveEntryLocked). This is
+// what makes Acquire-By-Hash (see internal/publish) actually safe for the
+// dynamically-regenerated /live view: a client that already fetched Release
+// (or a by-hash path) from the generation about to be retired must still be
+// able to fetch everything that Release referenced, even though /live keeps
+// rebuilding out from under it -- otherwise every rebuild would 404 any
+// client mid-flight between its Release fetch and its Packages/Sources
+// fetch, which is the exact "File has unexpected size" race Acquire-By-Hash
+// exists to prevent in the first place.
+const liveRetiredRetention = 1 * time.Minute
+
 var errUnknownSelector = errors.New("unknown snapshot selector")
 
 type liveEntry struct {
 	av     *avail.Available
 	files  map[string][]byte
-	hashes map[string]string // file key -> sha256 from Release; O(1) ETag lookup
+	hashes map[string]string // plain file key -> sha256 from Release; O(1) ETag lookup
 	built  time.Time
 	expiry time.Time
+}
+
+// lookupByHash finds the plain-named file whose hash (from Release, see
+// hashes' own doc comment) matches hash, and returns its bytes. by-hash
+// requests are resolved this way rather than by storing a literal
+// by-hash-named entry in files: generateLiveFiles sets
+// publish.SuiteInput.SkipByHash, so a by-hash sibling is never written to
+// this cache in the first place, which would otherwise be an exact
+// duplicate of a plain-named entry's bytes -- doubling /live's in-memory
+// footprint, and (via publishLiveUpdate enumerating every key in files)
+// doubling every peer replica's adoption fetch traffic and memory too, for
+// files that can just as well be served by deriving which plain key a
+// given hash belongs to. e.hashes is small (bounded by the number of
+// Packages/Sources compressed variants for one layout, typically a few
+// dozen at most), so a linear scan here is cheap relative to either an
+// HTTP round trip or a re-hash of a multi-MB file.
+func (e *liveEntry) lookupByHash(hash string) (data []byte, plainKey string, ok bool) {
+	for key, h := range e.hashes {
+		if h == hash {
+			if d, ok := e.files[key]; ok {
+				return d, key, true
+			}
+		}
+	}
+	return nil, "", false
+}
+
+// retiredLiveEntry is a liveEntry that was superseded by a newer one, kept
+// around for liveRetiredRetention so its files stay fetchable by hash. See
+// retireLiveEntryLocked/resolveByHash.
+type retiredLiveEntry struct {
+	entry     *liveEntry
+	retiredAt time.Time
 }
 
 // New creates a Server. notifier and exists may be nil.
@@ -115,6 +162,7 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 		liveCache:       map[string]*liveEntry{},
 		liveBuilding:    map[string]chan struct{}{},
 		retryCancel:     map[string]context.CancelFunc{},
+		retiredLive:     map[string][]*retiredLiveEntry{},
 		validOSCodename: validOSCodename,
 		validTriple:     validTriple,
 	}
@@ -162,6 +210,105 @@ func (s *Server) sweepExpiredLiveCache(now time.Time) {
 			delete(s.liveCache, k)
 		}
 	}
+}
+
+// retireLiveEntryLocked moves old into s.retiredLive[cacheKey] so its files
+// (including by-hash-named entries -- see internal/publish's Acquire-By-Hash
+// support) remain fetchable for liveRetiredRetention after being superseded,
+// pruning any previously-retired entries for this cacheKey that have already
+// aged out. Must be called with s.mu held, before old is replaced in
+// s.liveCache.
+func (s *Server) retireLiveEntryLocked(cacheKey string, old *liveEntry) {
+	now := time.Now()
+	cutoff := now.Add(-liveRetiredRetention)
+	var kept []*retiredLiveEntry
+	for _, r := range s.retiredLive[cacheKey] {
+		if r.retiredAt.After(cutoff) {
+			kept = append(kept, r)
+		}
+	}
+	s.retiredLive[cacheKey] = append(kept, &retiredLiveEntry{entry: old, retiredAt: now})
+}
+
+// resolveByHash finds the bytes matching hash for osName/codename, checking
+// current first, then recently retired generations (newest first, see
+// retireLiveEntryLocked) still within liveRetiredRetention. This is what
+// makes Acquire-By-Hash (see internal/publish) actually safe for the
+// dynamically-regenerated /live view: a client that already fetched Release
+// (or a by-hash path) from a generation about to be retired must still be
+// able to fetch everything that Release referenced, even though /live keeps
+// rebuilding out from under it -- otherwise every rebuild would 404 any
+// client mid-flight between its Release fetch and its Packages/Sources
+// fetch, which is the exact "File has unexpected size" race Acquire-By-Hash
+// exists to prevent in the first place.
+func (s *Server) resolveByHash(osName, codename string, current *liveEntry, hash string) (data []byte, builtAt time.Time, ok bool) {
+	if data, _, ok := current.lookupByHash(hash); ok {
+		return data, current.built, true
+	}
+
+	cacheKey := osName + "/" + codename
+	cutoff := time.Now().Add(-liveRetiredRetention)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	retained := s.retiredLive[cacheKey]
+	for i := len(retained) - 1; i >= 0; i-- {
+		r := retained[i]
+		if r.retiredAt.Before(cutoff) {
+			continue
+		}
+		if data, _, ok := r.entry.lookupByHash(hash); ok {
+			return data, r.entry.built, true
+		}
+	}
+	return nil, time.Time{}, false
+}
+
+// swapLiveEntry retires whatever was previously cached for osName/codename
+// (see retireLiveEntryLocked), installs newEntry as the current one, and --
+// only when fresh is true, meaning newEntry was just generated locally
+// rather than adopted from a peer that already published its own notice
+// (see buildOrAdoptLiveFiles) -- announces it to other replicas.
+//
+// The swap and the announcement are deliberately sequenced in that order,
+// swap first: other replicas (and, once they receive the notice and adopt,
+// their own local liveCache) should never be told about a generation this
+// replica itself can't yet serve. The announcement itself is fired via
+// safego.Go rather than awaited, so a slow or unreachable Valkey never adds
+// latency to a request that's just trying to install a build it already
+// has in hand.
+func (s *Server) swapLiveEntry(osName, codename string, newEntry *liveEntry, fresh bool) {
+	cacheKey := osName + "/" + codename
+
+	s.mu.Lock()
+	if old, ok := s.liveCache[cacheKey]; ok {
+		s.retireLiveEntryLocked(cacheKey, old)
+	}
+	s.sweepExpiredLiveCache(time.Now())
+	s.liveCache[cacheKey] = newEntry
+	s.mu.Unlock()
+
+	if fresh && s.valkey != nil {
+		safego.Go("publish live update", func() {
+			s.publishLiveUpdate(osName, codename, newEntry.files, newEntry.hashes, newEntry.built, newEntry.expiry)
+		})
+	}
+}
+
+// hashFromByHashKey extracts the sha256 hex digest from a by-hash key of the
+// form ".../by-hash/SHA256/<hex>", or "" if key doesn't match that shape.
+// Used to avoid re-hashing a file that's already named by its own hash just
+// to compute its ETag (see serveBytes's callers below) -- without this,
+// every by-hash request (which is what apt uses for nearly every
+// Packages/Sources fetch once Acquire-By-Hash is advertised, see
+// internal/publish) would re-hash a potentially multi-MB file on every
+// single request, even though the answer is right there in the URL.
+func hashFromByHashKey(key string) string {
+	const marker = "/by-hash/SHA256/"
+	i := strings.LastIndex(key, marker)
+	if i < 0 {
+		return ""
+	}
+	return key[i+len(marker):]
 }
 
 // Handler returns the HTTP handler with logging, response compression, and metrics.
@@ -335,6 +482,25 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 			return
 		}
 		key := path.Join(remainder...)
+		if hash := hashFromByHashKey(key); hash != "" {
+			// by-hash paths are resolved virtually, not by a literal key
+			// lookup (see liveEntry.lookupByHash for why), checking the
+			// current generation and then recently retired ones (see
+			// resolveByHash/liveRetiredRetention): a client that fetched
+			// Release just before this replica's most recent rebuild may
+			// still be fetching Packages/Sources by a hash that generation
+			// announced, and that generation's files must stay servable
+			// for a little while after being superseded. There's no
+			// decompression-fallback equivalent for a by-hash request (it
+			// always names one exact stored variant), so a miss here is a
+			// straight 404.
+			if data, builtAt, ok := s.resolveByHash(osName, codename, entry, hash); ok {
+				serveBytes(w, r, key, data, builtAt, hash)
+				return
+			}
+			http.NotFound(w, r)
+			return
+		}
 		data, ok := entry.files[key]
 		if !ok {
 			// Plain index file (Packages/Sources) is never stored  -- serve from
@@ -778,7 +944,7 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 		if !building {
 			wait := make(chan struct{})
 			s.liveBuilding[cacheKey] = wait
-			go s.rebuildLive(osName, codename, cacheKey, wait)
+			safego.Go("rebuild live cache", func() { s.rebuildLive(osName, codename, cacheKey, wait) })
 		}
 		s.mu.Unlock()
 		return entry, nil
@@ -818,21 +984,20 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	// window in the common case. rebuildLive and startMismatchRetry below
 	// are both background, non-blocking paths and always take the lock.
 	av := s.buildAvailBestEffort(buildCtx, osName, codename)
-	files, hashes, builtAt, expiry, err := s.buildOrAdoptLiveFiles(buildCtx, osName, codename, av)
+	files, hashes, builtAt, expiry, fresh, err := s.buildOrAdoptLiveFiles(buildCtx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
+	s.mu.Unlock()
 	if err == nil {
 		entry = &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
-		s.sweepExpiredLiveCache(time.Now())
-		s.liveCache[cacheKey] = entry
+		s.swapLiveEntry(osName, codename, entry, fresh)
 		slog.Info("live cache built", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
 		slog.Error("live file generation failed, no stale data available",
 			"os", osName, "codename", codename, "elapsed", elapsed, "err", err)
 	}
-	s.mu.Unlock()
 	close(wait)
 
 	if err != nil {
@@ -854,22 +1019,21 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 
 	buildStart := time.Now()
 	av := s.buildAvail(ctx, osName, codename)
-	files, hashes, builtAt, expiry, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
+	files, hashes, builtAt, expiry, fresh, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 
 	s.mu.Lock()
 	delete(s.liveBuilding, cacheKey)
+	s.mu.Unlock()
 	swapped := err == nil
 	if err == nil {
 		newEntry := &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
-		s.sweepExpiredLiveCache(time.Now())
-		s.liveCache[cacheKey] = newEntry
+		s.swapLiveEntry(osName, codename, newEntry, fresh)
 		slog.Debug("live cache refreshed in background", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
 		slog.Error("background live rebuild failed, retaining stale cache",
 			"os", osName, "codename", codename, "elapsed", elapsed, "err", err)
 	}
-	s.mu.Unlock()
 
 	if swapped {
 		debug.FreeOSMemory()
@@ -917,28 +1081,40 @@ func (s *Server) startMismatchRetry(osName, codename string) {
 			case <-ctx.Done():
 				return
 			}
-			// Close idle connections so the retry opens fresh TCP connections,
-			// potentially landing on a different CDN node with consistent state.
-			s.client.CloseIdleConnections()
-			slog.Info("retrying live build after digest mismatch",
-				"os", osName, "codename", codename, "attempt", i+1, "delay", delay)
-			av := s.buildAvail(ctx, osName, codename)
-			if !av.HasStaleMismatch {
-				files, hashes, builtAt, expiry, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
+			// Each attempt runs inside safego.Run so a panic during one
+			// attempt's build is logged and contained -- the next attempt
+			// still runs on schedule -- instead of silently ending the whole
+			// retry sequence (or crashing the process). succeeded, set only
+			// on the success path below, signals the outer loop to stop
+			// after the wrapped closure returns, since a bare `return` inside
+			// it would only exit this one attempt, not the loop.
+			succeeded := false
+			safego.Run(fmt.Sprintf("mismatch retry %s/%s attempt %d", osName, codename, i+1), func() {
+				// Close idle connections so the retry opens fresh TCP connections,
+				// potentially landing on a different CDN node with consistent state.
+				s.client.CloseIdleConnections()
+				slog.Info("retrying live build after digest mismatch",
+					"os", osName, "codename", codename, "attempt", i+1, "delay", delay)
+				av := s.buildAvail(ctx, osName, codename)
+				if av.HasStaleMismatch {
+					slog.Warn("mismatch retry: upstream still mid-sync",
+						"os", osName, "codename", codename, "attempt", i+1)
+					return
+				}
+				files, hashes, builtAt, expiry, fresh, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
 				if err != nil {
 					slog.Error("mismatch retry: live file generation failed", "os", osName, "codename", codename, "err", err)
-					continue
+					return
 				}
 				entry := &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
-				s.mu.Lock()
-				s.liveCache[key] = entry
-				s.mu.Unlock()
+				s.swapLiveEntry(osName, codename, entry, fresh)
 				slog.Info("mismatch retry succeeded, live cache updated",
 					"os", osName, "codename", codename, "attempt", i+1)
+				succeeded = true
+			})
+			if succeeded {
 				return
 			}
-			slog.Warn("mismatch retry: upstream still mid-sync",
-				"os", osName, "codename", codename, "attempt", i+1)
 		}
 		slog.Error("mismatch retry exhausted, upstream digest mismatch persists",
 			"os", osName, "codename", codename)
@@ -1027,13 +1203,23 @@ func (s *Server) generateLiveFiles(ctx context.Context, av *avail.Available) (ma
 		Date:          time.Now(),
 		Compression:   s.cfg.Storage.Compression.ResolveLive(),
 		HashTypes:     s.cfg.HashTypesFor(av.OS, av.Codename),
+		// /live is purely in-memory and rebuilt every schedule.refresh cycle
+		// -- a literal by-hash sibling here would just be a second,
+		// throwaway copy of a plain-named entry's exact bytes, doubling
+		// this cache's memory footprint (and, via publishLiveUpdate, every
+		// peer's fetch traffic and memory too) for no benefit. by-hash
+		// requests are served virtually instead -- see
+		// liveEntry.lookupByHash below, which derives the plain path from
+		// the hashes index built right below this call.
+		SkipByHash: true,
 	}
 	if err := publish.GenerateSuite(ctx, sink, "", in, s.key); err != nil {
 		return nil, nil, err
 	}
 
 	// Parse each Release file in the sink once to build a path->sha256 index.
-	// This is used by servePlainFromLive for O(1) ETag lookups without re-hashing.
+	// This is used by servePlainFromLive for O(1) ETag lookups without
+	// re-hashing, and by liveEntry.lookupByHash to resolve by-hash requests.
 	hashes := make(map[string]string, len(sink.files))
 	for key, data := range sink.files {
 		if !strings.HasSuffix(key, "/Release") {

@@ -4,8 +4,10 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -26,6 +28,10 @@ import (
 
 // SnapshotIDFormat is the timestamp layout used for snapshot directory names.
 const SnapshotIDFormat = "2006-01-02T15-04-05"
+
+// currentSnapshotNamePath is the plain-text file written by Snapshot
+// recording which snapshot ID "current" points to (see CurrentSnapshotName).
+const currentSnapshotNamePath = "current/snapshot-name"
 
 // Syncer ties together storage, the index, and the signing key.
 type Syncer struct {
@@ -104,17 +110,32 @@ func (s *Syncer) Prime(ctx context.Context, osName, codename, component string, 
 
 // Update fetches fresh upstream data and updates any auto_update packages,
 // then publishes a new snapshot.
+//
+// Takes s.indexCache's build lock for the duration of the update, mirroring
+// cmd/debproxy's per-layout background refresher (see IndexCache.Lock's own
+// doc comment) -- necessary, not just cosmetic, now that this can run
+// concurrently with that refresher against the very same shared cache (e.g.
+// triggered by POST /api/v1/update while the server is also live): without
+// it, the two could build through the cache at the same time, each
+// independently holding a Valkey fetch lock and resident merge memory. Safe
+// even when indexCache is a private, unshared instance (e.g. the `debproxy
+// update` CLI command) -- an uncontended Lock/Unlock is nearly free.
 func (s *Syncer) Update(ctx context.Context) error {
 	// Expire all entries so this call always re-validates against upstream, but
 	// keep the cached archPkgs so FetchIndex can use PDiff when packages change.
 	s.indexCache.ExpireAll()
+	s.indexCache.Lock()
+	defer s.indexCache.Unlock()
 	return s.runUpdate(ctx, s.indexCache, nil)
 }
 
 // UpdateWithCache runs the same update logic as Update but reuses an already-
 // populated index cache (e.g. from a background refresh) instead of fetching
-// from scratch.
+// from scratch. Takes cache's build lock for the same reason Update does --
+// see its doc comment.
 func (s *Syncer) UpdateWithCache(ctx context.Context, cache *upstream.IndexCache) error {
+	cache.Lock()
+	defer cache.Unlock()
 	return s.runUpdate(ctx, cache, nil)
 }
 
@@ -302,10 +323,47 @@ func (s *Syncer) Snapshot(ctx context.Context, now time.Time) error {
 	// Write a plain-text file so clients can discover which snapshot ID
 	// current points to without parsing Release metadata.
 	idBytes := []byte(snapshotID)
-	if err := s.store.WriteFile(ctx, "current/snapshot-name", strings.NewReader(snapshotID), int64(len(idBytes))); err != nil {
-		return fmt.Errorf("write current/snapshot-name: %w", err)
+	if err := s.store.WriteFile(ctx, currentSnapshotNamePath, strings.NewReader(snapshotID), int64(len(idBytes))); err != nil {
+		return fmt.Errorf("write %s: %w", currentSnapshotNamePath, err)
 	}
 	return nil
+}
+
+// CurrentSnapshotName returns the snapshot ID "current" currently points to,
+// as written by the most recent successful Snapshot call. Returns an error
+// satisfying os.IsNotExist if no snapshot has ever been published.
+func (s *Syncer) CurrentSnapshotName(ctx context.Context) (string, error) {
+	rc, err := s.store.OpenPublished(ctx, currentSnapshotNamePath)
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", currentSnapshotNamePath, err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// CurrentSnapshotAge returns how long ago the current snapshot was
+// published, relative to now, derived by parsing its ID (a SnapshotIDFormat
+// timestamp -- the ID *is* the timestamp, so no separate stored value is
+// needed). ok is false (with a nil error) when no snapshot has ever been
+// published; used by both the periodic snapshot scheduler and the API's
+// non-force snapshot path to implement the snapshot debounce window.
+func (s *Syncer) CurrentSnapshotAge(ctx context.Context, now time.Time) (age time.Duration, ok bool, err error) {
+	name, err := s.CurrentSnapshotName(ctx)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	t, err := time.Parse(SnapshotIDFormat, name)
+	if err != nil {
+		return 0, false, fmt.Errorf("parse snapshot id %q: %w", name, err)
+	}
+	return now.Sub(t), true, nil
 }
 
 // publishSuite writes a single suite's dists tree from cached index entries.

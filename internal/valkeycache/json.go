@@ -3,6 +3,7 @@ package valkeycache
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/valkey-io/valkey-go"
 )
@@ -32,6 +33,17 @@ func SetJSON(ctx context.Context, v valkey.Client, key string, val any) error {
 		return err
 	}
 	return v.Do(ctx, v.B().Set().Key(key).Value(string(data)).Build()).Error()
+}
+
+// SetJSONEx is SetJSON with a TTL (PX, milliseconds) attached, for values
+// that should expire on their own rather than live forever (e.g. async job
+// status records).
+func SetJSONEx(ctx context.Context, v valkey.Client, key string, val any, ttl time.Duration) error {
+	data, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+	return v.Do(ctx, v.B().Set().Key(key).Value(string(data)).Px(ttl).Build()).Error()
 }
 
 // MGetJSON MGETs keys and JSON-decodes each value into a T. results[i] is

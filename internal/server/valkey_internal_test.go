@@ -30,6 +30,12 @@ func newValkeyEnabledServer(t *testing.T, listenAddr string) *Server {
 }
 
 func TestHandleLiveUpdatedMessageInvalidatesMatchingEntry(t *testing.T) {
+	// Invalidation is jittered (see liveUpdateInvalidateJitter) -- shrink it
+	// so this test doesn't have to wait out the full production window.
+	orig := liveUpdateInvalidateJitter
+	liveUpdateInvalidateJitter = time.Millisecond
+	t.Cleanup(func() { liveUpdateInvalidateJitter = orig })
+
 	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
 
 	future := time.Now().Add(time.Hour)
@@ -42,10 +48,24 @@ func TestHandleLiveUpdatedMessageInvalidatesMatchingEntry(t *testing.T) {
 	}
 	s.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(msg)})
 
-	if !s.liveCache["debian/trixie"].expiry.IsZero() {
-		t.Fatal("expected debian/trixie entry to be invalidated (zero expiry)")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.mu.Lock()
+		invalidated := s.liveCache["debian/trixie"].expiry.IsZero()
+		s.mu.Unlock()
+		if invalidated {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for debian/trixie entry to be invalidated")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if !s.liveCache["ubuntu/noble"].expiry.Equal(future) {
+
+	s.mu.Lock()
+	untouched := s.liveCache["ubuntu/noble"].expiry
+	s.mu.Unlock()
+	if !untouched.Equal(future) {
 		t.Fatal("expected unrelated ubuntu/noble entry to be left untouched")
 	}
 }
@@ -115,9 +135,12 @@ func TestBuildOrAdoptLiveFiles_AdoptsFromPeerViaHTTP(t *testing.T) {
 	consumer.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(data)})
 
 	av := &avail.Available{}
-	files, gotHashes, gotBuiltAt, gotExpiry, err := consumer.buildOrAdoptLiveFiles(context.Background(), "debian", "trixie", av)
+	files, gotHashes, gotBuiltAt, gotExpiry, fresh, err := consumer.buildOrAdoptLiveFiles(context.Background(), "debian", "trixie", av)
 	if err != nil {
 		t.Fatalf("buildOrAdoptLiveFiles: %v", err)
+	}
+	if fresh {
+		t.Error("expected fresh=false for a peer-adopted generation")
 	}
 	if string(files[fileKey]) != string(sentinel) {
 		t.Fatalf("files[%q] = %q, want the publisher's sentinel bytes", fileKey, files[fileKey])

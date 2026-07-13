@@ -81,7 +81,6 @@ func TestKeysSrcGroupSharesHashTag(t *testing.T) {
 	}
 }
 
-
 func TestKeysDifferentBucketsProduceDifferentTags(t *testing.T) {
 	k := Keys{}
 	a := k.PkgBucket("debian", "trixie", "main", "amd64")

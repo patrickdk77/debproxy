@@ -161,3 +161,18 @@ func (k Keys) LayoutFresh(os, codename string) string {
 func (k Keys) MetadataFlushClaim(os, codename string) string {
 	return k.Prefix + "meta-flush-claim:" + os + ":" + codename
 }
+
+// OperationLock is the distributed lock (see AcquireLock) serializing
+// debproxy's mutating admin operations -- snapshot, cleanup, update, rebuild,
+// prime -- against each other and across every replica, since all of them
+// touch the shared index/pool state and running two concurrently risks a
+// logically-inconsistent snapshot. Used by both the /api HTTP surface and
+// the periodic snapshot/cleanup schedulers (internal/api's operationRunner
+// and OpLock).
+func (k Keys) OperationLock() string { return k.Prefix + "lock:operation" }
+
+// Job is the TTL'd key an async /api admin operation's status (queued,
+// running, succeeded, or failed) is written to, so a status poll landing on
+// any replica behind a load balancer can read the result of a job that ran
+// on a different one. See internal/api's jobStore.
+func (k Keys) Job(id string) string { return k.Prefix + "job:" + id }

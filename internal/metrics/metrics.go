@@ -87,6 +87,67 @@ var (
 		Name: "debproxy_build_info",
 		Help: "Build information about the running debproxy binary. Always 1.",
 	}, []string{"revision", "modified"})
+
+	// APIRequestsTotal counts completed /api/v1 requests, by resource,
+	// action, and status code (as a string, matching HTTPRequestsTotal's own
+	// convention).
+	APIRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "debproxy_api_requests_total",
+		Help: "Total /api/v1 requests served, by resource, action, and status code.",
+	}, []string{"resource", "action", "status"})
+
+	// APIAuthFailuresTotal counts /api/v1 authentication/authorization
+	// failures, by reason ("invalid_credentials" or "not_permitted").
+	APIAuthFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "debproxy_api_auth_failures_total",
+		Help: "Total /api/v1 authentication/authorization failures, by reason.",
+	}, []string{"reason"})
+
+	// OperationDuration records how long each admin operation (snapshot,
+	// cleanup, update, rebuild, prime) took, whether triggered via /api or a
+	// periodic scheduler.
+	OperationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "debproxy_operation_duration_seconds",
+		Help:    "Admin operation latency in seconds, by operation.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 12), // 1s .. ~34min
+	}, []string{"operation"})
+
+	// OperationFailuresTotal counts admin operations that ended in failure.
+	OperationFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "debproxy_operation_failures_total",
+		Help: "Total admin operations that ended in failure, by operation.",
+	}, []string{"operation"})
+
+	// APIJobQueueDepth is the current number of queued-or-running async
+	// admin-operation jobs on this replica -- lets a bulk `prime` submission
+	// watch its own drain progress instead of polling every individual
+	// job_id.
+	APIJobQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "debproxy_api_job_queue_depth",
+		Help: "Current number of queued or running async /api/v1 admin-operation jobs on this replica.",
+	})
+
+	// FileCacheRequestsTotal counts internal/storage/filecache lookups, by
+	// result ("hit" or "miss"). No-op (never incremented) when the cache is
+	// disabled (storage.file_cache.size unset or "0").
+	FileCacheRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "debproxy_file_cache_requests_total",
+		Help: "Total storage file-cache lookups, by result (hit or miss).",
+	}, []string{"result"})
+
+	// FileCacheBytes is the file cache's current total size in bytes.
+	FileCacheBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "debproxy_file_cache_bytes",
+		Help: "Current total size of the storage file cache, in bytes.",
+	})
+
+	// FileCacheEvictionsTotal counts entries evicted from the file cache to
+	// stay within its configured size budget (does not include entries
+	// invalidated because their underlying path was written or deleted).
+	FileCacheEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "debproxy_file_cache_evictions_total",
+		Help: "Total entries evicted from the storage file cache to stay within its size budget.",
+	})
 )
 
 func init() {

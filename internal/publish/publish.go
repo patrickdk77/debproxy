@@ -80,6 +80,19 @@ type SuiteInput struct {
 	// HashTypes lists which hash sections to write to Release/InRelease.
 	// Valid values: "sha256", "sha512", "sha1", "md5sum". Defaults to ["sha256"].
 	HashTypes []string
+	// SkipByHash disables writing by-hash/SHA256/<hash> sibling files (see
+	// byHashPath) even though Release still declares Acquire-By-Hash: yes.
+	// Release's own hash sections (used to derive by-hash paths) are
+	// unaffected either way. Set this for a purely in-memory, ephemeral
+	// sink where a by-hash sibling would just be a duplicate copy of a
+	// plain-named entry's exact bytes with no benefit -- see
+	// internal/server's liveEntry.lookupByHash, which serves /live's
+	// by-hash requests by deriving the plain path from Release's hash
+	// listing instead of ever storing a second copy. Real (storage-backed)
+	// publishing must leave this false: a plain HTTP file server has no
+	// such derivation layer, and by-hash paths must physically exist for
+	// clients to fetch them.
+	SkipByHash bool
 }
 
 type hashedFile struct {
@@ -105,6 +118,35 @@ func activeHashTypes(types []string) []string {
 		return []string{"sha256"}
 	}
 	return types
+}
+
+// hashTypesForHashing is activeHashTypes, but always including "sha256" even
+// if the caller's configured hash_types omits it. by-hash file naming (see
+// byHashPath and its call sites in GenerateSuite) depends on a sha256 digest
+// unconditionally; which hash *sections* actually get written to Release's
+// own text is a separate concern, still governed by the caller's original
+// list (see buildRelease's own activeHashTypes call).
+func hashTypesForHashing(configured []string) []string {
+	types := activeHashTypes(configured)
+	for _, t := range types {
+		if t == "sha256" {
+			return types
+		}
+	}
+	return append(append([]string(nil), types...), "sha256")
+}
+
+// byHashPath returns rel's by-hash sibling path (e.g.
+// "main/binary-amd64/Packages.gz" -> "main/binary-amd64/by-hash/SHA256/<sha256>"),
+// matching real Debian/Ubuntu archive layout: one by-hash/SHA256/ directory
+// per index file's own directory, containing one entry per distinct
+// compressed variant (each has different content, hence a different hash).
+// Never used for Release/InRelease themselves -- by-hash only ever applies
+// to the index files Release's own hash sections list (Packages/Sources),
+// never to Release, which is the client's root of trust for those hashes in
+// the first place.
+func byHashPath(rel, sha256 string) string {
+	return path.Join(path.Dir(rel), "by-hash", "SHA256", sha256)
 }
 
 // hashWriters builds one hash.Hash per configured type in the order
@@ -214,7 +256,7 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 		}})
 	}
 
-	hashTypes := activeHashTypes(in.HashTypes)
+	hashTypes := hashTypesForHashing(in.HashTypes)
 
 	// streamStanzas fans stanzas through hashers and all compressors simultaneously
 	// via io.MultiWriter so the full plain content is never assembled into one buffer.
@@ -377,6 +419,18 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 					return err
 				}
 				files = append(files, cf.hf)
+				// by-hash sibling: not listed in files (see byHashPath's own
+				// doc comment -- Release never declares by-hash paths
+				// separately), just written alongside the plain-named file so
+				// Acquire-By-Hash clients can fetch it by hash regardless of
+				// what's since become "current" at the plain-named path. See
+				// SkipByHash's own doc comment for why this is conditional.
+				if cf.hf.sha256 != "" && !in.SkipByHash {
+					byHashFull := path.Join(distRoot, byHashPath(cf.hf.rel, cf.hf.sha256))
+					if err := sink.WriteFile(ctx, byHashFull, bytes.NewReader(cf.data), cf.hf.size); err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
@@ -429,6 +483,15 @@ func GenerateSuite(ctx context.Context, sink FileSink, prefix string, in SuiteIn
 				return err
 			}
 			files = append(files, hf)
+			// by-hash sibling -- see the identical treatment (and its doc
+			// comment) in the binary-Packages loop above.
+			if hf.sha256 != "" && !in.SkipByHash {
+				byHashFull := path.Join(distRoot, byHashPath(hf.rel, hf.sha256))
+				if err := sink.WriteFile(ctx, byHashFull, bytes.NewReader(data), hf.size); err != nil {
+					returnBufs()
+					return err
+				}
+			}
 		}
 		returnBufs()
 	}
@@ -492,6 +555,15 @@ func buildRelease(in SuiteInput, files []hashedFile) string {
 	if in.Description != "" {
 		p.Set("Description", in.Description)
 	}
+	// Every index file GenerateSuite writes also gets a by-hash sibling (see
+	// byHashPath and its call sites above), so this is always true, not a
+	// per-suite option -- matches how every modern Debian/Ubuntu archive
+	// mirror advertises it. This is what lets an apt client that already
+	// fetched this Release keep fetching Packages/Sources by the exact hash
+	// it read here, even if the plain-named path moves on to a newer build
+	// in the meantime (the race behind "File has unexpected size" errors on
+	// a fast-rotating /live view).
+	p.Set("Acquire-By-Hash", "yes")
 
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
 

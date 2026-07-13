@@ -54,6 +54,12 @@ schedule:
   # Omit or set to "0" to disable  -- use `debproxy cleanup` to run manually.
   cleanup: "sunday@04:00"
 
+  # snapshot_debounce is the minimum age the current snapshot must reach
+  # before another one is published, whether triggered by the scheduler
+  # above or by POST /api/v1/snapshot without {"force": true}. Omit for the
+  # built-in default of 5 minutes; set to "0" to disable debouncing entirely.
+  # snapshot_debounce: 5m
+
   # gc_grace is the minimum age a pool/src file must reach before pool/src GC
   # will delete it as unreferenced. This guards against a race between a
   # concurrent cache write and a GC pass building its "keep" set in between
@@ -99,6 +105,21 @@ storage:
   #     zstd: 3
   #     xz: false
 
+  # file_cache is an OPTIONAL in-process LRU cache for pool/src file
+  # downloads (the actual .deb/source-archive bytes clients pull through),
+  # so repeat requests for a popular file don't re-fetch it from the
+  # storage backend every time. Most valuable with storage.backend: s3,
+  # where every miss is a real GetObject call; of little value against the
+  # filesystem backend, which is already local.
+  # file_cache:
+  #   # size bounds total cached bytes. Accepts a plain byte count or a
+  #   # number with a KB/MB/GB (binary, 1024-based) suffix -- e.g. "500MB",
+  #   # "2GB", "1.5GB". A single file larger than 1/10th of this size is
+  #   # never cached (streamed straight through instead), so one huge
+  #   # package can't dominate or evict the whole cache. Omit or set to "0"
+  #   # to disable the cache entirely (the default).
+  #   size: "1GB"
+
 # valkey configures an OPTIONAL shared Valkey/Redis deployment. When enabled,
 # a cluster of debproxy replicas share the pool metadata index instead of
 # each holding it fully in memory, and coordinate upstream fetches so only
@@ -114,6 +135,66 @@ storage:
 #   # key_prefix is prepended to every key debproxy writes, so a single Valkey
 #   # deployment can safely be shared with other applications.
 #   key_prefix: "debproxy:"
+
+# api_job_queue_max bounds the async admin-operation job queue (update,
+# cleanup, rebuild, prime -- see api: below). Omit for the built-in default
+# of 1000, sized for bulk prime submissions (hundreds of packages at once).
+# api_job_queue_max: 1000
+
+# auth and api together configure debproxy's authenticated /api/v1 HTTP
+# surface, letting CI/CD and other automation trigger admin actions in real
+# time instead of only via CLI subcommand or the schedule: settings above.
+# Leave both commented out to disable /api entirely -- every /api/v1 request
+# then 404s (an unconfigured action is indistinguishable from a nonexistent
+# one; see the design doc's request-flow section for why).
+#
+# auth:
+#   # basic maps username -> password hash. Supported formats are
+#   # auto-detected from their prefix: $2a$/$2b$/$2$ (bcrypt), $argon2id$,
+#   # $6$ (sha512crypt), $5$ (sha256crypt). Generate with an operator tool
+#   # (e.g. `htpasswd -B -C 12` for bcrypt, `mkpasswd -m sha-512`) -- this
+#   # config never stores or accepts a plaintext password.
+#   basic:
+#     ci-bot: "$2b$12$replace-with-a-real-bcrypt-hash"
+#   oidc:
+#     # clock_tolerance_seconds/discovery_cooldown_seconds/cache_ttl_seconds/
+#     # cache_max_entries all have built-in defaults (30/30/300/1000); only
+#     # override if you have a specific reason to.
+#     issuers:
+#       # Example: GitHub Actions OIDC, restricted to one repository's
+#       # workflows on its default branch.
+#       - id: github-actions
+#         issuer: https://token.actions.githubusercontent.com
+#         audience: https://api.debproxy.example.com
+#         # algorithms omitted -- resolved from OIDC discovery, filtered
+#         # through the fixed safe ceiling (RS256/384/512, PS256/384/512,
+#         # ES256/384/512, EdDSA; never HS*/none).
+#         username_template: "{repository}"
+#         group_templates: ["{repository_owner}"]
+#         match_claim: repository
+#         allow:
+#           - "your-org/your-repo"
+#
+# api maps resource -> action -> the list of principal globs (Basic
+# usernames and/or OIDC identity/group globs from username_template/
+# group_templates above, matched case-insensitively) allowed to call it.
+# Resource/action pairs not listed here 404 rather than 401/403 -- see above.
+# api:
+#   snapshot:
+#     create: ["ci-bot", "github-actions"]  # POST /api/v1/snapshot
+#     current: ["ci-bot", "github-actions"] # GET  /api/v1/snapshot/current
+#   update:
+#     run: ["admin-*"]                      # POST /api/v1/update
+#   cleanup:
+#     run: ["admin-*"]                      # POST /api/v1/cleanup
+#   rebuild:
+#     run: ["admin-*"]                      # POST /api/v1/rebuild
+#   prime:
+#     run: ["ci-bot", "github-actions"]      # POST /api/v1/prime
+#   publish-key:
+#     run: ["admin-*"]                      # POST /api/v1/publish-key
+#   jobs:
+#     read: ["ci-bot", "github-actions", "admin-*"] # GET /api/v1/jobs/{id}
 
 upstreams:
   # --- Debian ---

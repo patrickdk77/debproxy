@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"path"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,14 +20,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valkey-io/valkey-go"
 
+	"github.com/debproxy/debproxy/internal/api"
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/metadata"
 	"github.com/debproxy/debproxy/internal/metadatafactory"
+	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/rebuild"
+	"github.com/debproxy/debproxy/internal/safego"
 	"github.com/debproxy/debproxy/internal/server"
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
+	"github.com/debproxy/debproxy/internal/storage/filecache"
 	"github.com/debproxy/debproxy/internal/storagefactory"
 	syncerpkg "github.com/debproxy/debproxy/internal/syncer"
 	"github.com/debproxy/debproxy/internal/upstream"
@@ -151,6 +154,13 @@ const (
 	defaultLockRenewInterval = 30 * time.Second
 )
 
+// schedulerLockWait bounds how long the periodic snapshot/cleanup
+// schedulers wait for api.OpLock before skipping this cycle -- short and
+// non-blocking-in-spirit, matching api.snapshotLockWait's own reasoning:
+// these are background ticks, not a request a caller is waiting on, but
+// there's no reason to give up faster than a request would.
+const schedulerLockWait = 5 * time.Second
+
 // Defaults for schedule.metadata_flush; see ScheduleConfig.MetadataFlush.
 // The Valkey default is longer because a Backuper pulls the entire current
 // index on every save rather than just recently-dirty keys.
@@ -199,6 +209,28 @@ func resolveRefreshJitter(cfg *config.Config) time.Duration {
 	if err != nil {
 		slog.Warn("invalid schedule.refresh_jitter, using default", "value", raw, "default", defaultRefreshJitter, "err", err)
 		return defaultRefreshJitter
+	}
+	return d
+}
+
+// Default for schedule.snapshot_debounce; see ScheduleConfig.SnapshotDebounce.
+const defaultSnapshotDebounce = 5 * time.Minute
+
+// resolveSnapshotDebounce resolves schedule.snapshot_debounce. "0" here is a
+// meaningful, distinct value (disable debouncing entirely) rather than
+// "unset".
+func resolveSnapshotDebounce(cfg *config.Config) time.Duration {
+	raw := cfg.Schedule.SnapshotDebounce
+	if raw == "" {
+		return defaultSnapshotDebounce
+	}
+	if raw == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid schedule.snapshot_debounce, using default", "value", raw, "default", defaultSnapshotDebounce, "err", err)
+		return defaultSnapshotDebounce
 	}
 	return d
 }
@@ -360,7 +392,7 @@ func runCleanup(args []string) int {
 		slog.Error("load signing key", "err", err)
 		return 1
 	}
-	maxAge, err := parseDuration(cfg.Schedule.Age)
+	maxAge, err := config.ParseDuration(cfg.Schedule.Age)
 	if err != nil {
 		slog.Error("invalid schedule.age", "value", cfg.Schedule.Age, "err", err)
 		return 1
@@ -378,21 +410,6 @@ func runCleanup(args []string) int {
 	}
 	slog.Info("cleanup complete")
 	return 0
-}
-
-// parseDuration extends time.ParseDuration with "d" suffix support (e.g. "30d" = 720h).
-func parseDuration(s string) (time.Duration, error) {
-	if s == "" || s == "0" {
-		return 0, nil
-	}
-	if strings.HasSuffix(s, "d") {
-		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
-		if err != nil || n < 0 {
-			return 0, fmt.Errorf("invalid duration %q", s)
-		}
-		return time.Duration(n) * 24 * time.Hour, nil
-	}
-	return time.ParseDuration(s)
 }
 
 func runPrime(args []string) int {
@@ -608,7 +625,7 @@ func runServe(args []string) int {
 		slog.Error("invalid schedule.cleanup", "value", cfg.Schedule.Cleanup, "err", err)
 		return 1
 	}
-	if _, err := parseDuration(cfg.Schedule.Age); err != nil {
+	if _, err := config.ParseDuration(cfg.Schedule.Age); err != nil {
 		slog.Error("invalid schedule.age", "value", cfg.Schedule.Age, "err", err)
 		return 1
 	}
@@ -643,8 +660,19 @@ func runServe(args []string) int {
 		vclient:       vclient,
 		vkeys:         valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix},
 	})
-	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched)
-	stopCleaner := startPeriodicCleanup(syncr, cleanupSched, cfg)
+	vkeys := valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix}
+	// oplock serializes debproxy's mutating admin operations -- snapshot,
+	// cleanup, update, rebuild, prime -- against each other, whether
+	// triggered by these periodic schedulers or by the /api surface below,
+	// and (when Valkey is enabled) across every replica. One instance is
+	// shared between both consumers: constructing two separate OpLocks over
+	// the no-Valkey fallback would each get their own, non-communicating
+	// in-process channel, defeating the exclusion entirely.
+	oplock := api.NewOpLock(vclient, vkeys)
+	snapshotDebounce := resolveSnapshotDebounce(cfg)
+
+	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched, oplock, indexCache, snapshotDebounce, vclient)
+	stopCleaner := startPeriodicCleanup(syncr, cleanupSched, cfg, oplock)
 
 	if cfg.MetricsAddr != "" {
 		metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: promhttp.Handler()}
@@ -662,7 +690,58 @@ func runServe(args []string) int {
 		stopLiveValkey = webServer.EnableValkey(context.Background(), vclient, *addr)
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: webServer.Handler()}
+	// If storage.file_cache.size is configured, store is a *filecache.Store
+	// (see storagefactory.New) and needs to purge its "current/" entries
+	// whenever ANOTHER replica publishes a snapshot -- this replica's own
+	// snapshot publishes already self-invalidate via filecache.Store's
+	// WriteFile override, so this subscriber exists purely for that
+	// cross-replica case. A no-op when Valkey is disabled (nothing to
+	// subscribe to) or the file cache is disabled (store doesn't implement
+	// filecache.Purger, so the type assertion below just skips it).
+	stopSnapshotPurgeSubscriber := func() {}
+	if cfg.Valkey.Enabled {
+		if purger, ok := store.(filecache.Purger); ok {
+			subCtx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			safego.Go("snapshot-published subscriber", func() {
+				defer close(done)
+				valkeycache.Subscribe(subCtx, vclient, valkeycache.ChannelSnapshotPublished, func(valkey.PubSubMessage) {
+					safego.Run("snapshot-published purge", func() { purger.PurgePrefix("current/") })
+				})
+			})
+			stopSnapshotPurgeSubscriber = func() { cancel(); <-done }
+		}
+	}
+
+	apiSrv, err := api.New(api.Deps{
+		Config:           cfg,
+		Store:            store,
+		Index:            index,
+		Syncer:           syncr,
+		IndexCache:       indexCache,
+		HTTPClient:       httpClient,
+		Key:              key,
+		OpLock:           oplock,
+		VClient:          vclient,
+		VKeys:            vkeys,
+		Notifier:         notifier,
+		SnapshotDebounce: snapshotDebounce,
+	})
+	if err != nil {
+		slog.Error("api config", "err", err)
+		return 1
+	}
+
+	// /api/ is matched ahead of "/" by net/http's ServeMux (the more specific
+	// pattern wins), so apiSrv.Handler() -- which itself does its own
+	// resource/action/permission routing under /api/v1/... -- sees every
+	// request under /api/, and webServer.Handler() sees everything else,
+	// unchanged from before this feature existed.
+	topMux := http.NewServeMux()
+	topMux.Handle("/api/", apiSrv.Handler())
+	topMux.Handle("/", webServer.Handler())
+
+	srv := &http.Server{Addr: *addr, Handler: topMux}
 	go func() {
 		slog.Info("listening", "addr", *addr, "layouts", len(cfg.ResolvedLayouts))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -685,6 +764,13 @@ func runServe(args []string) int {
 	}
 
 	stopLiveValkey()
+	stopSnapshotPurgeSubscriber()
+	// Stops intake and waits for any in-flight async job to finish; queued
+	// jobs behind it are abandoned but re-triggerable (see operationRunner's
+	// own doc comment) -- called before the scheduler/refresher stops below
+	// since they share apiSrv's operation lock, not because ordering among
+	// them matters for correctness.
+	apiSrv.Close()
 	stopRefresher()
 	stopSnapshotter()
 	stopCleaner()
@@ -817,27 +903,35 @@ func runLayoutRefreshLoop(stop <-chan struct{}, key layoutKey, upstreams []model
 	go func() { <-stop; cancel() }()
 
 	runRefreshLocked := func() {
-		// Every replica's own local timer fires independently, but only one
-		// of them should actually do the work each interval -- claim it
-		// first (see valkeycache.Keys.RefreshClaim). If another replica
-		// already refreshed this layout within the current interval, its
-		// claim is still held and this attempt fails cleanly (no error): skip
-		// entirely rather than redundantly repeating the same upstream
-		// fetches and auto-update pulls. A real error acquiring the claim
-		// (e.g. Valkey unreachable) fails open -- refresh directly rather
-		// than silently skipping a layout because coordination is down.
-		if deps.vclient != nil && deps.interval > 0 {
-			_, claimed, err := valkeycache.AcquireLock(ctx, deps.vclient, deps.vkeys.RefreshClaim(key.os, key.codename), deps.interval)
-			if err != nil {
-				slog.Warn("valkey refresh claim unavailable, refreshing directly", "os", key.os, "codename", key.codename, "err", err)
-			} else if !claimed {
-				slog.Debug("layout already refreshed by another replica this interval, skipping", "os", key.os, "codename", key.codename)
-				return
+		// Wrapped in safego.Run so a panic during one layout's refresh cycle
+		// (upstream fetch/parse, auto-update, metadata save) is logged and
+		// contained to this cycle -- the loop keeps running and retries next
+		// interval -- instead of silently ending this layout's refresh
+		// goroutine forever (or, before safego existed anywhere in this
+		// codebase, crashing the whole process).
+		safego.Run(fmt.Sprintf("layout refresh %s/%s", key.os, key.codename), func() {
+			// Every replica's own local timer fires independently, but only one
+			// of them should actually do the work each interval -- claim it
+			// first (see valkeycache.Keys.RefreshClaim). If another replica
+			// already refreshed this layout within the current interval, its
+			// claim is still held and this attempt fails cleanly (no error): skip
+			// entirely rather than redundantly repeating the same upstream
+			// fetches and auto-update pulls. A real error acquiring the claim
+			// (e.g. Valkey unreachable) fails open -- refresh directly rather
+			// than silently skipping a layout because coordination is down.
+			if deps.vclient != nil && deps.interval > 0 {
+				_, claimed, err := valkeycache.AcquireLock(ctx, deps.vclient, deps.vkeys.RefreshClaim(key.os, key.codename), deps.interval)
+				if err != nil {
+					slog.Warn("valkey refresh claim unavailable, refreshing directly", "os", key.os, "codename", key.codename, "err", err)
+				} else if !claimed {
+					slog.Debug("layout already refreshed by another replica this interval, skipping", "os", key.os, "codename", key.codename)
+					return
+				}
 			}
-		}
-		deps.cache.Lock()
-		defer deps.cache.Unlock()
-		refreshLayoutGroup(ctx, key, upstreams, deps)
+			deps.cache.Lock()
+			defer deps.cache.Unlock()
+			refreshLayoutGroup(ctx, key, upstreams, deps)
+		})
 	}
 
 	runRefreshLocked()
@@ -865,12 +959,14 @@ func runLayoutRefreshLoop(stop <-chan struct{}, key layoutKey, upstreams []model
 		return
 	}
 	saveOnlyLocked := func() {
-		deps.cache.Lock()
-		defer deps.cache.Unlock()
-		if ctx.Err() != nil {
-			return
-		}
-		saveLayoutMetadata(ctx, key, upstreams, deps)
+		safego.Run(fmt.Sprintf("layout metadata save %s/%s", key.os, key.codename), func() {
+			deps.cache.Lock()
+			defer deps.cache.Unlock()
+			if ctx.Err() != nil {
+				return
+			}
+			saveLayoutMetadata(ctx, key, upstreams, deps)
+		})
 	}
 	for {
 		select {
@@ -1055,8 +1151,14 @@ func nextSnapshotAfter(sched snapshotSched, now time.Time) time.Time {
 }
 
 // startPeriodicSnapshot publishes a snapshot on the configured schedule.
-// A no-op if sched is empty (automatic snapshots disabled).
-func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched) func() {
+// A no-op if sched is empty (automatic snapshots disabled). Each tick
+// acquires oplock (the same distributed operation lock the /api surface
+// uses) before publishing, so this scheduler and any concurrent
+// snapshot/cleanup/update/rebuild/prime -- whether running on this replica
+// or, when Valkey is enabled, another one -- never overlap; a busy lock
+// skips this cycle entirely rather than blocking. debounce mirrors the
+// API's non-force snapshot path (see Config.Schedule.SnapshotDebounce).
+func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched, oplock *api.OpLock, indexCache *upstream.IndexCache, debounce time.Duration, vclient valkey.Client) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -1070,15 +1172,44 @@ func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched) func() 
 			slog.Info("next scheduled snapshot", "at", next.Format(time.RFC3339))
 			select {
 			case <-time.After(time.Until(next)):
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-				slog.Info("publishing scheduled snapshot")
-				snapNow := time.Now()
-				if err := syncr.Snapshot(ctx, snapNow); err != nil {
-					slog.Warn("scheduled snapshot failed", "err", err)
-				} else {
-					writeSnapshotName(snapNow.UTC().Format(syncerpkg.SnapshotIDFormat))
-				}
-				cancel()
+				safego.Run("periodic snapshot", func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+					defer cancel()
+					held, err := oplock.Acquire(ctx, api.OperationLockTTL, schedulerLockWait)
+					if err != nil {
+						slog.Warn("scheduled snapshot: acquire operation lock", "err", err)
+						return
+					}
+					if held == nil {
+						slog.Info("scheduled snapshot skipped: an admin operation is already in progress")
+						return
+					}
+					defer held.Release(ctx)
+
+					if debounce > 0 {
+						if age, ok, ageErr := syncr.CurrentSnapshotAge(ctx, time.Now()); ageErr != nil {
+							slog.Warn("scheduled snapshot: check current age", "err", ageErr)
+						} else if ok && age < debounce {
+							slog.Info("scheduled snapshot skipped: within debounce window", "age", age)
+							return
+						}
+					}
+
+					slog.Info("publishing scheduled snapshot")
+					opStart := time.Now()
+					indexCache.Lock()
+					snapNow := time.Now()
+					snapErr := syncr.Snapshot(ctx, snapNow)
+					indexCache.Unlock()
+					metrics.OperationDuration.WithLabelValues(api.ResSnapshot).Observe(time.Since(opStart).Seconds())
+					if snapErr != nil {
+						metrics.OperationFailuresTotal.WithLabelValues(api.ResSnapshot).Inc()
+						slog.Warn("scheduled snapshot failed", "err", snapErr)
+					} else {
+						writeSnapshotName(snapNow.UTC().Format(syncerpkg.SnapshotIDFormat))
+						publishSnapshotPublished(ctx, vclient)
+					}
+				})
 			case <-stop:
 				return
 			}
@@ -1090,8 +1221,29 @@ func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched) func() 
 	}
 }
 
-// startPeriodicCleanup runs snapshot pruning and pool GC on the configured schedule.
-func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *config.Config) func() {
+// publishSnapshotPublished tells every other replica that "current/*" just
+// changed, so each can purge its own storage file cache's "current/"
+// entries (see internal/storage/filecache.Purger and
+// valkeycache.ChannelSnapshotPublished's own doc comment for the full
+// reasoning) -- this replica already self-invalidated the exact paths it
+// just wrote and doesn't need this notice itself. A no-op when vclient is
+// nil (Valkey disabled: single replica, nothing else to notify).
+// Fire-and-forget: a publish error is logged, not propagated, matching
+// every other pub/sub notice in this codebase.
+func publishSnapshotPublished(ctx context.Context, vclient valkey.Client) {
+	if vclient == nil {
+		return
+	}
+	if err := valkeycache.Publish(ctx, vclient, valkeycache.ChannelSnapshotPublished, ""); err != nil {
+		slog.Warn("publish snapshot-published notice", "err", err)
+	}
+}
+
+// startPeriodicCleanup runs snapshot pruning and pool GC on the configured
+// schedule. Each tick acquires oplock first, same reasoning as
+// startPeriodicSnapshot -- cleanup doesn't build the index, so unlike
+// snapshot it doesn't also need indexCache's build lock.
+func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *config.Config, oplock *api.OpLock) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -1105,17 +1257,34 @@ func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *con
 			slog.Info("next scheduled cleanup", "at", next.Format(time.RFC3339))
 			select {
 			case <-time.After(time.Until(next)):
-				maxAge, err := parseDuration(cfg.Schedule.Age)
-				if err != nil {
-					slog.Warn("scheduled cleanup: invalid schedule.age", "err", err)
-					continue
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-				slog.Info("running scheduled cleanup")
-				if err := syncr.Cleanup(ctx, cfg.Schedule.History, maxAge, time.Now()); err != nil {
-					slog.Warn("scheduled cleanup failed", "err", err)
-				}
-				cancel()
+				safego.Run("periodic cleanup", func() {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+					defer cancel()
+					held, err := oplock.Acquire(ctx, api.OperationLockTTL, schedulerLockWait)
+					if err != nil {
+						slog.Warn("scheduled cleanup: acquire operation lock", "err", err)
+						return
+					}
+					if held == nil {
+						slog.Info("scheduled cleanup skipped: an admin operation is already in progress")
+						return
+					}
+					defer held.Release(ctx)
+
+					maxAge, ageErr := config.ParseDuration(cfg.Schedule.Age)
+					if ageErr != nil {
+						slog.Warn("scheduled cleanup: invalid schedule.age", "err", ageErr)
+						return
+					}
+					slog.Info("running scheduled cleanup")
+					opStart := time.Now()
+					err = syncr.Cleanup(ctx, cfg.Schedule.History, maxAge, time.Now())
+					metrics.OperationDuration.WithLabelValues(api.ResCleanup).Observe(time.Since(opStart).Seconds())
+					if err != nil {
+						metrics.OperationFailuresTotal.WithLabelValues(api.ResCleanup).Inc()
+						slog.Warn("scheduled cleanup failed", "err", err)
+					}
+				})
 			case <-stop:
 				return
 			}
@@ -1142,9 +1311,11 @@ func startPeriodicMerge(index metadata.MetadataIndex, interval time.Duration) fu
 			jitter := time.Duration(rand.Intn(601)) * time.Second
 			select {
 			case <-time.After(interval + jitter):
-				if err := index.Refresh(context.Background()); err != nil {
-					slog.Warn("periodic metadata merge", "err", err)
-				}
+				safego.Run("periodic metadata merge", func() {
+					if err := index.Refresh(context.Background()); err != nil {
+						slog.Warn("periodic metadata merge", "err", err)
+					}
+				})
 			case <-stop:
 				return
 			}
@@ -1274,15 +1445,19 @@ func startPeriodicMetadataFlush(index metadata.MetadataIndex, interval time.Dura
 		for {
 			select {
 			case <-t.C:
-				if err := index.Flush(context.Background()); err != nil {
-					slog.Warn("periodic metadata flush", "err", err)
-				}
+				safego.Run("periodic metadata flush", func() {
+					if err := index.Flush(context.Background()); err != nil {
+						slog.Warn("periodic metadata flush", "err", err)
+					}
+				})
 			case <-stop:
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := index.Flush(ctx); err != nil {
-					slog.Warn("final metadata flush", "err", err)
-				}
+				safego.Run("final metadata flush", func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					if err := index.Flush(ctx); err != nil {
+						slog.Warn("final metadata flush", "err", err)
+					}
+				})
 				return
 			}
 		}

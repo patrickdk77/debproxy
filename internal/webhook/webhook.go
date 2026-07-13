@@ -12,24 +12,51 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/debproxy/debproxy/internal/safego"
+)
+
+// EventKindPackage and EventKindJob are the values Event.Kind takes: a newly
+// downloaded .deb file, or an async admin operation (update, cleanup,
+// rebuild, prime) reaching a terminal state. See Def.On.
+const (
+	EventKindPackage = "package"
+	EventKindJob     = "job"
 )
 
 // Def is one webhook endpoint, loaded from config.
 type Def struct {
-	URL         string            `yaml:"url"`
-	ContentType string            `yaml:"content_type"`
+	URL         string `yaml:"url"`
+	ContentType string `yaml:"content_type"`
 	// Headers are sent with every request. Values starting with "$" are
 	// expanded from the environment at startup (e.g. "$GOTIFY_TOKEN").
-	Headers   map[string]string `yaml:"headers"`
-	// Body is a Go text/template rendered for each event. Available fields:
-	// .Package .Version .Arch .OS .Codename .Component .Section .Upstream .PoolPath .Size
-	Body      string   `yaml:"body"`
+	Headers map[string]string `yaml:"headers"`
+	// Body is a Go text/template rendered for each event. Available fields
+	// for a "package" event (see On): .Package .Version .Arch .OS .Codename
+	// .Component .Section .Upstream .PoolPath .Size. Available fields for a
+	// "job" event: .JobID .Operation .Status .Error.
+	Body string `yaml:"body"`
 	// Upstreams restricts firing to the named upstreams. Empty fires for all.
+	// Only meaningful for "package" events; a "job" event has no upstream.
 	Upstreams []string `yaml:"upstreams"`
+	// On restricts which event kinds this hook fires for: "package" and/or
+	// "job" (see EventKindPackage/EventKindJob). Defaults to ["package"]
+	// when omitted, so a config written before "job" events existed keeps
+	// firing only for what it always fired for, rather than suddenly also
+	// receiving job-completion pings with mostly-empty package-shaped
+	// template fields.
+	On []string `yaml:"on"`
 }
 
-// Event describes a newly downloaded .deb file.
+// Event describes either a newly downloaded .deb file (Kind ==
+// EventKindPackage) or an async admin operation's terminal state (Kind ==
+// EventKindJob). An empty Kind is treated as EventKindPackage, so existing
+// callers that construct an Event without setting it (every call site that
+// predates job-completion events) are unaffected.
 type Event struct {
+	Kind string
+
+	// package fields (Kind == EventKindPackage)
 	Package   string
 	Version   string
 	Arch      string
@@ -40,6 +67,12 @@ type Event struct {
 	Upstream  string
 	PoolPath  string
 	Size      int64
+
+	// job fields (Kind == EventKindJob)
+	JobID     string
+	Operation string
+	Status    string
+	Error     string
 }
 
 type compiled struct {
@@ -49,6 +82,7 @@ type compiled struct {
 	tmpl        *template.Template
 	hasBody     bool            // false -> GET with no body; true -> POST with rendered body
 	upstreams   map[string]bool // empty = all
+	on          map[string]bool // which Event.Kind values this hook fires for
 }
 
 // Notifier fires HTTP webhooks when new packages are downloaded.
@@ -88,6 +122,14 @@ func New(defs []Def, client *http.Client) (*Notifier, error) {
 			}
 			headers[k] = v
 		}
+		on := d.On
+		if len(on) == 0 {
+			on = []string{EventKindPackage}
+		}
+		onSet := make(map[string]bool, len(on))
+		for _, k := range on {
+			onSet[k] = true
+		}
 		n.hooks = append(n.hooks, compiled{
 			url:         d.URL,
 			contentType: ct,
@@ -95,6 +137,7 @@ func New(defs []Def, client *http.Client) (*Notifier, error) {
 			tmpl:        tmpl,
 			hasBody:     d.Body != "",
 			upstreams:   upstreams,
+			on:          onSet,
 		})
 	}
 	return n, nil
@@ -106,17 +149,25 @@ func (n *Notifier) Fire(ev Event) {
 	if n == nil || len(n.hooks) == 0 {
 		return
 	}
+	kind := ev.Kind
+	if kind == "" {
+		kind = EventKindPackage
+	}
 	for _, h := range n.hooks {
-		if len(h.upstreams) > 0 && !h.upstreams[ev.Upstream] {
+		if !h.on[kind] {
 			continue
 		}
-		go func(h compiled) {
+		if kind == EventKindPackage && len(h.upstreams) > 0 && !h.upstreams[ev.Upstream] {
+			continue
+		}
+		h := h
+		safego.Go("webhook fire "+h.url, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			if err := send(ctx, n.client, h, ev); err != nil {
 				slog.Warn("webhook", "url", h.url, "package", ev.Package, "err", err)
 			}
-		}(h)
+		})
 	}
 }
 

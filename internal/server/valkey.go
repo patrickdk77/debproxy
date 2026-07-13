@@ -14,6 +14,7 @@ import (
 	"github.com/valkey-io/valkey-go"
 
 	"github.com/debproxy/debproxy/internal/avail"
+	"github.com/debproxy/debproxy/internal/safego"
 	"github.com/debproxy/debproxy/internal/valkeycache"
 )
 
@@ -57,10 +58,17 @@ func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, listenAddr s
 
 	subCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	go func() {
+	safego.Go("live-updated subscriber", func() {
 		defer close(done)
-		valkeycache.Subscribe(subCtx, v, valkeycache.ChannelLiveUpdated, s.handleLiveUpdatedMessage)
-	}()
+		valkeycache.Subscribe(subCtx, v, valkeycache.ChannelLiveUpdated, func(msg valkey.PubSubMessage) {
+			// Wrapped again at the individual-message level, not just around
+			// the whole Subscribe call: a panic while handling one malformed
+			// or unexpected message (e.g. bad JSON from a peer running a
+			// different version) must not tear down the subscription loop
+			// itself, only that one message.
+			safego.Run("live-updated message handler", func() { s.handleLiveUpdatedMessage(msg) })
+		})
+	})
 	return func() {
 		cancel()
 		<-done
@@ -108,17 +116,36 @@ func localPeerAddrs(listenAddr string) []string {
 type liveUpdatedMsg struct {
 	OS       string            `json:"os"`
 	Codename string            `json:"codename"`
-	Addrs    []string          `json:"addrs"`    // publisher's own host:port candidates
+	Addrs    []string          `json:"addrs"` // publisher's own host:port candidates
 	BuiltAt  time.Time         `json:"built_at"`
 	Expiry   time.Time         `json:"expiry"`
 	Hashes   map[string]string `json:"hashes"`
 	Files    []string          `json:"files"` // entry.files map keys, e.g. "dists/noble/main/binary-amd64/Packages.gz"
 }
 
-// handleLiveUpdatedMessage records the notice (for the next buildOrAdoptLiveFiles
-// call to use, see adoptLiveFromPeer) and invalidates this replica's own
-// local liveCache entry for the notified os/codename by marking it
-// immediately expired, so the next request runs the existing
+// liveUpdateInvalidateJitter bounds a random delay between receiving a
+// live-updated notice and actually invalidating this replica's own local
+// liveCache entry for it (see handleLiveUpdatedMessage). A var, not a const,
+// so tests can shrink it to keep runtime fast without touching production
+// behavior.
+//
+// Without this, every replica watching the channel invalidates at the exact
+// same instant, and invalidation is what makes the *next* incoming client
+// request kick off a background fetch from the publisher (see
+// getLive/rebuildLive -> adoptLiveFromPeer) -- so for a popular layout under
+// continuous request traffic, one notice would otherwise turn into every
+// replica hitting the publishing replica's HTTP endpoint for the same files
+// within the same fraction of a second. Spreading invalidation itself out
+// spreads out when each replica's own first post-notice request notices
+// staleness and fetches, without changing anything about the fetch path.
+var liveUpdateInvalidateJitter = 10 * time.Second
+
+// handleLiveUpdatedMessage records the notice immediately (for the next
+// buildOrAdoptLiveFiles call to use, see adoptLiveFromPeer -- cheap
+// bookkeeping, not a network fetch, so it doesn't need jitter) and, after a
+// random delay (see liveUpdateInvalidateJitter), invalidates this replica's
+// own local liveCache entry for the notified os/codename by marking it
+// expired, so the next request after that delay runs the existing
 // stale-serve-then-background-refresh path (getLive/rebuildLive, unchanged)
 // instead of waiting out its own TTL. A notification for an os/codename this
 // replica hasn't served yet is a no-op beyond recording the notice: there is
@@ -138,20 +165,30 @@ func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 		s.valkey.mu.Unlock()
 	}
 
-	s.mu.Lock()
-	if entry, ok := s.liveCache[cacheKey]; ok {
-		expired := *entry
-		expired.expiry = time.Time{}
-		s.liveCache[cacheKey] = &expired
-	}
-	s.mu.Unlock()
+	jitter := valkeycache.RandDuration(liveUpdateInvalidateJitter)
+	safego.Go("live-updated cache invalidation", func() {
+		if jitter > 0 {
+			time.Sleep(jitter)
+		}
+		s.mu.Lock()
+		if entry, ok := s.liveCache[cacheKey]; ok {
+			expired := *entry
+			expired.expiry = time.Time{}
+			s.liveCache[cacheKey] = &expired
+		}
+		s.mu.Unlock()
+	})
 }
 
 // buildOrAdoptLiveFiles returns the compressed serving files for
 // osName/codename, adopting them via a direct HTTP fetch from whichever
 // replica most recently published a still-fresh build for this layout (see
-// adoptLiveFromPeer), or generating them locally and publishing a notice
-// otherwise.
+// adoptLiveFromPeer), or generating them locally otherwise. fresh reports
+// which happened: true if this call generated the files itself (the caller
+// must then swap them in and announce the new generation -- see
+// swapLiveEntry), false if they were adopted from a peer that already did
+// so (announcing again here would just echo the same notice back out,
+// which every other replica would then also re-announce in turn).
 //
 // av is always built locally by the caller regardless of what this function
 // does (see getLive/rebuildLive/startMismatchRetry): av.ByPoolPath is needed
@@ -160,7 +197,7 @@ func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 // replica already refreshed the underlying upstream data -- it becomes
 // cheap local merging. generateLiveFiles' compression is the part that's
 // actually expensive and worth sharing across replicas.
-func (s *Server) buildOrAdoptLiveFiles(ctx context.Context, osName, codename string, av *avail.Available) (files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time, err error) {
+func (s *Server) buildOrAdoptLiveFiles(ctx context.Context, osName, codename string, av *avail.Available) (files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time, fresh bool, err error) {
 	// av.Pkgs/av.Srcs are only ever read below, inside generateLiveFiles (and
 	// not at all when adopting from a peer instead) -- nothing reads them
 	// again for the rest of this liveEntry's lifetime once this function
@@ -177,21 +214,18 @@ func (s *Server) buildOrAdoptLiveFiles(ctx context.Context, osName, codename str
 
 	if s.valkey != nil {
 		if files, hashes, builtAt, expiry, ok := s.adoptLiveFromPeer(ctx, osName, codename); ok {
-			return files, hashes, builtAt, expiry, nil
+			return files, hashes, builtAt, expiry, false, nil
 		}
 	}
 
 	files, hashes, err = s.generateLiveFiles(ctx, av)
 	if err != nil {
-		return nil, nil, time.Time{}, time.Time{}, err
+		return nil, nil, time.Time{}, time.Time{}, false, err
 	}
 	builtAt = time.Now()
 	jitter := valkeycache.RandDuration(liveTTLJitter)
 	expiry = builtAt.Add(liveTTLBase + jitter)
-	if s.valkey != nil {
-		s.publishLiveUpdate(osName, codename, files, hashes, builtAt, expiry)
-	}
-	return files, hashes, builtAt, expiry, nil
+	return files, hashes, builtAt, expiry, true, nil
 }
 
 // adoptLiveFromPeer reports whether another replica has recently published a

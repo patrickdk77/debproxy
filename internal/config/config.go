@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,26 @@ type Config struct {
 	// (e.g. ":9090"). The endpoint is exposed at /metrics on this address.
 	// Leave empty to disable metrics.
 	MetricsAddr string `yaml:"metrics_addr"`
+
+	// Auth configures authentication (Basic + OIDC) for the /api HTTP
+	// surface. See AuthConfig.
+	Auth AuthConfig `yaml:"auth"`
+	// API maps resource -> action -> the list of principal globs (Basic
+	// usernames and/or OIDC identity/group globs, matched case-insensitively
+	// via internal/auth.Match) allowed to call it, e.g.:
+	//   api:
+	//     snapshot:
+	//       create: ["ci-*", "admin"]
+	// A resource/action pair with no entry here (or an empty principal list)
+	// is not just unauthorized but returns 404 -- see internal/api's request
+	// flow doc comment for why. Validated against the fixed resource/action
+	// taxonomy by api.New, not here (see the design doc for why this and
+	// Auth are validated there instead of in (*Config).validate).
+	API map[string]map[string][]string `yaml:"api"`
+	// APIJobQueueMax bounds the async admin-operation job queue (update,
+	// cleanup, rebuild, prime). Defaults to 1000 when zero -- sized for bulk
+	// prime submissions (hundreds of packages at once), not a small cap.
+	APIJobQueueMax int `yaml:"api_job_queue_max"`
 
 	ResolvedLayouts []model.Layout `yaml:"-"`
 }
@@ -114,6 +135,12 @@ type ScheduleConfig struct {
 	// when Valkey is enabled; disabling it (or Valkey data loss before the
 	// first backup) means recovery falls back to `debproxy rebuild`.
 	MetadataFlush string `yaml:"metadata_flush"`
+	// SnapshotDebounce is the minimum age the current snapshot must reach
+	// before another one is published, whether triggered by this same
+	// periodic scheduler or by POST /api/v1/snapshot without
+	// {"force": true}. Accepts a Go duration string (e.g. "5m"). Empty uses
+	// the built-in default of 5 minutes; "0" disables debouncing entirely.
+	SnapshotDebounce string `yaml:"snapshot_debounce"`
 }
 
 // RefreshInterval parses Refresh into a time.Duration. Empty, "0", or an
@@ -131,6 +158,63 @@ func (s ScheduleConfig) RefreshInterval() time.Duration {
 		return 0
 	}
 	return d
+}
+
+// ParseDuration extends time.ParseDuration with a "d" (days) suffix (e.g.
+// "30d" == 720h), matching the convention used by schedule.age and other
+// pruning-related duration settings. Empty or "0" both parse to zero
+// (disabled) -- a meaningful, distinct value from a parse error, which
+// callers should still check for separately since a config typo should not
+// silently behave like "disabled".
+func ParseDuration(s string) (time.Duration, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	if strings.HasSuffix(s, "d") {
+		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
+}
+
+// ParseSize parses a byte-size config value: a bare number (bytes), or a
+// number followed by a case-insensitive "B"/"K"/"KB"/"M"/"MB"/"G"/"GB"
+// suffix, using binary (1024-based) multipliers -- the conventional meaning
+// for a cache/memory size (as opposed to "d" in ParseDuration, which is
+// unambiguous). A fractional number is accepted (e.g. "1.5GB"). Empty or
+// "0" both parse to 0 (disabled), a meaningful, distinct value from a parse
+// error -- callers should still check for a parse error separately, since a
+// config typo should not silently behave like "disabled".
+func ParseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	upper := strings.ToUpper(s)
+	mult := int64(1)
+	numPart := upper
+	switch {
+	case strings.HasSuffix(upper, "GB"), strings.HasSuffix(upper, "G"):
+		mult = 1 << 30
+		numPart = strings.TrimSuffix(strings.TrimSuffix(upper, "B"), "G")
+	case strings.HasSuffix(upper, "MB"), strings.HasSuffix(upper, "M"):
+		mult = 1 << 20
+		numPart = strings.TrimSuffix(strings.TrimSuffix(upper, "B"), "M")
+	case strings.HasSuffix(upper, "KB"), strings.HasSuffix(upper, "K"):
+		mult = 1 << 10
+		numPart = strings.TrimSuffix(strings.TrimSuffix(upper, "B"), "K")
+	case strings.HasSuffix(upper, "B"):
+		numPart = strings.TrimSuffix(upper, "B")
+	}
+	numPart = strings.TrimSpace(numPart)
+	n, err := strconv.ParseFloat(numPart, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return int64(n * float64(mult)), nil
 }
 
 // CompressionLevel is a YAML-compatible compression setting.
@@ -252,6 +336,21 @@ type StorageConfig struct {
 	Filesystem  FilesystemConfig  `yaml:"filesystem"`
 	S3          S3Config          `yaml:"s3"`
 	Compression CompressionConfig `yaml:"compression"`
+	FileCache   FileCacheConfig   `yaml:"file_cache"`
+}
+
+// FileCacheConfig configures an optional in-process LRU cache for pool/src
+// file downloads -- the actual .deb/source-archive bytes clients pull
+// through -- so repeat requests for a popular file don't re-fetch it from
+// the storage backend every time. Most impactful for the S3 backend, where
+// every miss is a real GetObject call; harmless but of little value against
+// the filesystem backend, which is already local.
+type FileCacheConfig struct {
+	// Size bounds total cached bytes. Accepts a plain byte count or a
+	// number with a KB/MB/GB (binary, 1024-based) suffix, e.g. "500MB",
+	// "2GB", "1.5GB" (see ParseSize). Empty or "0" disables the cache
+	// entirely -- the default.
+	Size string `yaml:"size"`
 }
 
 type FilesystemConfig struct {
