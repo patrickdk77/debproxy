@@ -96,7 +96,10 @@ func (s *Store) ListEntries(ctx context.Context, sel model.Selector) ([]model.In
 
 	var out []model.IndexEntry
 	for _, b := range buckets {
-		members, err := s.v.Do(ctx, s.v.B().Smembers().Key(s.keys.PkgBucket(b.os, b.codename, b.component, b.arch)).Build()).AsStrSlice()
+		// ScanSetMembers (SSCAN), not SMEMBERS: some buckets (e.g. Ubuntu's
+		// "universe" component) run to tens of thousands of members, and a
+		// single SMEMBERS reply for one of those is itself sizable.
+		members, err := valkeycache.ScanSetMembers(ctx, s.v, s.keys.PkgBucket(b.os, b.codename, b.component, b.arch))
 		if err != nil {
 			return nil, fmt.Errorf("list pkg bucket: %w", err)
 		}
@@ -114,10 +117,14 @@ func (s *Store) ListEntries(ctx context.Context, sel model.Selector) ([]model.In
 		if len(entryKeys) == 0 {
 			continue
 		}
-		// MGetJSONStrict: a missing entry (vanished between SMEMBERS and MGET,
-		// e.g. concurrent GC) is skipped, but a value that exists and fails to
-		// decode fails the whole list -- that's real corruption, not a race.
-		entries, err := valkeycache.MGetJSONStrict[model.IndexEntry](ctx, s.v, entryKeys)
+		// MGetJSONStrictBatched: chunked so no single MGET reply is ever
+		// unbounded by the bucket's size (the same tens-of-thousands-of-
+		// members buckets noted above would otherwise produce one
+		// multi-hundred-MB reply). A missing entry (vanished between the
+		// SSCAN and its MGET, e.g. concurrent GC) is skipped, but a value
+		// that exists and fails to decode fails the whole list -- that's
+		// real corruption, not a race.
+		entries, err := valkeycache.MGetJSONStrictBatched[model.IndexEntry](ctx, s.v, entryKeys)
 		if err != nil {
 			return nil, fmt.Errorf("mget pkg entries: %w", err)
 		}

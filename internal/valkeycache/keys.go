@@ -20,9 +20,27 @@ func (k Keys) UpstreamMeta(upstream, suite, component string) string {
 	return k.Prefix + "up:" + k.upstreamTag(upstream, suite, component) + ":meta"
 }
 
-// UpstreamPkgs holds the JSON-encoded parsed apt.RawPkg list for one arch.
-func (k Keys) UpstreamPkgs(upstream, suite, component, arch string) string {
-	return k.Prefix + "up:" + k.upstreamTag(upstream, suite, component) + ":pkgs:" + arch
+func (k Keys) upstreamPkgTag(upstream, suite, component, arch string) string {
+	return "{" + upstream + ":" + suite + ":" + component + ":" + arch + "}"
+}
+
+// UpstreamPkgEntry is the JSON-encoded apt.RawPkg for one package+version
+// parsed from upstream+suite+component+arch's Packages file. Per-entry
+// (rather than one blob per arch) so a PDiff-driven update writes only the
+// handful of packages that actually changed, and so no single read/write
+// ever has to move an entire arch's data (some buckets, e.g. Ubuntu's
+// "universe" component, run to tens of thousands of packages and multiple
+// hundred MB as one value) in a single request.
+func (k Keys) UpstreamPkgEntry(upstream, suite, component, arch, pkg, version string) string {
+	return k.Prefix + "up-pkg:" + k.upstreamPkgTag(upstream, suite, component, arch) + ":" + pkg + ":" + version
+}
+
+// UpstreamPkgBucket is the SET of "{package}:{version}" members present in
+// upstream+suite+component+arch's most recently fetched Packages file,
+// mirroring valkeystore's PkgBucket. Walked via SSCAN (never SMEMBERS) so
+// enumerating it is also never one unbounded reply.
+func (k Keys) UpstreamPkgBucket(upstream, suite, component, arch string) string {
+	return k.Prefix + "up-pkgs:" + k.upstreamPkgTag(upstream, suite, component, arch)
 }
 
 // UpstreamSrcs holds the JSON-encoded parsed apt.RawSrc list.
@@ -98,22 +116,6 @@ func (k Keys) BucketsUpstate() string { return k.Prefix + "buckets:upstate" }
 // PkgByDigest is the point-lookup index backing EntryByDigest.
 func (k Keys) PkgByDigest(sha256 string) string {
 	return k.Prefix + "pkg-by-digest:" + sha256
-}
-
-func (k Keys) liveTag(os, codename string) string {
-	return "{" + os + ":" + codename + "}"
-}
-
-// LiveMeta is the HASH of built_at/expiry/hashes_json for one os/codename's
-// /live serving artifacts, mirroring server.liveEntry.
-func (k Keys) LiveMeta(os, codename string) string {
-	return k.Prefix + "live:" + k.liveTag(os, codename) + ":meta"
-}
-
-// LiveFile is one compressed serving artifact's raw bytes, keyed by its
-// relative path within the layout (e.g. "main/binary-amd64/Packages.gz").
-func (k Keys) LiveFile(os, codename, relpath string) string {
-	return k.Prefix + "live:" + k.liveTag(os, codename) + ":files:" + relpath
 }
 
 // RefreshClaim is the SET NX PX claim key one replica holds for the duration

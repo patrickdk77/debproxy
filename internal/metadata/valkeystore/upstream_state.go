@@ -51,7 +51,11 @@ func splitUpstateMember(m string) (upstream, pkg, arch string, ok bool) {
 // metadata.MetadataIndex interface since no other caller needs a bulk
 // listing today.
 func (s *Store) ListUpstreamStates(ctx context.Context, upstreams []string) ([]model.UpstreamPackageState, error) {
-	members, err := s.v.Do(ctx, s.v.B().Smembers().Key(s.keys.BucketsUpstate()).Build()).AsStrSlice()
+	// ScanSetMembers (SSCAN): unlike BucketsIndex/BucketsSrc (bounded by the
+	// number of os/codename/component/arch combinations), BucketsUpstate
+	// scales with the total package count across every tracked upstream, so
+	// it can be just as large as any single pkg/src bucket.
+	members, err := valkeycache.ScanSetMembers(ctx, s.v, s.keys.BucketsUpstate())
 	if err != nil {
 		return nil, fmt.Errorf("list upstream state buckets: %w", err)
 	}
@@ -82,7 +86,7 @@ func (s *Store) ListUpstreamStates(ctx context.Context, upstreams []string) ([]m
 		return nil, nil
 	}
 
-	states, err := valkeycache.MGetJSONStrict[model.UpstreamPackageState](ctx, s.v, stateKeys)
+	states, err := valkeycache.MGetJSONStrictBatched[model.UpstreamPackageState](ctx, s.v, stateKeys)
 	if err != nil {
 		return nil, fmt.Errorf("mget upstream states: %w", err)
 	}

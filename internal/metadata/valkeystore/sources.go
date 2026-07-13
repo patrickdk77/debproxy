@@ -76,7 +76,11 @@ func (s *Store) ListSourceEntries(ctx context.Context, sel model.Selector) ([]mo
 
 	var out []model.SourceEntry
 	for _, b := range buckets {
-		members, err := s.v.Do(ctx, s.v.B().Smembers().Key(s.keys.SrcBucket(b.os, b.codename, b.component)).Build()).AsStrSlice()
+		// ScanSetMembers (SSCAN) + MGetJSONStrictBatched below: see the
+		// identical reasoning in entries.go's ListEntries -- a large source
+		// component's bucket can still run large enough that SMEMBERS/a
+		// single MGET would be unbounded.
+		members, err := valkeycache.ScanSetMembers(ctx, s.v, s.keys.SrcBucket(b.os, b.codename, b.component))
 		if err != nil {
 			return nil, fmt.Errorf("list src bucket: %w", err)
 		}
@@ -94,7 +98,7 @@ func (s *Store) ListSourceEntries(ctx context.Context, sel model.Selector) ([]mo
 		if len(entryKeys) == 0 {
 			continue
 		}
-		entries, err := valkeycache.MGetJSONStrict[model.SourceEntry](ctx, s.v, entryKeys)
+		entries, err := valkeycache.MGetJSONStrictBatched[model.SourceEntry](ctx, s.v, entryKeys)
 		if err != nil {
 			return nil, fmt.Errorf("mget src entries: %w", err)
 		}

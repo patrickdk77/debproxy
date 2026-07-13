@@ -11,13 +11,40 @@ func TestKeysUpstreamGroupSharesHashTag(t *testing.T) {
 
 	for name, got := range map[string]string{
 		"meta":       k.UpstreamMeta("ubuntu-main", "noble", "main"),
-		"pkgs":       k.UpstreamPkgs("ubuntu-main", "noble", "main", "amd64"),
 		"srcs":       k.UpstreamSrcs("ubuntu-main", "noble", "main"),
 		"fetch_lock": k.FetchLock("ubuntu-main", "noble", "main"),
 	} {
 		if !strings.Contains(got, tag) {
 			t.Errorf("%s key %q missing expected hash tag %q", name, got, tag)
 		}
+	}
+}
+
+// TestKeysUpstreamPkgGroupSharesHashTag covers UpstreamPkgEntry/UpstreamPkgBucket,
+// which are scoped per-arch (upstream:suite:component:arch) rather than
+// sharing UpstreamMeta's per-upstream:suite:component tag above -- each
+// arch's package data is read/written independently (SSCAN/MGET/MSET/SADD/
+// SREM/DEL never span more than one arch in a single command), so there's no
+// need to force every arch plus meta onto one Cluster slot.
+func TestKeysUpstreamPkgGroupSharesHashTag(t *testing.T) {
+	k := Keys{Prefix: "debproxy:"}
+	tag := "{ubuntu-main:noble:main:amd64}"
+
+	entry := k.UpstreamPkgEntry("ubuntu-main", "noble", "main", "amd64", "curl", "8.0-1")
+	bucket := k.UpstreamPkgBucket("ubuntu-main", "noble", "main", "amd64")
+
+	for name, got := range map[string]string{"entry": entry, "bucket": bucket} {
+		if !strings.Contains(got, tag) {
+			t.Errorf("%s key %q missing expected hash tag %q", name, got, tag)
+		}
+	}
+	if entry == bucket {
+		t.Fatalf("upstream pkg keys must be distinct: entry=%q bucket=%q", entry, bucket)
+	}
+
+	other := k.UpstreamPkgBucket("ubuntu-main", "noble", "main", "arm64")
+	if bucket == other {
+		t.Fatalf("expected different arches to produce different buckets, both got %q", bucket)
 	}
 }
 
@@ -54,20 +81,6 @@ func TestKeysSrcGroupSharesHashTag(t *testing.T) {
 	}
 }
 
-func TestKeysLiveGroupSharesHashTag(t *testing.T) {
-	k := Keys{}
-	tag := "{debian:trixie}"
-
-	meta := k.LiveMeta("debian", "trixie")
-	file := k.LiveFile("debian", "trixie", "main/binary-amd64/Packages.gz")
-
-	if !strings.Contains(meta, tag) {
-		t.Errorf("meta key %q missing expected hash tag %q", meta, tag)
-	}
-	if !strings.Contains(file, tag) {
-		t.Errorf("file key %q missing expected hash tag %q", file, tag)
-	}
-}
 
 func TestKeysDifferentBucketsProduceDifferentTags(t *testing.T) {
 	k := Keys{}

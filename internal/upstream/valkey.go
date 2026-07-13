@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -82,8 +83,9 @@ func (c *IndexCache) MarkLayoutDataFresh(ctx context.Context, os, codename strin
 
 // valkeyPayload is the JSON-serializable mirror of indexCacheEntry's
 // Release-side fields, stored at Keys.UpstreamMeta. archPkgs and srcs are
-// stored under their own separate keys (Keys.UpstreamPkgs / Keys.UpstreamSrcs)
-// since they're considerably larger and aren't always both needed at once.
+// stored under their own separate keys (Keys.UpstreamPkgEntry/UpstreamPkgBucket
+// / Keys.UpstreamSrcs) since they're considerably larger and aren't always
+// both needed at once.
 type valkeyPayload struct {
 	ETag    string
 	LastMod string
@@ -227,37 +229,76 @@ func (b *valkeyBacking) getMeta(ctx context.Context, upstream, suite, component 
 	return meta, true
 }
 
-// fetchArchPkgs MGETs archs' Packages data for upstream+suite+component.
-// Missing archs are simply absent from the result. Returns nil if archs is
-// empty or the MGET itself fails (logged; callers treat nil as "no per-arch
-// data available," same as a cache miss).
+// fetchArchPkgs reads archs' Packages data for upstream+suite+component from
+// Valkey. Missing archs are simply absent from the result. Each arch's
+// bucket is walked via SSCAN and its entries read via chunked MGET (see
+// bucket.go), so no single reply is ever unbounded by the arch's total
+// package count -- some buckets (e.g. Ubuntu's "universe" component) run to
+// tens of thousands of packages, which is exactly what used to produce a
+// multi-hundred-MB single MGET reply here.
 func (b *valkeyBacking) fetchArchPkgs(ctx context.Context, upstream, suite, component string, archs []string) map[string][]apt.RawPkg {
 	if len(archs) == 0 {
 		return nil
 	}
-	pkgKeys := make([]string, len(archs))
-	for i, arch := range archs {
-		pkgKeys[i] = b.keys.UpstreamPkgs(upstream, suite, component, arch)
-	}
-	vals, err := b.client.Do(ctx, b.client.B().Mget().Key(pkgKeys...).Build()).ToArray()
-	if err != nil {
-		slog.Warn("valkey: mget upstream pkgs failed", "upstream", upstream, "err", err)
-		return nil
-	}
 	archPkgs := make(map[string][]apt.RawPkg, len(archs))
-	for i, v := range vals {
-		str, err := v.ToString()
+	for _, arch := range archs {
+		pkgs, err := b.fetchOneArchPkgs(ctx, upstream, suite, component, arch)
 		if err != nil {
+			slog.Warn("valkey: read upstream pkgs failed", "upstream", upstream, "arch", arch, "err", err)
 			continue // this arch not cached in valkey; leave it absent
 		}
-		var pkgs []apt.RawPkg
-		if err := json.Unmarshal([]byte(str), &pkgs); err != nil {
-			slog.Warn("valkey: decode upstream pkgs failed", "upstream", upstream, "arch", archs[i], "err", err)
-			continue
+		if pkgs != nil {
+			archPkgs[arch] = pkgs
 		}
-		archPkgs[archs[i]] = pkgs
 	}
 	return archPkgs
+}
+
+// fetchOneArchPkgs reads one arch's bucket in full, via a paginated SSCAN of
+// its membership followed by chunked MGETs of the entries. Returns (nil, nil)
+// if the bucket is empty/uncached -- distinct from a real error, both of
+// which callers treat as "no cached data for this arch."
+func (b *valkeyBacking) fetchOneArchPkgs(ctx context.Context, upstream, suite, component, arch string) ([]apt.RawPkg, error) {
+	bucket := b.keys.UpstreamPkgBucket(upstream, suite, component, arch)
+	members, err := scanBucketMembers(ctx, b.client, bucket)
+	if err != nil {
+		return nil, fmt.Errorf("scan bucket: %w", err)
+	}
+	if len(members) == 0 {
+		return nil, nil
+	}
+
+	pkgs := make([]apt.RawPkg, 0, len(members))
+	for i := 0; i < len(members); i += upstreamPkgBatchSize {
+		batch := members[i:min(i+upstreamPkgBatchSize, len(members))]
+		entryKeys := make([]string, 0, len(batch))
+		for _, m := range batch {
+			pkg, version, ok := splitUpstreamPkgMember(m)
+			if !ok {
+				continue
+			}
+			entryKeys = append(entryKeys, b.keys.UpstreamPkgEntry(upstream, suite, component, arch, pkg, version))
+		}
+		if len(entryKeys) == 0 {
+			continue
+		}
+		vals, err := b.client.Do(ctx, b.client.B().Mget().Key(entryKeys...).Build()).ToArray()
+		if err != nil {
+			return nil, fmt.Errorf("mget pkg entries: %w", err)
+		}
+		for _, v := range vals {
+			str, err := v.ToString()
+			if err != nil {
+				continue // entry vanished between SSCAN and MGET (e.g. concurrent write); skip
+			}
+			var pkg apt.RawPkg
+			if err := json.Unmarshal([]byte(str), &pkg); err != nil {
+				return nil, fmt.Errorf("decode pkg entry: %w", err)
+			}
+			pkgs = append(pkgs, pkg)
+		}
+	}
+	return pkgs, nil
 }
 
 // fetchSrcs reads upstream+suite+component's Sources data from Valkey.
@@ -290,10 +331,99 @@ func (c *IndexCache) publishToValkey(ctx context.Context, upstream, suite, compo
 	}
 
 	for arch, pkgs := range entry.archPkgs {
-		if err := valkeycache.SetJSON(ctx, b.client, b.keys.UpstreamPkgs(upstream, suite, component, arch), pkgs); err != nil {
+		if err := b.publishArchPkgs(ctx, upstream, suite, component, arch, pkgs); err != nil {
 			slog.Warn("valkey: write upstream pkgs failed", "upstream", upstream, "arch", arch, "err", err)
 		}
 	}
+}
+
+// publishArchPkgs writes pkgs for upstream+suite+component+arch as a delta
+// against whatever's currently in the bucket: only new/changed
+// package+version entries are written and only stale ones removed, so a
+// PDiff-driven update -- which typically changes a handful of packages out
+// of tens of thousands -- never rewrites the whole arch. This is the write
+// side of the same problem fetchOneArchPkgs's read side solves: the old
+// one-blob-per-arch scheme meant every publish, even one triggered by a tiny
+// PDiff, rewrote the complete arch as a single value.
+func (b *valkeyBacking) publishArchPkgs(ctx context.Context, upstream, suite, component, arch string, pkgs []apt.RawPkg) error {
+	bucket := b.keys.UpstreamPkgBucket(upstream, suite, component, arch)
+
+	current, err := scanBucketMembers(ctx, b.client, bucket)
+	if err != nil {
+		return fmt.Errorf("scan current bucket: %w", err)
+	}
+	currentSet := make(map[string]bool, len(current))
+	for _, m := range current {
+		currentSet[m] = true
+	}
+
+	newSet := make(map[string]bool, len(pkgs))
+	byMember := make(map[string]apt.RawPkg, len(pkgs))
+	for _, pkg := range pkgs {
+		m := upstreamPkgMember(pkg.Package, pkg.Version)
+		newSet[m] = true
+		byMember[m] = pkg
+	}
+
+	var toAdd, toRemove []string
+	for m := range newSet {
+		if !currentSet[m] {
+			toAdd = append(toAdd, m)
+		}
+	}
+	for m := range currentSet {
+		if !newSet[m] {
+			toRemove = append(toRemove, m)
+		}
+	}
+
+	for i := 0; i < len(toAdd); i += upstreamPkgBatchSize {
+		batch := toAdd[i:min(i+upstreamPkgBatchSize, len(toAdd))]
+		mset := b.client.B().Mset().KeyValue()
+		n := 0
+		for _, m := range batch {
+			pkg, version, ok := splitUpstreamPkgMember(m)
+			if !ok {
+				continue
+			}
+			data, err := json.Marshal(byMember[m])
+			if err != nil {
+				return fmt.Errorf("encode pkg entry: %w", err)
+			}
+			mset = mset.KeyValue(b.keys.UpstreamPkgEntry(upstream, suite, component, arch, pkg, version), string(data))
+			n++
+		}
+		if n > 0 {
+			if err := b.client.Do(ctx, mset.Build()).Error(); err != nil {
+				return fmt.Errorf("mset pkg entries: %w", err)
+			}
+		}
+		if err := b.client.Do(ctx, b.client.B().Sadd().Key(bucket).Member(batch...).Build()).Error(); err != nil {
+			return fmt.Errorf("sadd bucket members: %w", err)
+		}
+	}
+
+	for i := 0; i < len(toRemove); i += upstreamPkgBatchSize {
+		batch := toRemove[i:min(i+upstreamPkgBatchSize, len(toRemove))]
+		if err := b.client.Do(ctx, b.client.B().Srem().Key(bucket).Member(batch...).Build()).Error(); err != nil {
+			return fmt.Errorf("srem bucket members: %w", err)
+		}
+		entryKeys := make([]string, 0, len(batch))
+		for _, m := range batch {
+			pkg, version, ok := splitUpstreamPkgMember(m)
+			if !ok {
+				continue
+			}
+			entryKeys = append(entryKeys, b.keys.UpstreamPkgEntry(upstream, suite, component, arch, pkg, version))
+		}
+		if len(entryKeys) > 0 {
+			if err := b.client.Do(ctx, b.client.B().Del().Key(entryKeys...).Build()).Error(); err != nil {
+				return fmt.Errorf("del stale pkg entries: %w", err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // publishSrcsToValkey writes srcs through to Valkey. Kept separate from

@@ -21,21 +21,18 @@ import (
 	"github.com/debproxy/debproxy/internal/valkeycache"
 )
 
-// testValkeyAddr is set by TestMain once the shared container is up.
-var testValkeyAddr string
-
 // TestMain starts one real Valkey container for the whole test binary run
 // (see testsupport.StartValkey for why a real server rather than a mock --
 // these tests in particular rely on real lock/expiry semantics).
 func TestMain(m *testing.M) {
-	testsupport.RunMain(m, &testValkeyAddr)
+	testsupport.RunMain(m, &upstream.TestValkeyAddr)
 }
 
 // newRawTestClient returns a fresh Valkey client connected to the shared test
 // container, and registers a cleanup that flushes the database and closes
 // the connection.
 func newRawTestClient(t *testing.T) valkey.Client {
-	return testsupport.NewTestClient(t, testValkeyAddr)
+	return testsupport.NewTestClient(t, upstream.TestValkeyAddr)
 }
 
 // countingProxy wraps srvURL in an httptest.Server that forwards every

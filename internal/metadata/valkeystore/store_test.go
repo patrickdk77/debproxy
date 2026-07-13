@@ -2,6 +2,7 @@ package valkeystore_test
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -40,6 +41,40 @@ func TestUpsertAndList(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Package != "apt" {
 		t.Fatalf("expected 1 apt entry, got %v", entries)
+	}
+}
+
+// TestListEntriesAcrossBucketBatches is the regression test for the
+// chunked-read fix: a bucket with more members than a single SSCAN/MGET
+// batch (valkeycache.ScanSetMemberCount / MGetBatchSize) must still list
+// every entry correctly, with none dropped or duplicated at a batch
+// boundary. Mirrors the equivalent internal/upstream test for the same
+// underlying pattern.
+func TestListEntriesAcrossBucketBatches(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	const n = 1000 + 250 // spans two SSCAN/MGET batches, second partial
+	for i := 0; i < n; i++ {
+		if err := s.UpsertEntry(ctx, entry("apt", strconv.Itoa(i)+".0", "amd64")); err != nil {
+			t.Fatalf("UpsertEntry %d: %v", i, err)
+		}
+	}
+
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != n {
+		t.Fatalf("ListEntries returned %d entries, want %d", len(entries), n)
+	}
+	seen := make(map[string]bool, n)
+	for _, e := range entries {
+		key := e.Package + ":" + e.Version
+		if seen[key] {
+			t.Fatalf("duplicate entry %s in result", key)
+		}
+		seen[key] = true
 	}
 }
 

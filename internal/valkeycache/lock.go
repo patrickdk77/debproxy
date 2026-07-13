@@ -51,7 +51,9 @@ func AcquireLock(ctx context.Context, v valkey.Client, key string, ttl time.Dura
 	if err != nil {
 		return nil, false, fmt.Errorf("generate lock token: %w", err)
 	}
-	err = v.Do(ctx, v.B().Set().Key(key).Value(token).Nx().Px(ttl).Build()).Error()
+	err = withRetry(ctx, func() error {
+		return v.Do(ctx, v.B().Set().Key(key).Value(token).Nx().Px(ttl).Build()).Error()
+	})
 	if err != nil {
 		if valkey.IsValkeyNil(err) {
 			return nil, false, nil
@@ -70,8 +72,12 @@ func (l *Lock) Renew(ctx context.Context, ttl time.Duration) (ok bool, err error
 	if millis <= 0 {
 		millis = 1
 	}
-	resp := renewLockScript.Exec(ctx, l.v, []string{l.key}, []string{l.token, strconv.FormatInt(millis, 10)})
-	n, err := resp.AsInt64()
+	var n int64
+	err = withRetry(ctx, func() error {
+		var e error
+		n, e = renewLockScript.Exec(ctx, l.v, []string{l.key}, []string{l.token, strconv.FormatInt(millis, 10)}).AsInt64()
+		return e
+	})
 	if err != nil {
 		return false, fmt.Errorf("renew lock %s: %w", l.key, err)
 	}
@@ -81,8 +87,11 @@ func (l *Lock) Renew(ctx context.Context, ttl time.Duration) (ok bool, err error
 // Release drops the lock, but only if this Lock still holds it. Safe to call
 // even if the lock already expired or was taken over by another replica.
 func (l *Lock) Release(ctx context.Context) error {
-	resp := releaseLockScript.Exec(ctx, l.v, []string{l.key}, []string{l.token})
-	if _, err := resp.AsInt64(); err != nil {
+	err := withRetry(ctx, func() error {
+		_, e := releaseLockScript.Exec(ctx, l.v, []string{l.key}, []string{l.token}).AsInt64()
+		return e
+	})
+	if err != nil {
 		return fmt.Errorf("release lock %s: %w", l.key, err)
 	}
 	return nil

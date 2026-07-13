@@ -3,7 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/valkey-io/valkey-go"
@@ -13,20 +18,42 @@ import (
 )
 
 // serverValkeyBacking holds the optional shared-cache wiring for a Server's
-// /live serving artifacts.
+// /live serving artifacts. Only a small pub/sub notice ever goes through
+// Valkey (metadata plus the publisher's own reachable addresses) -- the
+// compressed file bytes themselves are fetched peer-to-peer over plain HTTP
+// directly from whichever replica published them, never written through
+// Valkey. This matters because a whole layout's compressed indexes can run
+// to hundreds of MB: writing/reading that as a single Valkey value used to
+// risk overflowing the pubsub-classified connection's output buffer limit
+// (see the design doc's incident writeup), a risk that disappears entirely
+// once Valkey never carries file content at all.
 type serverValkeyBacking struct {
-	client valkey.Client
-	keys   valkeycache.Keys
+	client    valkey.Client
+	peerAddrs []string     // this replica's own "host:port" candidates, advertised in its own notices
+	peerHTTP  *http.Client // short-timeout client used for peer-to-peer fetches
+
+	mu      sync.Mutex
+	notices map[string]liveUpdatedMsg // key: os/codename -> most recently received notice
 }
 
-// EnableValkey wires v into s so /live's compressed serving artifacts are
-// shared with other debproxy replicas instead of each independently
-// compressing its own copy, and starts a background subscriber that
-// invalidates the local liveCache entry early when another replica
-// publishes a fresher one. Call once at startup; the returned stop func
-// must be called on graceful shutdown to stop that subscriber goroutine.
-func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, keys valkeycache.Keys) (stop func()) {
-	s.valkey = &serverValkeyBacking{client: v, keys: keys}
+// EnableValkey wires v into s so /live build completions are announced to
+// other debproxy replicas (letting them fetch the result directly from this
+// replica instead of independently recompressing their own copy), and starts
+// a background subscriber that does the same when another replica publishes
+// first. listenAddr is this process's own --addr (e.g. ":8080"); its port,
+// combined with every non-loopback local interface address, forms the
+// peerAddrs this replica advertises in its own notices -- other replicas may
+// listen on a different port than this one, so each replica must always
+// advertise its own, never assume a shared value. Call once at startup; the
+// returned stop func must be called on graceful shutdown to stop the
+// subscriber goroutine.
+func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, listenAddr string) (stop func()) {
+	s.valkey = &serverValkeyBacking{
+		client:    v,
+		peerAddrs: localPeerAddrs(listenAddr),
+		peerHTTP:  &http.Client{Timeout: 10 * time.Second},
+		notices:   map[string]liveUpdatedMsg{},
+	}
 
 	subCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -40,19 +67,63 @@ func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, keys valkeyc
 	}
 }
 
-// liveUpdatedMsg is the pub/sub payload for events:live-updated.
-type liveUpdatedMsg struct {
-	OS       string `json:"os"`
-	Codename string `json:"codename"`
+// localPeerAddrs returns "host:port" candidates other replicas might reach
+// this process at: every non-loopback, non-link-local unicast address found
+// on any local network interface, combined with listenAddr's own port. No
+// assumption is made about the runtime environment (Kubernetes pod IP,
+// Docker bridge IP, bare metal, ...) -- every address this process could
+// plausibly be dialed at is advertised, and a consuming replica simply tries
+// each in turn (see fetchLiveFiles) until one connects or all fail.
+func localPeerAddrs(listenAddr string) []string {
+	_, portStr, err := net.SplitHostPort(listenAddr)
+	if err != nil || portStr == "" || portStr == "0" {
+		slog.Warn("valkey: could not determine own listen port for peer-fetch advertising", "listen_addr", listenAddr)
+		return nil
+	}
+	ifaceAddrs, err := net.InterfaceAddrs()
+	if err != nil {
+		slog.Warn("valkey: enumerating local addresses for peer fetch failed", "err", err)
+		return nil
+	}
+	var out []string
+	for _, a := range ifaceAddrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			continue
+		}
+		out = append(out, net.JoinHostPort(ip.String(), portStr))
+	}
+	return out
 }
 
-// handleLiveUpdatedMessage invalidates the local liveCache entry for the
-// notified os/codename by marking it immediately expired, so the next
-// request runs the existing stale-serve-then-background-refresh path
-// (getLive/rebuildLive, unchanged) instead of waiting out its own TTL. A
-// notification for an os/codename this replica hasn't served yet is a
-// no-op: there is no local entry to invalidate, and the next real request
-// does a cold-start build, which already checks Valkey first.
+// liveUpdatedMsg is the pub/sub payload for events:live-updated. It carries
+// everything a receiving replica needs to adopt the just-published live
+// artifacts by fetching them directly from the publisher over HTTP -- see
+// the package doc comment on serverValkeyBacking for why only this small
+// notice, never file content, ever goes through Valkey.
+type liveUpdatedMsg struct {
+	OS       string            `json:"os"`
+	Codename string            `json:"codename"`
+	Addrs    []string          `json:"addrs"`    // publisher's own host:port candidates
+	BuiltAt  time.Time         `json:"built_at"`
+	Expiry   time.Time         `json:"expiry"`
+	Hashes   map[string]string `json:"hashes"`
+	Files    []string          `json:"files"` // entry.files map keys, e.g. "dists/noble/main/binary-amd64/Packages.gz"
+}
+
+// handleLiveUpdatedMessage records the notice (for the next buildOrAdoptLiveFiles
+// call to use, see adoptLiveFromPeer) and invalidates this replica's own
+// local liveCache entry for the notified os/codename by marking it
+// immediately expired, so the next request runs the existing
+// stale-serve-then-background-refresh path (getLive/rebuildLive, unchanged)
+// instead of waiting out its own TTL. A notification for an os/codename this
+// replica hasn't served yet is a no-op beyond recording the notice: there is
+// no local entry to invalidate, and the next real request does a cold-start
+// build, which already checks for a recent peer notice first.
 func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 	var m liveUpdatedMsg
 	if err := json.Unmarshal([]byte(msg.Message), &m); err != nil {
@@ -60,6 +131,13 @@ func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 		return
 	}
 	cacheKey := m.OS + "/" + m.Codename
+
+	if s.valkey != nil {
+		s.valkey.mu.Lock()
+		s.valkey.notices[cacheKey] = m
+		s.valkey.mu.Unlock()
+	}
+
 	s.mu.Lock()
 	if entry, ok := s.liveCache[cacheKey]; ok {
 		expired := *entry
@@ -69,26 +147,11 @@ func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 	s.mu.Unlock()
 }
 
-// liveMeta is the JSON-serializable metadata stored at Keys.LiveMeta,
-// mirroring liveEntry's non-av fields. Files is tracked separately from
-// Hashes because Hashes' key set is a strict superset of Files': a plain,
-// uncompressed index path (e.g. "dists/trixie/main/binary-amd64/Packages")
-// gets an ETag hash parsed from the Release listing even when only its
-// compressed variants (.gz/.zst) are physically stored -- servePlainFromLive
-// decompresses one of those on the fly rather than ever storing the plain
-// bytes separately. Adopting by Hashes' keys would treat every such entry as
-// "missing" and always fall back to a full local rebuild.
-type liveMeta struct {
-	BuiltAt time.Time
-	Expiry  time.Time
-	Hashes  map[string]string
-	Files   []string
-}
-
 // buildOrAdoptLiveFiles returns the compressed serving files for
-// osName/codename, adopting them from Valkey if another replica already
-// built a fresh copy (avoiding redundant compression work), or generating
-// them locally and writing through to Valkey otherwise.
+// osName/codename, adopting them via a direct HTTP fetch from whichever
+// replica most recently published a still-fresh build for this layout (see
+// adoptLiveFromPeer), or generating them locally and publishing a notice
+// otherwise.
 //
 // av is always built locally by the caller regardless of what this function
 // does (see getLive/rebuildLive/startMismatchRetry): av.ByPoolPath is needed
@@ -99,7 +162,7 @@ type liveMeta struct {
 // actually expensive and worth sharing across replicas.
 func (s *Server) buildOrAdoptLiveFiles(ctx context.Context, osName, codename string, av *avail.Available) (files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time, err error) {
 	// av.Pkgs/av.Srcs are only ever read below, inside generateLiveFiles (and
-	// not at all when adopting from Valkey instead) -- nothing reads them
+	// not at all when adopting from a peer instead) -- nothing reads them
 	// again for the rest of this liveEntry's lifetime once this function
 	// returns, only av.ByPoolPath (pull-through) and the top-level fields
 	// matter. Clear them here so the per-(component, arch) breakdown --
@@ -113,7 +176,7 @@ func (s *Server) buildOrAdoptLiveFiles(ctx context.Context, osName, codename str
 	}()
 
 	if s.valkey != nil {
-		if files, hashes, builtAt, expiry, ok := s.adoptLiveFromValkey(ctx, osName, codename); ok {
+		if files, hashes, builtAt, expiry, ok := s.adoptLiveFromPeer(ctx, osName, codename); ok {
 			return files, hashes, builtAt, expiry, nil
 		}
 	}
@@ -126,90 +189,123 @@ func (s *Server) buildOrAdoptLiveFiles(ctx context.Context, osName, codename str
 	jitter := valkeycache.RandDuration(liveTTLJitter)
 	expiry = builtAt.Add(liveTTLBase + jitter)
 	if s.valkey != nil {
-		s.publishLiveToValkey(ctx, osName, codename, files, hashes, builtAt, expiry)
+		s.publishLiveUpdate(osName, codename, files, hashes, builtAt, expiry)
 	}
 	return files, hashes, builtAt, expiry, nil
 }
 
-// adoptLiveFromValkey reports whether Valkey has an unexpired live-artifact
-// entry for osName/codename and, if so, returns its files/hashes/timestamps.
-func (s *Server) adoptLiveFromValkey(ctx context.Context, osName, codename string) (files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time, ok bool) {
+// adoptLiveFromPeer reports whether another replica has recently published a
+// still-fresh build for osName/codename and, if so, fetches its files
+// directly over HTTP from that replica instead of building locally.
+func (s *Server) adoptLiveFromPeer(ctx context.Context, osName, codename string) (files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time, ok bool) {
 	b := s.valkey
-	meta, ok, err := valkeycache.GetJSON[liveMeta](ctx, b.client, b.keys.LiveMeta(osName, codename))
-	if err != nil {
-		slog.Warn("valkey: read live meta failed", "os", osName, "codename", codename, "err", err)
-		return nil, nil, time.Time{}, time.Time{}, false
-	}
+	cacheKey := osName + "/" + codename
+
+	b.mu.Lock()
+	notice, ok := b.notices[cacheKey]
+	b.mu.Unlock()
 	if !ok {
 		return nil, nil, time.Time{}, time.Time{}, false
 	}
-	if !time.Now().Before(meta.Expiry) {
+	if !time.Now().Before(notice.Expiry) {
 		return nil, nil, time.Time{}, time.Time{}, false
 	}
-	if len(meta.Files) == 0 {
+	if len(notice.Files) == 0 || len(notice.Addrs) == 0 {
 		return nil, nil, time.Time{}, time.Time{}, false
 	}
 
-	relpaths := make([]string, 0, len(meta.Files))
-	fileKeys := make([]string, 0, len(meta.Files))
-	for _, relpath := range meta.Files {
-		relpaths = append(relpaths, relpath)
-		fileKeys = append(fileKeys, b.keys.LiveFile(osName, codename, relpath))
-	}
-	vals, err := b.client.Do(ctx, b.client.B().Mget().Key(fileKeys...).Build()).ToArray()
+	files, err := b.fetchLiveFiles(ctx, osName, notice)
 	if err != nil {
-		slog.Warn("valkey: mget live files failed", "os", osName, "codename", codename, "err", err)
+		slog.Warn("valkey: fetch live files from peer failed, building locally instead",
+			"os", osName, "codename", codename, "err", err)
 		return nil, nil, time.Time{}, time.Time{}, false
 	}
-	files = make(map[string][]byte, len(relpaths))
-	for i, v := range vals {
-		str, err := v.ToString()
-		if err != nil {
-			// A file went missing between reading meta and the MGET (e.g. it
-			// expired out independently) -- treat the whole adoption as
-			// incomplete rather than serving a partial index.
-			slog.Warn("valkey: live file missing, falling back to local build",
-				"os", osName, "codename", codename, "file", relpaths[i])
-			return nil, nil, time.Time{}, time.Time{}, false
-		}
-		files[relpaths[i]] = []byte(str)
-	}
-	return files, meta.Hashes, meta.BuiltAt, meta.Expiry, true
+	return files, notice.Hashes, notice.BuiltAt, notice.Expiry, true
 }
 
-// publishLiveToValkey writes files/hashes through to Valkey and notifies
-// other replicas via pub/sub. Best-effort: failures are logged, not
-// returned, since the local build already succeeded and the caller has
-// valid data to serve regardless of whether the shared-cache write succeeds.
-func (s *Server) publishLiveToValkey(ctx context.Context, osName, codename string, files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time) {
-	b := s.valkey
-
-	// One batched MSET instead of one SET per file -- this runs synchronously
-	// in front of a live client's cold-start request (see
-	// buildOrAdoptLiveFiles), so N serialized round trips here directly adds
-	// N times the latency to that response. All of a layout's LiveFile keys
-	// share one hash tag (see valkeycache.Keys.LiveFile), so a single MSET is
-	// Cluster-safe the same way adoptLiveFromValkey's MGET already is.
-	relpaths := make([]string, 0, len(files))
-	if len(files) > 0 {
-		mset := b.client.B().Mset().KeyValue()
-		for relpath, data := range files {
-			relpaths = append(relpaths, relpath)
-			mset = mset.KeyValue(b.keys.LiveFile(osName, codename, relpath), string(data))
+// fetchLiveFiles fetches every file in notice.Files from one of notice.Addrs,
+// trying each address in turn until one responds successfully to every file
+// or all addresses are exhausted.
+func (b *serverValkeyBacking) fetchLiveFiles(ctx context.Context, osName string, notice liveUpdatedMsg) (map[string][]byte, error) {
+	var lastErr error
+	for _, addr := range notice.Addrs {
+		files, err := b.fetchLiveFilesFrom(ctx, addr, osName, notice.Files)
+		if err == nil {
+			return files, nil
 		}
-		if err := b.client.Do(ctx, mset.Build()).Error(); err != nil {
-			slog.Warn("valkey: write live files failed", "os", osName, "codename", codename, "err", err)
-		}
+		lastErr = err
 	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("publisher advertised no reachable addresses")
+	}
+	return nil, lastErr
+}
 
-	meta := liveMeta{BuiltAt: builtAt, Expiry: expiry, Hashes: hashes, Files: relpaths}
-	if err := valkeycache.SetJSON(ctx, b.client, b.keys.LiveMeta(osName, codename), meta); err != nil {
-		slog.Warn("valkey: write live meta failed", "os", osName, "codename", codename, "err", err)
+// fetchLiveFilesFrom fetches every key in keys from addr, over the exact
+// same public /live/{os}/{key} route a real apt client would use -- the
+// publishing replica needs no separate peer-only API surface, since it
+// already serves these exact bytes (a cache hit against its own liveCache,
+// per servePlainFromLive/serveBytes) to any caller.
+func (b *serverValkeyBacking) fetchLiveFilesFrom(ctx context.Context, addr, osName string, keys []string) (map[string][]byte, error) {
+	files := make(map[string][]byte, len(keys))
+	for _, key := range keys {
+		url := "http://" + addr + "/live/" + osName + "/" + key
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("building request for %s: %w", key, err)
+		}
+		data, err := b.doFetch(req)
+		if err != nil {
+			return nil, fmt.Errorf("fetching %s from %s: %w", key, addr, err)
+		}
+		files[key] = data
+	}
+	return files, nil
+}
+
+func (b *serverValkeyBacking) doFetch(req *http.Request) ([]byte, error) {
+	resp, err := b.peerHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// publishLiveUpdate notifies other replicas that osName/codename was just
+// built, with enough information (metadata plus this replica's own reachable
+// addresses) for them to fetch the files directly instead of independently
+// recompressing their own copy. Best-effort: failures are logged, not
+// returned, since the local build already succeeded and the caller has valid
+// data to serve regardless of whether the notification succeeds.
+func (s *Server) publishLiveUpdate(osName, codename string, files map[string][]byte, hashes map[string]string, builtAt, expiry time.Time) {
+	b := s.valkey
+	if len(b.peerAddrs) == 0 {
+		// Nothing else could ever reach this replica for a peer fetch; skip
+		// notifying entirely rather than publish a notice no one could use.
 		return
 	}
 
-	msg, _ := json.Marshal(liveUpdatedMsg{OS: osName, Codename: codename})
-	if err := valkeycache.Publish(ctx, b.client, valkeycache.ChannelLiveUpdated, string(msg)); err != nil {
+	relpaths := make([]string, 0, len(files))
+	for relpath := range files {
+		relpaths = append(relpaths, relpath)
+	}
+
+	msg := liveUpdatedMsg{
+		OS: osName, Codename: codename,
+		Addrs:   b.peerAddrs,
+		BuiltAt: builtAt, Expiry: expiry,
+		Hashes: hashes, Files: relpaths,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		slog.Warn("valkey: encode live-updated message failed", "os", osName, "codename", codename, "err", err)
+		return
+	}
+	if err := valkeycache.Publish(context.Background(), b.client, valkeycache.ChannelLiveUpdated, string(data)); err != nil {
 		slog.Warn("valkey: publish live update failed", "os", osName, "codename", codename, "err", err)
 	}
 }

@@ -659,7 +659,7 @@ func runServe(args []string) int {
 	webServer := server.New(cfg, store, index, key, httpClient, indexCache, notifier, syncr.ExistsCache())
 	stopLiveValkey := func() {}
 	if cfg.Valkey.Enabled {
-		stopLiveValkey = webServer.EnableValkey(context.Background(), vclient, valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix})
+		stopLiveValkey = webServer.EnableValkey(context.Background(), vclient, *addr)
 	}
 
 	srv := &http.Server{Addr: *addr, Handler: webServer.Handler()}

@@ -93,3 +93,26 @@ func MGetJSONStrict[T any](ctx context.Context, v valkey.Client, keys []string) 
 	}
 	return out, nil
 }
+
+// MGetBatchSize bounds how many keys MGetJSONStrictBatched sends per MGET.
+const MGetBatchSize = 1000
+
+// MGetJSONStrictBatched is MGetJSONStrict, but sent in chunks of at most
+// MGetBatchSize keys per round trip, so no single reply is ever unbounded by
+// len(keys) -- a listing over a bucket with tens of thousands of entries
+// would otherwise produce one multi-hundred-MB MGET reply.
+func MGetJSONStrictBatched[T any](ctx context.Context, v valkey.Client, keys []string) ([]T, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	out := make([]T, 0, len(keys))
+	for i := 0; i < len(keys); i += MGetBatchSize {
+		batch := keys[i:min(i+MGetBatchSize, len(keys))]
+		vals, err := MGetJSONStrict[T](ctx, v, batch)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vals...)
+	}
+	return out, nil
+}
