@@ -86,7 +86,21 @@ const (
 // client mid-flight between its Release fetch and its Packages/Sources
 // fetch, which is the exact "File has unexpected size" race Acquire-By-Hash
 // exists to prevent in the first place.
-const liveRetiredRetention = 1 * time.Minute
+//
+// Must be at least as long as /live's own HTTP Cache-Control max-age (see
+// httpCacheControl, which derives its value from liveTTLBase so the two can
+// never drift apart): a client -- or an intermediate cache/CDN -- is
+// entitled to keep using a Release it fetched for that *entire* window
+// before revalidating, and the worst case is a rebuild retiring that exact
+// generation moments after the client fetched it, not moments before the
+// window closes. An earlier, much shorter 1-minute value let exactly this
+// happen in production: a client held a ~3-minute-old Release, its by-hash
+// fetch 404'd against the too-short window, and it fell back to the
+// plain-named path -- straight back into the race Acquire-By-Hash exists to
+// prevent. The 5-minute margin on top of liveTTLBase covers network/
+// processing delay and more than one rebuild landing inside the window
+// under heavier-than-normal churn.
+const liveRetiredRetention = liveTTLBase + 5*time.Minute
 
 var errUnknownSelector = errors.New("unknown snapshot selector")
 
@@ -970,8 +984,14 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	s.mu.Unlock()
 
 	// Detach from the client context so a disconnect doesn't abort a build
-	// that will populate the cache for subsequent requests.
-	buildCtx := context.WithoutCancel(ctx)
+	// that will populate the cache for subsequent requests. Marked
+	// WithClientWaiting since this is the one genuine case where a real
+	// client HTTP request is synchronously blocked on the result -- see
+	// fastFallbackTimeout's doc comment (internal/upstream/fetch.go) for why
+	// that marking matters: it's what lets FetchIndex/FetchSources degrade
+	// early to stale data here, while background rebuilds and the periodic
+	// refresher (neither marked) always spend the full retry budget instead.
+	buildCtx := upstream.WithClientWaiting(context.WithoutCancel(ctx))
 	slog.Info("building live cache", "os", osName, "codename", codename)
 	buildStart := time.Now()
 	// Deliberately s.buildAvailBestEffort, not s.buildAvail: this is the
@@ -1380,10 +1400,17 @@ func stanzaString(p avail.Pkg) string {
 	return p.StanzaStr
 }
 
+// liveHTTPCacheControl is /live's and /current's own Cache-Control value,
+// derived from liveTTLBase rather than a second, independent literal -- see
+// liveRetiredRetention's own doc comment for why these two must never be
+// allowed to drift apart (retention must always cover at least this much
+// client-side caching allowance).
+var liveHTTPCacheControl = fmt.Sprintf("public, max-age=%d", int(liveTTLBase.Seconds()))
+
 // httpCacheControl returns the Cache-Control header value for a request URL
 // path. It is keyed on the first path segment (the "selector"):
-//   - live/**          -> 12-minute public cache (matches server-side live TTL)
-//   - current/**       -> 12-minute public cache (current alias changes on snapshot)
+//   - live/**          -> public cache for liveTTLBase (matches server-side live TTL)
+//   - current/**       -> same as live/** (current alias changes on snapshot)
 //   - keys/debproxy.*  -> 1-day cache (rotates on key change)
 //   - everything else  -> 1-year immutable (pool files and pinned snapshot files)
 func httpCacheControl(urlPath string) string {
@@ -1393,7 +1420,7 @@ func httpCacheControl(urlPath string) string {
 	}
 	switch parts[0] {
 	case "live", "current":
-		return "public, max-age=720"
+		return liveHTTPCacheControl
 	case "keys":
 		if len(parts) >= 2 && strings.HasPrefix(parts[1], "debproxy.") {
 			return "public, max-age=86400"

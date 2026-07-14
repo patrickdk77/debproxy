@@ -152,24 +152,43 @@ func releaseListsSources(rel *apt.Release, component string) bool {
 	return false
 }
 
-// fastFallbackTimeout bounds a single fetch attempt when a stale-but-usable
-// comparison entry is already in hand (see cachedForComparison/
-// srcsCachedForComparison) -- rather than waiting through NewHTTPClient's
-// full retry budget (up to ~4 attempts x 30s ResponseHeaderTimeout each, plus
-// escalating delays -- worst case around two minutes) against a mirror
-// that's currently slow or down, a bad upstream degrades to "serve what we
-// already have" in seconds instead of stalling an entire avail.Build (and so
-// a whole /live rebuild) for that long. retryTransport treats context
-// cancellation as non-retryable, so this cleanly aborts after one bounded
-// attempt rather than exhausting retries first. Only applied when a fallback
-// actually exists: with nothing to fall back to, the full retry budget is
-// worth spending for a real answer instead of failing the fetch outright.
-const fastFallbackTimeout = 5 * time.Second
+// fastFallbackTimeout bounds a single fetch attempt when BOTH a stale-but-
+// usable comparison entry is already in hand (see cachedForComparison/
+// srcsCachedForComparison) AND a real client HTTP request is synchronously
+// blocked waiting on the result (see WithClientWaiting) -- rather than
+// making that client wait through NewHTTPClient's full retry budget (up to
+// ~4 attempts x 30s ResponseHeaderTimeout each, plus escalating delays --
+// worst case around two minutes) against a mirror that's currently slow or
+// down, it degrades to "serve what we already have" in seconds. retryTransport
+// treats context cancellation as non-retryable, so this cleanly aborts after
+// one bounded attempt rather than exhausting retries first.
+//
+// This must NOT apply just because a fallback exists: it originally did
+// (gated on haveFallback alone), which meant the periodic refresher and every
+// background /live rebuild -- neither of which has any client waiting on
+// them at all -- also got downgraded to this budget on every single fetch
+// after the first successful one for a given upstream+arch (cachedEntry,
+// once populated, never goes away). Any upstream/arch that was merely slow
+// (not down) -- e.g. a lower-capacity ports/legacy-arch mirror under normal
+// internet latency -- lost that race essentially every time and silently
+// kept re-serving stale data forever, with only a WARN log to show for it.
+// Confirmed in production via repeated "fetch failed, serving stale
+// packages" / "context deadline exceeded" log lines against real
+// archive/ports mirrors across multiple arches and days, never a real
+// outage. Gating on clientIsWaiting too means background refreshes now
+// always get the full retry budget for a real answer, and only a genuine
+// cold-start client request degrades early -- which is also why the bound
+// itself was raised from 5s to 30s: matching NewHTTPClient's own per-attempt
+// ResponseHeaderTimeout gives even that narrowed case a realistic chance to
+// succeed instead of failing over prematurely.
+const fastFallbackTimeout = 30 * time.Second
 
 // withFallbackTimeout returns ctx bounded by fastFallbackTimeout when
-// haveFallback is true, and ctx unchanged (with a no-op cancel) otherwise.
-func withFallbackTimeout(ctx context.Context, haveFallback bool) (context.Context, context.CancelFunc) {
-	if !haveFallback {
+// useFastFallback is true, and ctx unchanged (with a no-op cancel) otherwise.
+// Callers must pass haveFallback && clientIsWaiting(ctx), never haveFallback
+// alone -- see fastFallbackTimeout's own doc comment.
+func withFallbackTimeout(ctx context.Context, useFastFallback bool) (context.Context, context.CancelFunc) {
+	if !useFastFallback {
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, fastFallbackTimeout)
@@ -238,11 +257,14 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 	}
 
 	// Bound this attempt when we already have per-arch data to fall back to
-	// (see fastFallbackTimeout) -- a cachedEntry with no archPkgs at all (e.g.
-	// a first-ever adopt that only got meta) has nothing to fall back to for
-	// Packages specifically, so the full retry budget is worth spending then.
+	// AND a real client is synchronously waiting on it (see
+	// fastFallbackTimeout) -- a cachedEntry with no archPkgs at all (e.g. a
+	// first-ever adopt that only got meta) has nothing to fall back to for
+	// Packages specifically, so the full retry budget is worth spending then;
+	// so is a background caller (periodic refresher, background /live
+	// rebuild) with no client waiting on the outcome at all.
 	haveArchFallback := cachedEntry != nil && len(cachedEntry.archPkgs) > 0
-	fetchCtx, cancel := withFallbackTimeout(ctx, haveArchFallback)
+	fetchCtx, cancel := withFallbackTimeout(ctx, haveArchFallback && clientIsWaiting(ctx))
 	defer cancel()
 
 	slog.Debug("upstream index: performing real network fetch", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component, "have_arch_fallback", haveArchFallback)
@@ -880,9 +902,10 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	}
 
 	// Bound this attempt (InRelease plus, below, the Sources file itself) when
-	// we already have srcs to fall back to -- see fastFallbackTimeout.
+	// we already have srcs to fall back to AND a real client is synchronously
+	// waiting on it -- see fastFallbackTimeout.
 	haveSrcsFallback := cachedEntry != nil && cachedEntry.srcs != nil
-	fetchCtx, cancel := withFallbackTimeout(ctx, haveSrcsFallback)
+	fetchCtx, cancel := withFallbackTimeout(ctx, haveSrcsFallback && clientIsWaiting(ctx))
 	defer cancel()
 
 	slog.Debug("upstream Sources: performing real network fetch", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component, "have_srcs_fallback", haveSrcsFallback)

@@ -12,12 +12,34 @@ import (
 
 type contextKey int
 
-const userAgentKey contextKey = iota
+const (
+	userAgentKey contextKey = iota
+	clientWaitingKey
+)
 
 // WithUserAgent stores ua in ctx so that upstream fetches made with that
 // context will use it as the outgoing User-Agent (when no global UA is configured).
 func WithUserAgent(ctx context.Context, ua string) context.Context {
 	return context.WithValue(ctx, userAgentKey, ua)
+}
+
+// WithClientWaiting marks ctx as one where a real client HTTP request is
+// synchronously blocked on the result -- currently only true for a /live
+// cold start with nothing yet cached for that os/codename. See
+// fastFallbackTimeout's doc comment (fetch.go) for why this distinction
+// matters: every other caller of FetchIndex/FetchSources -- the periodic
+// refresher, a stale live entry's background rebuild, an async admin job --
+// has no client waiting on it at all, and should always spend the full
+// retry budget chasing a correct answer rather than degrading early to a
+// stale fallback just because one happens to exist.
+func WithClientWaiting(ctx context.Context) context.Context {
+	return context.WithValue(ctx, clientWaitingKey, true)
+}
+
+// clientIsWaiting reports whether ctx was marked via WithClientWaiting.
+func clientIsWaiting(ctx context.Context) bool {
+	v, _ := ctx.Value(clientWaitingKey).(bool)
+	return v
 }
 
 // NewHTTPClient returns an *http.Client tuned for fetching from Debian mirror

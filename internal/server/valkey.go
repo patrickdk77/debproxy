@@ -31,7 +31,7 @@ import (
 type serverValkeyBacking struct {
 	client    valkey.Client
 	peerAddrs []string     // this replica's own "host:port" candidates, advertised in its own notices
-	peerHTTP  *http.Client // short-timeout client used for peer-to-peer fetches
+	peerHTTP  *http.Client // bounded-timeout client used for peer-to-peer fetches
 
 	mu      sync.Mutex
 	notices map[string]liveUpdatedMsg // key: os/codename -> most recently received notice
@@ -52,8 +52,13 @@ func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, listenAddr s
 	s.valkey = &serverValkeyBacking{
 		client:    v,
 		peerAddrs: localPeerAddrs(listenAddr),
-		peerHTTP:  &http.Client{Timeout: 10 * time.Second},
-		notices:   map[string]liveUpdatedMsg{},
+		// 30s, not the original 10s: production logs showed this timing out
+		// ("Client.Timeout exceeded while awaiting headers") for ordinary
+		// Packages.zst-sized fetches whenever the peer replica was itself busy
+		// (e.g. mid rebuild for a large layout), forcing an unnecessary local
+		// rebuild instead of the cheap peer adopt this path exists for.
+		peerHTTP: &http.Client{Timeout: 30 * time.Second},
+		notices:  map[string]liveUpdatedMsg{},
 	}
 
 	subCtx, cancel := context.WithCancel(ctx)

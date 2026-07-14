@@ -281,7 +281,10 @@ func TestFetchIndex304ReusesCache(t *testing.T) {
 // upstream (as opposed to one that errors quickly, like
 // TestFetchIndexStaleFallbackOnError) degrades to the stale fallback within
 // fastFallbackTimeout instead of the full retry budget NewHTTPClient
-// otherwise allows (up to ~4 attempts x 30s each).
+// otherwise allows (up to ~4 attempts x 30s each) -- but only when the
+// caller's context is marked via WithClientWaiting, matching the one real
+// caller that ever sets it (a /live cold start). See
+// TestFetchIndexBackgroundCallerUsesFullRetryBudget for the unmarked case.
 func TestFetchIndexFastFallbackTimeoutBoundsHangingUpstream(t *testing.T) {
 	key, keyring := testKey(t)
 	srvURL, _, _ := buildFakeUpstream(t, key)
@@ -313,7 +316,7 @@ func TestFetchIndexFastFallbackTimeoutBoundsHangingUpstream(t *testing.T) {
 	src := makeSource(t, srv.URL, keyring)
 	cache := upstream.NewIndexCache()
 	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient(""), cache)
-	ctx := context.Background()
+	ctx := upstream.WithClientWaiting(context.Background())
 
 	// First fetch succeeds and warms the cache with real archPkgs.
 	idx1, err := f.FetchIndex(ctx)
@@ -332,11 +335,98 @@ func TestFetchIndexFastFallbackTimeoutBoundsHangingUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected stale fallback, got error: %v", err)
 	}
-	if elapsed > 8*time.Second {
-		t.Fatalf("expected fastFallbackTimeout (~5s) to bound the hung request, took %v instead", elapsed)
+	if elapsed > 40*time.Second {
+		t.Fatalf("expected fastFallbackTimeout (~30s) to bound the hung request, took %v instead", elapsed)
 	}
 	if len(idx2.ByArch["amd64"]) != len(idx1.ByArch["amd64"]) {
 		t.Fatal("stale fallback returned wrong package data")
+	}
+}
+
+// TestFetchIndexBackgroundCallerToleratesSlowUpstream is the regression test
+// for the actual production bug: an unmarked context (the periodic
+// refresher, a background /live rebuild -- neither has a client waiting on
+// it) must NOT be downgraded to fastFallbackTimeout just because a stale
+// fallback exists. The upstream here is slow, not permanently hung
+// (NewHTTPClient's own ResponseHeaderTimeout is also 30s, so a permanently
+// hung upstream is indistinguishable between the two paths -- it just proves
+// nothing either way); a real mirror that's merely slower than
+// fastFallbackTimeout, but still answers, is exactly the shape of the
+// production incident (real archive/ports mirrors, not an outage). If the
+// unmarked path were still (wrongly) bounded by fastFallbackTimeout, this
+// fetch would fail over to stale data at ~30s instead of waiting for the
+// real, fresh response.
+func TestFetchIndexBackgroundCallerToleratesSlowUpstream(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, _, _ := buildFakeUpstream(t, key)
+
+	var slow atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp, err := http.Get(srvURL + r.RequestURI)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		var buf bytes.Buffer
+		buf.ReadFrom(resp.Body)
+		for k, vs := range resp.Header {
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		// Headers/status flushed immediately either way -- NewHTTPClient's
+		// ResponseHeaderTimeout only bounds waiting for these, so a slow
+		// *body* (the realistic shape of a real mirror under load) is what
+		// exercises fastFallbackTimeout/the caller's own context, not that
+		// separate, already-satisfied timeout.
+		w.WriteHeader(resp.StatusCode)
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		if slow.Load() {
+			select {
+			case <-time.After(35 * time.Second):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	src := makeSource(t, srv.URL, keyring)
+	cache := upstream.NewIndexCache()
+	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient(""), cache)
+
+	// Deliberately not WithClientWaiting -- this mirrors the periodic
+	// refresher / background rebuild callers.
+	bg := context.Background()
+
+	idx1, err := f.FetchIndex(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache.ExpireAll()
+	slow.Store(true)
+
+	// Generous outer deadline: the point of this test is that nothing
+	// *internal* cuts this off early, not that it's unbounded forever.
+	ctx, cancel := context.WithTimeout(bg, 55*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	idx2, err := f.FetchIndex(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected the background caller to wait out the slow upstream and succeed, got error: %v", err)
+	}
+	if elapsed < 33*time.Second {
+		t.Fatalf("expected the unmarked background context to wait past fastFallbackTimeout (30s) for the real response, returned early at %v", elapsed)
+	}
+	if len(idx2.ByArch["amd64"]) != len(idx1.ByArch["amd64"]) {
+		t.Fatal("fetched index returned wrong package data")
 	}
 }
 
