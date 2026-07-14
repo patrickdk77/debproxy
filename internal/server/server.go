@@ -51,11 +51,12 @@ type Server struct {
 	notifier   *webhook.Notifier
 	exists     *ingest.ExistsCache // shared with syncer; nil disables re-index
 
-	mu           sync.Mutex
-	liveCache    map[string]*liveEntry          // key: os/codename
-	liveBuilding map[string]chan struct{}       // in-flight builds
-	retryCancel  map[string]context.CancelFunc  // background mismatch retries
-	retiredLive  map[string][]*retiredLiveEntry // key: os/codename; see retireLiveEntryLocked
+	mu               sync.Mutex
+	liveCache        map[string]*liveEntry          // key: os/codename
+	liveBuilding     map[string]chan struct{}       // in-flight builds
+	retryCancel      map[string]context.CancelFunc  // background mismatch retries
+	retiredLive      map[string][]*retiredLiveEntry // key: os/codename; see retireLiveEntryLocked
+	pendingPeerAdopt map[string]context.CancelFunc  // key: os/codename; see handleLiveUpdatedMessage
 
 	// validOSCodename and validTriple bound metric-label cardinality to the
 	// configured universe. Keys are "os/codename" and "os/codename/upstream"
@@ -173,10 +174,11 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 		indexCache:      indexCache,
 		notifier:        notifier,
 		exists:          exists,
-		liveCache:       map[string]*liveEntry{},
-		liveBuilding:    map[string]chan struct{}{},
-		retryCancel:     map[string]context.CancelFunc{},
-		retiredLive:     map[string][]*retiredLiveEntry{},
+		liveCache:        map[string]*liveEntry{},
+		liveBuilding:     map[string]chan struct{}{},
+		retryCancel:      map[string]context.CancelFunc{},
+		retiredLive:      map[string][]*retiredLiveEntry{},
+		pendingPeerAdopt: map[string]context.CancelFunc{},
 		validOSCodename: validOSCodename,
 		validTriple:     validTriple,
 	}
@@ -956,6 +958,14 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	// Stale entry exists: return it immediately and refresh in the background.
 	if ok {
 		if !building {
+			// This request is about to trigger the same rebuild a pending
+			// notice-driven proactive adopt (see handleLiveUpdatedMessage)
+			// would otherwise fire after its own jitter delay -- cancel it
+			// so it doesn't duplicate the rebuild this request is starting.
+			if cancel, pending := s.pendingPeerAdopt[cacheKey]; pending {
+				cancel()
+				delete(s.pendingPeerAdopt, cacheKey)
+			}
 			wait := make(chan struct{})
 			s.liveBuilding[cacheKey] = wait
 			safego.Go("rebuild live cache", func() { s.rebuildLive(osName, codename, cacheKey, wait) })

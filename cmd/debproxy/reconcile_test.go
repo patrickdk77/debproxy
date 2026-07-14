@@ -11,6 +11,7 @@ import (
 	"github.com/debproxy/debproxy/internal/metadata/deb822store"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/storage/filesystem"
+	"github.com/debproxy/debproxy/internal/valkeycache"
 )
 
 // buildTestDeb creates a minimal .deb AR archive with the given
@@ -90,7 +91,7 @@ func TestReconcileIndexIfEmptySkipsWhenIndexHasEntries(t *testing.T) {
 	}
 
 	cfg := &config.Config{}
-	if err := reconcileIndexIfEmpty(ctx, cfg, store, index, nil); err != nil {
+	if err := reconcileIndexIfEmpty(ctx, cfg, store, index, nil, nil, valkeycache.Keys{}); err != nil {
 		t.Fatalf("reconcileIndexIfEmpty: %v", err)
 	}
 
@@ -131,7 +132,7 @@ func TestReconcileIndexIfEmptyReconcilesFromPoolWhenEmpty(t *testing.T) {
 	// nothing in cfg.ResolvedLayouts matches this file's upstream segment, so
 	// it resolves via the "no known component" fallback instead.
 	cfg := &config.Config{}
-	if err := reconcileIndexIfEmpty(ctx, cfg, store, index, nil); err != nil {
+	if err := reconcileIndexIfEmpty(ctx, cfg, store, index, nil, nil, valkeycache.Keys{}); err != nil {
 		t.Fatalf("reconcileIndexIfEmpty: %v", err)
 	}
 

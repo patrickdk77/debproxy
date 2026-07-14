@@ -345,6 +345,19 @@ func (c *IndexCache) publishToValkey(ctx context.Context, upstream, suite, compo
 // side of the same problem fetchOneArchPkgs's read side solves: the old
 // one-blob-per-arch scheme meant every publish, even one triggered by a tiny
 // PDiff, rewrote the complete arch as a single value.
+//
+// A member already in the bucket set is NOT assumed to still have valid
+// entry data behind it -- see verifyExistingMembers below. That assumption
+// broke in production: an operational purge deleted every up:/up-pkg: key
+// (Release metadata and entry data) but not up-pkgs: (the bucket sets),
+// leaving every member "already present" per the set while its entry data
+// was gone. The diff below skipped writing all of them, since it only
+// compares set membership -- a real fetch's result kept being silently
+// discarded for anything that hadn't changed version, with no error and no
+// self-healing. The same desync isn't purge-specific either: an MSET
+// succeeding but a process dying before the paired SADD (or the reverse
+// order elsewhere) reaches the server produces the identical inconsistency
+// without anyone touching Valkey by hand.
 func (b *valkeyBacking) publishArchPkgs(ctx context.Context, upstream, suite, component, arch string, pkgs []apt.RawPkg) error {
 	bucket := b.keys.UpstreamPkgBucket(upstream, suite, component, arch)
 
@@ -365,10 +378,12 @@ func (b *valkeyBacking) publishArchPkgs(ctx context.Context, upstream, suite, co
 		byMember[m] = pkg
 	}
 
-	var toAdd, toRemove []string
+	var toAdd, toRemove, unchanged []string
 	for m := range newSet {
 		if !currentSet[m] {
 			toAdd = append(toAdd, m)
+		} else {
+			unchanged = append(unchanged, m)
 		}
 	}
 	for m := range currentSet {
@@ -376,6 +391,12 @@ func (b *valkeyBacking) publishArchPkgs(ctx context.Context, upstream, suite, co
 			toRemove = append(toRemove, m)
 		}
 	}
+
+	missing, err := b.findMembersMissingEntries(ctx, upstream, suite, component, arch, unchanged)
+	if err != nil {
+		return fmt.Errorf("verify existing pkg entries: %w", err)
+	}
+	toAdd = append(toAdd, missing...)
 
 	for i := 0; i < len(toAdd); i += upstreamPkgBatchSize {
 		batch := toAdd[i:min(i+upstreamPkgBatchSize, len(toAdd))]
@@ -424,6 +445,43 @@ func (b *valkeyBacking) publishArchPkgs(ctx context.Context, upstream, suite, co
 	}
 
 	return nil
+}
+
+// findMembersMissingEntries checks members (bucket-set members the diff in
+// publishArchPkgs considers unchanged, so it would otherwise never touch
+// them again) and returns the subset whose UpstreamPkgEntry key doesn't
+// actually exist -- see publishArchPkgs's doc comment for why this
+// assumption can't be trusted on set membership alone. Chunked MGET, same
+// batch size as every other bulk operation in this file, so verifying a
+// large bucket is never one unbounded reply.
+func (b *valkeyBacking) findMembersMissingEntries(ctx context.Context, upstream, suite, component, arch string, members []string) ([]string, error) {
+	var missing []string
+	for i := 0; i < len(members); i += upstreamPkgBatchSize {
+		batch := members[i:min(i+upstreamPkgBatchSize, len(members))]
+		entryKeys := make([]string, 0, len(batch))
+		checked := make([]string, 0, len(batch))
+		for _, m := range batch {
+			pkg, version, ok := splitUpstreamPkgMember(m)
+			if !ok {
+				continue
+			}
+			entryKeys = append(entryKeys, b.keys.UpstreamPkgEntry(upstream, suite, component, arch, pkg, version))
+			checked = append(checked, m)
+		}
+		if len(entryKeys) == 0 {
+			continue
+		}
+		vals, err := b.client.Do(ctx, b.client.B().Mget().Key(entryKeys...).Build()).ToArray()
+		if err != nil {
+			return nil, fmt.Errorf("mget pkg entries: %w", err)
+		}
+		for j, v := range vals {
+			if _, err := v.ToString(); err != nil {
+				missing = append(missing, checked[j])
+			}
+		}
+	}
+	return missing, nil
 }
 
 // publishSrcsToValkey writes srcs through to Valkey. Kept separate from

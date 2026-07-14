@@ -264,13 +264,60 @@ func openBackends(ctx context.Context, cfg *config.Config) (storage.Storage, met
 // cleanup.go) for the safety net that now also guards against this, and
 // which this reconciliation is meant to make unnecessary in the first place
 // by not leaving the index empty across a restart.
-func reconcileIndexIfEmpty(ctx context.Context, cfg *config.Config, store storage.Storage, index metadata.MetadataIndex, client *http.Client) error {
+//
+// For a Valkey-backed index (shared across every replica in the cluster),
+// vclient/vkeys gate this behind the same OperationLock every other
+// cluster-wide mutating action uses: every replica's index looks empty at
+// the same instant right after a real data-loss event, so without this lock
+// every replica would independently run the full restore-then-pool-walk at
+// once -- confirmed in production logs (two replicas restarting seconds
+// apart both logged "restored metadata from backup" and "rebuild complete"
+// for the same data, each taking 60-90s, doubling startup latency for no
+// benefit). A replica that loses the lock race skips reconciliation
+// entirely and proceeds straight to serving -- correct, not just expedient,
+// since Valkey is the single shared source of truth here: whichever replica
+// holds the lock populates it, and this replica's own subsequent reads
+// (ListEntries et al.) go straight to that same shared store, not a stale
+// local copy. For a non-Valkey (deb822store) index there is no cluster to
+// disrupt -- each process owns its own on-disk state independently -- so no
+// locking applies; vclient is expected nil in that case.
+func reconcileIndexIfEmpty(ctx context.Context, cfg *config.Config, store storage.Storage, index metadata.MetadataIndex, client *http.Client, vclient valkey.Client, vkeys valkeycache.Keys) error {
 	entries, err := index.ListEntries(ctx, model.Selector{})
 	if err != nil {
 		return fmt.Errorf("check index: %w", err)
 	}
 	if len(entries) > 0 {
 		return nil
+	}
+
+	if vclient != nil {
+		lock, acquired, err := valkeycache.AcquireLock(ctx, vclient, vkeys.OperationLock(), defaultLockTTL)
+		if err != nil {
+			slog.Warn("acquire reconcile lock failed, reconciling directly", "err", err)
+		} else if !acquired {
+			slog.Info("metadata index looks empty, but another replica already holds the reconcile lock -- skipping (shared Valkey store will reflect its work)")
+			return nil
+		} else {
+			_, stopRenew := lock.StartRenewing(ctx, defaultLockTTL, defaultLockRenewInterval)
+			defer stopRenew()
+			defer func() {
+				if err := lock.Release(context.Background()); err != nil {
+					slog.Warn("release reconcile lock failed", "err", err)
+				}
+			}()
+
+			// Re-check now that we hold the lock: another replica may have
+			// raced us for it, finished its own reconciliation, and released
+			// before we acquired -- in which case the shared store is already
+			// populated and repeating the work would just be redundant.
+			entries, err := index.ListEntries(ctx, model.Selector{})
+			if err != nil {
+				return fmt.Errorf("re-check index after acquiring reconcile lock: %w", err)
+			}
+			if len(entries) > 0 {
+				return nil
+			}
+		}
 	}
 
 	slog.Warn("metadata index is empty at startup, reconciling from backup and pool")
@@ -627,11 +674,6 @@ func runServe(args []string) int {
 	httpClient := upstream.NewHTTPClient(cfg.UserAgent)
 	indexCache := upstream.NewIndexCache()
 
-	if err := reconcileIndexIfEmpty(context.Background(), cfg, store, index, httpClient); err != nil {
-		slog.Error("reconcile metadata index", "err", err)
-		return 1
-	}
-
 	// vclient is shared between the upstream fetch cache/lock (below) and the
 	// /live serving-artifact cache (wired into server.New's result further
 	// down) -- one shared client for the whole process rather than a second
@@ -645,6 +687,11 @@ func runServe(args []string) int {
 			return 1
 		}
 		indexCache.EnableValkey(vclient, valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix}, defaultLockTTL, defaultLockRenewInterval)
+	}
+
+	if err := reconcileIndexIfEmpty(context.Background(), cfg, store, index, httpClient, vclient, valkeycache.Keys{Prefix: cfg.Valkey.KeyPrefix}); err != nil {
+		slog.Error("reconcile metadata index", "err", err)
+		return 1
 	}
 
 	notifier, err := buildNotifier(cfg)

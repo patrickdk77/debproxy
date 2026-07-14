@@ -29,9 +29,18 @@ func newValkeyEnabledServer(t *testing.T, listenAddr string) *Server {
 	return s
 }
 
-func TestHandleLiveUpdatedMessageInvalidatesMatchingEntry(t *testing.T) {
-	// Invalidation is jittered (see liveUpdateInvalidateJitter) -- shrink it
-	// so this test doesn't have to wait out the full production window.
+// TestHandleLiveUpdatedMessageProactivelyRebuildsMatchingEntry proves the
+// actual current behavior: receiving a live-updated notice doesn't just mark
+// the matching entry stale and wait for a client request to notice (see
+// getLive) -- after the jitter delay, it proactively rebuilds/adopts right
+// away on its own, replacing the entry outright. Detected via pointer
+// identity (swapLiveEntry always installs a new *liveEntry), since the
+// invalidated state is only transient now -- a real rebuild follows
+// immediately, so polling for a zero expiry is racy against that replacement.
+func TestHandleLiveUpdatedMessageProactivelyRebuildsMatchingEntry(t *testing.T) {
+	// The proactive adopt is jittered (see liveUpdateInvalidateJitter) --
+	// shrink it so this test doesn't have to wait out the full production
+	// window.
 	orig := liveUpdateInvalidateJitter
 	liveUpdateInvalidateJitter = time.Millisecond
 	t.Cleanup(func() { liveUpdateInvalidateJitter = orig })
@@ -39,8 +48,10 @@ func TestHandleLiveUpdatedMessageInvalidatesMatchingEntry(t *testing.T) {
 	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
 
 	future := time.Now().Add(time.Hour)
-	s.liveCache["debian/trixie"] = &liveEntry{expiry: future}
-	s.liveCache["ubuntu/noble"] = &liveEntry{expiry: future}
+	originalTrixie := &liveEntry{expiry: future}
+	originalNoble := &liveEntry{expiry: future}
+	s.liveCache["debian/trixie"] = originalTrixie
+	s.liveCache["ubuntu/noble"] = originalNoble
 
 	msg, err := json.Marshal(liveUpdatedMsg{OS: "debian", Codename: "trixie"})
 	if err != nil {
@@ -51,21 +62,21 @@ func TestHandleLiveUpdatedMessageInvalidatesMatchingEntry(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		s.mu.Lock()
-		invalidated := s.liveCache["debian/trixie"].expiry.IsZero()
+		replaced := s.liveCache["debian/trixie"] != originalTrixie
 		s.mu.Unlock()
-		if invalidated {
+		if replaced {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for debian/trixie entry to be invalidated")
+			t.Fatal("timed out waiting for debian/trixie entry to be proactively rebuilt")
 		}
 		time.Sleep(time.Millisecond)
 	}
 
 	s.mu.Lock()
-	untouched := s.liveCache["ubuntu/noble"].expiry
+	untouched := s.liveCache["ubuntu/noble"]
 	s.mu.Unlock()
-	if !untouched.Equal(future) {
+	if untouched != originalNoble {
 		t.Fatal("expected unrelated ubuntu/noble entry to be left untouched")
 	}
 }
@@ -82,6 +93,51 @@ func TestHandleLiveUpdatedMessageNoLocalEntryIsNoop(t *testing.T) {
 
 	if len(s.liveCache) != 0 {
 		t.Fatalf("expected no entries created, got %v", s.liveCache)
+	}
+}
+
+// TestGetLiveCancelsPendingPeerAdoptOnClientRequest proves the other half of
+// the design: a client request for a stale entry must cancel any still-
+// pending notice-driven proactive adopt for the same cacheKey (see
+// handleLiveUpdatedMessage) rather than let both fire and duplicate the same
+// rebuild -- the client's own request already triggers it immediately.
+func TestGetLiveCancelsPendingPeerAdoptOnClientRequest(t *testing.T) {
+	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
+	cacheKey := "debian/trixie"
+	s.liveCache[cacheKey] = &liveEntry{expiry: time.Now().Add(-time.Minute)} // stale
+
+	// Simulate a live-updated notice having just arrived with its jitter
+	// delay still pending (long enough that it won't fire during this test).
+	_, realCancel := context.WithCancel(context.Background())
+	called := false
+	wrappedCancel := func() { called = true; realCancel() }
+	s.mu.Lock()
+	s.pendingPeerAdopt[cacheKey] = wrappedCancel
+	s.mu.Unlock()
+
+	entry, err := s.getLive(context.Background(), "debian", "trixie")
+	if err != nil {
+		t.Fatalf("getLive: %v", err)
+	}
+	if entry == nil {
+		t.Fatal("expected the stale entry to still be returned immediately")
+	}
+
+	if !called {
+		t.Error("expected the pending peer-adopt timer's cancel func to be called")
+	}
+	s.mu.Lock()
+	_, stillPending := s.pendingPeerAdopt[cacheKey]
+	wait, building := s.liveBuilding[cacheKey]
+	s.mu.Unlock()
+	if stillPending {
+		t.Error("expected the pending peer-adopt entry to be removed once a client request took over")
+	}
+
+	// Let the background rebuild this request triggered finish so it
+	// doesn't leak past the test.
+	if building {
+		<-wait
 	}
 }
 

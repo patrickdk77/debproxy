@@ -4,22 +4,25 @@ debproxy holds two categories of data in RAM: the upstream package cache (raw st
 
 ## Upstream package cache
 
-Every configured upstream is fetched and held in memory rather than in a database. At this scale RAM is cheaper and faster than a database server, and reading every package entry from storage on each update cycle to produce a new Packages file would incur prohibitive IOPS costs. The table below shows package counts from a full refresh cycle, one row per codename, summed across all its upstreams, suites, and components.
+Every configured upstream is fetched and held in memory rather than in a database. At this scale RAM is cheaper and faster than a database server, and reading every package entry from storage on each update cycle to produce a new Packages file would incur prohibitive IOPS costs.
 
-| Codename | Upstream packages |
-|---|---:|
-| debian/trixie | 256,906 |
-| debian/bookworm | 238,981 |
-| debian/experimental | 9,099 |
-| ubuntu/bionic | 310,849 |
-| ubuntu/focal | 286,745 |
-| ubuntu/jammy | 281,618 |
-| ubuntu/noble | 243,725 |
-| **Total** | **1,628,119** |
+**Methodology note:** the table below counts each configured upstream *source* separately -- e.g. `ubuntu-main`, `ubuntu-updates`, `ubuntu-security`, and the three `ubuntu-ports-*` equivalents each contribute their own full package count for a given codename, even though most of that content overlaps between them (an `-updates`/`-security` pocket is a delta on top of the base suite, not a disjoint set). This is deliberate: it's what the Valkey-backed upstream mirror cache (`internal/upstream/valkey.go`) actually stores -- one bucket per `(upstream, suite, component, arch)`, never deduplicated against sibling upstreams. The final *merged, deduplicated* `/live` package count (what a client actually sees) is a different, much lower number, since it collapses all of a codename's upstream sources down to one winning version per package.
 
-Package stanzas average roughly 1,300 bytes of in-memory text (Ubuntu stanzas run ~1,400 bytes, Debian ~1,200). Upstream cache would occupy around **2.1 GB**.
+Figures below are a fresh measurement (2026-07-14) against the real upstream mirrors, for the 6 standard Ubuntu sources (`ubuntu-main`/`-updates`/`-security` + the 3 `ubuntu-ports-*` equivalents) and 4 standard Debian sources (`debian-main`/`-updates`/`-security`/`-backports`), across every configured component and architecture. **Excludes** Ubuntu ESM/Pro, PPAs, and third-party repos (MongoDB, Node.js, etc.) -- those add some further amount on top but are individually small (a 25-repo sample of the third-party ones totaled ~322 KB combined) and weren't re-measured here since ESM requires spending a real Pro-subscription credential to query.
 
-The config used for this data includes four Ubuntu codenames (noble, jammy, focal, bionic) with x86 and ports upstreams, Ubuntu ESM/Pro on the LTS releases, two Debian stable codenames (trixie, bookworm), Debian experimental, and third-party repos for MongoDB and Node.js.
+| Codename | Upstream packages | Bytes |
+|---|---:|---:|
+| ubuntu/noble | 280,650 | 304.3 MB |
+| ubuntu/jammy | 282,245 | 290.0 MB |
+| ubuntu/focal | 264,091 | 249.0 MB |
+| ubuntu/bionic | 285,591 | 271.2 MB |
+| debian/trixie | 220,608 | 172.7 MB |
+| debian/bookworm | 203,726 | 153.5 MB |
+| **Total (excl. ESM/PPA/third-party)** | **1,536,911** | **~1.41 GB** |
+
+Package stanzas average **1,050 bytes** (Ubuntu) and **806 bytes** (Debian) of in-memory text. Adding ESM/PPA/third-party sources on top of this table's totals brings the full catalog to somewhat above 1.41 GB.
+
+The config used for this data includes four Ubuntu codenames (noble, jammy, focal, bionic) with x86 and ports upstreams, two Debian stable codenames (trixie, bookworm), plus (not separately re-measured) Ubuntu ESM/Pro on the LTS releases and various third-party repos.
 
 ## Live cache
 
@@ -75,37 +78,61 @@ Enabling `valkey:` (see `config.example.yaml`) moves both of these off the heap
 of every debproxy process and into a shared Valkey/Redis deployment instead --
 see [Optional Valkey-backed shared cache](design.md#optional-valkey-backed-shared-cache-multi-replica-deployments)
 in the design doc for the full mechanism (distributed fetch lock, freshness
-tracking, live-artifact pub/sub). The practical memory effect:
+tracking, live-artifact pub/sub).
 
-- **Valkey's own memory usage is about the same as one non-Valkey debproxy
-  instance's total** -- ~4.8 GB at the reference configuration above. It is
-  holding the same underlying data (parsed upstream stanzas plus compressed
-  live artifacts); the difference is that it holds **one shared copy** instead
-  of one copy per replica.
-- **Each debproxy replica's own memory usage drops to roughly 1/8th** of the
-  non-Valkey figure -- around **600 MB** at the reference configuration,
-  instead of ~4.8 GB. A replica that finds Valkey's copy fresh adopts it
-  directly (a handful of Valkey round trips) rather than fetching from
-  upstream and parsing/compressing locally, and evicts its own local copy of
-  an upstream's data once a refresh cycle is done with it
+The rest of this document (upstream package cache, live cache, the ~4.8 GB
+total) describes a **non-Valkey** instance. This section, by contrast, is
+grounded in a **real measurement of an actual Valkey-enabled production
+deployment**:
+
+**Measured 2026-07-14, production, real config (4 Ubuntu codenames +
+2 Debian codenames + ESM + PPAs + third-party repos, per `config.example.yaml`'s
+reference layout):**
+
+| | |
+|---|---:|
+| Valkey memory attributable to debproxy | ~3.1 GB |
+| Valkey `mem_fragmentation_ratio` | 1.01 (healthy) |
+| Each debproxy replica's own RSS, steady state | ~1 GB |
+| Each debproxy replica's own RSS, during a rebuild | 3-4 GB |
+| Upstream cache key count (`up-pkg`, individual entries) | 1,627,930 |
+
+- **Valkey does NOT hold the live cache at all.** The live cache (compressed
+  gz/zst Packages files served to apt clients) exists only in each replica's
+  own local memory (`Server.liveCache`); replicas share a *freshly-built* one
+  via direct peer-to-peer HTTP fetch plus a small Valkey pub/sub notice (see
+  `liveUpdatedMsg` in `internal/server/valkey.go`) -- the file content itself
+  never goes through Valkey. What Valkey *does* hold is the upstream package
+  cache (per-upstream-source, undeduplicated -- see the methodology note
+  above) plus the pool metadata index (`internal/metadata/valkeystore`,
+  tracking packages actually downloaded into local pool storage via
+  pull-through/auto-update -- sized by how much of the catalog has actually
+  been fetched, not the full upstream catalog size, and starts small on a
+  fresh deployment or after a pool GC).
+- **Each debproxy replica's own memory usage is ~1 GB, steady state.**
+  A replica that finds Valkey's copy fresh adopts it directly (a handful of Valkey round trips) rather than
+  fetching from upstream and parsing/compressing locally, and evicts its own
+  local copy of an upstream's data once a refresh cycle is done with it
   (`IndexCache.EvictUpstream`) instead of holding every upstream's stanzas
   resident for the life of the process.
-- **Except during a rebuild action.** Whenever a replica is the one actually
-  doing real work -- the periodic background refresh for a layout, or an
-  on-demand `/live` build that can't adopt a fresh copy from Valkey (cold
-  start with nothing cached yet, or Valkey's copy has expired) -- that
-  replica must hold the full merged data resident to parse and (for `/live`)
-  compress it, the same as the non-Valkey path. Memory on that one replica
-  temporarily approaches the non-Valkey per-instance figures above for the
-  duration of that rebuild, then drops back to the ~1/8th steady state once
-  the result is evicted/adopted-from-Valkey again. Provision each replica for
-  the **non-Valkey steady-state figure**, not the ~600 MB typical figure, so an
-  in-progress rebuild on any one replica doesn't OOM it.
+- **Except during a rebuild action -- measured at 3-4 GB.** Whenever a
+  replica is the one actually doing real work -- the periodic background
+  refresh for a layout, or an on-demand `/live` build that can't adopt a
+  fresh copy from Valkey (cold start with nothing cached yet, or Valkey's
+  copy has expired) -- that replica must hold the full merged data resident
+  to parse and (for `/live`) compress it, the same as the non-Valkey path.
+  Memory on that one replica temporarily rises to **3-4 GB measured**
+  (below the non-Valkey per-instance figure, since only the one layout being
+  rebuilt is resident, not every configured layout at once), then drops back
+  to the ~1 GB steady state once the result is evicted/adopted-from-Valkey
+  again. Provision each replica for the **measured rebuild-spike figure
+  (4 GB)**, not the ~1 GB typical figure, so an in-progress rebuild on any
+  one replica doesn't OOM it.
 
 Net effect for an N-replica deployment: without Valkey, total memory is
-roughly `N x 4.8 GB`. With Valkey, it's roughly `4.8 GB (Valkey) + N x 600 MB`
-in steady state, with each replica still provisioned to absorb its own
-rebuild spike.
+roughly `N x 4.8 GB`. With Valkey, it's roughly `~3.1 GB (Valkey, debproxy's
+share) + N x 1 GB` in steady state, with each replica still provisioned for
+its own ~4 GB rebuild spike.
 
 ## Configuration recommendations
 

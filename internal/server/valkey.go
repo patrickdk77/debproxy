@@ -145,17 +145,13 @@ type liveUpdatedMsg struct {
 // staleness and fetches, without changing anything about the fetch path.
 var liveUpdateInvalidateJitter = 10 * time.Second
 
-// handleLiveUpdatedMessage records the notice immediately (for the next
-// buildOrAdoptLiveFiles call to use, see adoptLiveFromPeer -- cheap
-// bookkeeping, not a network fetch, so it doesn't need jitter) and, after a
-// random delay (see liveUpdateInvalidateJitter), invalidates this replica's
-// own local liveCache entry for the notified os/codename by marking it
-// expired, so the next request after that delay runs the existing
-// stale-serve-then-background-refresh path (getLive/rebuildLive, unchanged)
-// instead of waiting out its own TTL. A notification for an os/codename this
-// replica hasn't served yet is a no-op beyond recording the notice: there is
-// no local entry to invalidate, and the next real request does a cold-start
-// build, which already checks for a recent peer notice first.
+// handleLiveUpdatedMessage records a peer's freshly-published generation and
+// proactively adopts it after a jitter delay -- it does not wait for a
+// client request to arrive and trigger the pull. Only a client request that
+// arrives first (see getLive's stale-entry branch) cancels this in favor of
+// the rebuild it starts itself, so the same generation is never fetched
+// twice. Jittered across replicas (see liveUpdateInvalidateJitter) so they
+// don't all hit the publisher at once.
 func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 	var m liveUpdatedMsg
 	if err := json.Unmarshal([]byte(msg.Message), &m); err != nil {
@@ -171,17 +167,49 @@ func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 	}
 
 	jitter := valkeycache.RandDuration(liveUpdateInvalidateJitter)
-	safego.Go("live-updated cache invalidation", func() {
-		if jitter > 0 {
-			time.Sleep(jitter)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s.mu.Lock()
+	// A newer notice for the same layout supersedes any still-pending
+	// proactive adopt from an earlier one -- cancel it so it doesn't fire a
+	// redundant rebuild once this notice's own timer completes instead.
+	if prevCancel, pending := s.pendingPeerAdopt[cacheKey]; pending {
+		prevCancel()
+	}
+	s.pendingPeerAdopt[cacheKey] = cancel
+	s.mu.Unlock()
+
+	safego.Go("live-updated proactive adopt", func() {
+		defer cancel()
+		select {
+		case <-ctx.Done():
+			// Canceled: superseded by a newer notice, or a client request
+			// already started the same rebuild via getLive -- either way,
+			// nothing left to do here.
+			return
+		case <-time.After(jitter):
 		}
+
 		s.mu.Lock()
-		if entry, ok := s.liveCache[cacheKey]; ok {
-			expired := *entry
-			expired.expiry = time.Time{}
-			s.liveCache[cacheKey] = &expired
+		delete(s.pendingPeerAdopt, cacheKey)
+		entry, ok := s.liveCache[cacheKey]
+		_, building := s.liveBuilding[cacheKey]
+		if !ok || building {
+			// Nothing cached for this layout on this replica -- don't
+			// proactively build something nobody here has ever asked for --
+			// or a build is already in flight (a client request beat this
+			// timer to it; avoid a redundant concurrent rebuild).
+			s.mu.Unlock()
+			return
 		}
+		expired := *entry
+		expired.expiry = time.Time{}
+		s.liveCache[cacheKey] = &expired
+		wait := make(chan struct{})
+		s.liveBuilding[cacheKey] = wait
 		s.mu.Unlock()
+
+		s.rebuildLive(m.OS, m.Codename, cacheKey, wait)
 	})
 }
 
