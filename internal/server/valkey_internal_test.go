@@ -14,7 +14,13 @@ import (
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/testsupport"
+	"github.com/debproxy/debproxy/internal/upstream"
 )
+
+// roundTripFunc lets a plain func satisfy http.RoundTripper for tests below.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func testLayoutConfig() *config.Config {
 	return &config.Config{ResolvedLayouts: []model.Layout{{OS: "debian", Codename: "trixie"}}}
@@ -24,7 +30,7 @@ func newValkeyEnabledServer(t *testing.T, listenAddr string) *Server {
 	t.Helper()
 	client := testsupport.NewTestClient(t, TestValkeyAddr)
 	s := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
-	stop := s.EnableValkey(context.Background(), client, listenAddr)
+	stop := s.EnableValkey(context.Background(), client, listenAddr, "")
 	t.Cleanup(stop)
 	return s
 }
@@ -78,6 +84,54 @@ func TestHandleLiveUpdatedMessageProactivelyRebuildsMatchingEntry(t *testing.T) 
 	s.mu.Unlock()
 	if untouched != originalNoble {
 		t.Fatal("expected unrelated ubuntu/noble entry to be left untouched")
+	}
+}
+
+// TestHandleLiveUpdatedMessageIgnoresOwnNotice is the direct regression test
+// for the production incident where a replica downloaded its own files: since
+// EnableValkey subscribes to the exact channel it also publishes on, a
+// replica always receives its own live-updated notice back. Before SourceID
+// filtering, the proactive-adopt jitter timer would still fire on that
+// self-notice, invalidate the entry the replica had itself just built, and
+// then "adopt" it right back from its own advertised address over real HTTP.
+func TestHandleLiveUpdatedMessageIgnoresOwnNotice(t *testing.T) {
+	orig := liveUpdateInvalidateJitter
+	liveUpdateInvalidateJitter = time.Millisecond
+	t.Cleanup(func() { liveUpdateInvalidateJitter = orig })
+
+	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
+	s.valkey = &serverValkeyBacking{instanceID: "self-id", notices: map[string]liveUpdatedMsg{}}
+
+	future := time.Now().Add(time.Hour)
+	original := &liveEntry{expiry: future}
+	s.liveCache["debian/trixie"] = original
+
+	msg, err := json.Marshal(liveUpdatedMsg{OS: "debian", Codename: "trixie", SourceID: "self-id"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(msg)})
+
+	// Give a wrongly-scheduled proactive adopt time to fire if the filter
+	// didn't work, then confirm nothing changed.
+	time.Sleep(50 * time.Millisecond)
+
+	s.mu.Lock()
+	untouched := s.liveCache["debian/trixie"] == original
+	_, pending := s.pendingPeerAdopt["debian/trixie"]
+	s.mu.Unlock()
+	if !untouched {
+		t.Error("own notice triggered a proactive rebuild of the entry this replica just built")
+	}
+	if pending {
+		t.Error("own notice registered a pending peer-adopt timer, want it ignored outright")
+	}
+
+	s.valkey.mu.Lock()
+	_, stored := s.valkey.notices["debian/trixie"]
+	s.valkey.mu.Unlock()
+	if stored {
+		t.Error("own notice was stored in the notices map, want it ignored before storage")
 	}
 }
 
@@ -301,6 +355,67 @@ func TestPublishLiveUpdate_SkipsWhenNoPeerAddrs(t *testing.T) {
 		t.Error("publishLiveUpdate published a notice despite having no peer addresses to advertise")
 	case <-time.After(500 * time.Millisecond):
 		// expected: nothing published
+	}
+}
+
+// TestPeerUserAgentTransportPrecedence proves peerUserAgentTransport's three
+// -tier precedence: a live client's own User-Agent (passed through via
+// upstream.WithUserAgent on the request context) beats the configured value,
+// which beats the fixed fallback used when neither exists.
+func TestPeerUserAgentTransportPrecedence(t *testing.T) {
+	var gotUA string
+	capture := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotUA = r.Header.Get("User-Agent")
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	})
+
+	newReq := func(ctx context.Context) *http.Request {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req
+	}
+
+	cases := []struct {
+		name       string
+		ctx        context.Context
+		configured string
+		fallback   string
+		want       string
+	}{
+		{
+			name:       "client passthrough wins over configured and fallback",
+			ctx:        upstream.WithUserAgent(context.Background(), "apt-client/1.0"),
+			configured: "configured-ua",
+			fallback:   "debproxy fallback",
+			want:       "apt-client/1.0",
+		},
+		{
+			name:       "configured wins when no client UA in context",
+			ctx:        context.Background(),
+			configured: "configured-ua",
+			fallback:   "debproxy fallback",
+			want:       "configured-ua",
+		},
+		{
+			name:       "fallback used when neither client UA nor configured exist",
+			ctx:        context.Background(),
+			configured: "",
+			fallback:   "debproxy fallback",
+			want:       "debproxy fallback",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			transport := &peerUserAgentTransport{base: capture, configured: tc.configured, fallback: tc.fallback}
+			if _, err := transport.RoundTrip(newReq(tc.ctx)); err != nil {
+				t.Fatalf("RoundTrip: %v", err)
+			}
+			if gotUA != tc.want {
+				t.Errorf("User-Agent = %q, want %q", gotUA, tc.want)
+			}
+		})
 	}
 }
 

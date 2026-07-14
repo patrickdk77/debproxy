@@ -42,6 +42,15 @@ func clientIsWaiting(ctx context.Context) bool {
 	return v
 }
 
+// UserAgentFromContext returns the User-Agent stored by WithUserAgent, if
+// any -- used by callers outside this package (e.g. the server's
+// peer-to-peer live-cache fetch client) that need the same passthrough value
+// without going through NewHTTPClient's own configured>context precedence.
+func UserAgentFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(userAgentKey).(string)
+	return v, ok
+}
+
 // NewHTTPClient returns an *http.Client tuned for fetching from Debian mirror
 // upstreams:
 //   - 10 s connect and TLS handshake timeout

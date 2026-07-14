@@ -2,12 +2,15 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 
 	"github.com/debproxy/debproxy/internal/avail"
 	"github.com/debproxy/debproxy/internal/safego"
+	"github.com/debproxy/debproxy/internal/upstream"
 	"github.com/debproxy/debproxy/internal/valkeycache"
 )
 
@@ -29,9 +33,10 @@ import (
 // (see the design doc's incident writeup), a risk that disappears entirely
 // once Valkey never carries file content at all.
 type serverValkeyBacking struct {
-	client    valkey.Client
-	peerAddrs []string     // this replica's own "host:port" candidates, advertised in its own notices
-	peerHTTP  *http.Client // bounded-timeout client used for peer-to-peer fetches
+	client     valkey.Client
+	peerAddrs  []string     // this replica's own "host:port" candidates, advertised in its own notices
+	peerHTTP   *http.Client // bounded-timeout client used for peer-to-peer fetches
+	instanceID string       // random per-process ID stamped on this replica's own notices, see handleLiveUpdatedMessage
 
 	mu      sync.Mutex
 	notices map[string]liveUpdatedMsg // key: os/codename -> most recently received notice
@@ -45,20 +50,29 @@ type serverValkeyBacking struct {
 // combined with every non-loopback local interface address, forms the
 // peerAddrs this replica advertises in its own notices -- other replicas may
 // listen on a different port than this one, so each replica must always
-// advertise its own, never assume a shared value. Call once at startup; the
-// returned stop func must be called on graceful shutdown to stop the
-// subscriber goroutine.
-func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, listenAddr string) (stop func()) {
+// advertise its own, never assume a shared value. userAgent is the
+// configured cfg.UserAgent (may be empty); see peerUserAgentTransport for how
+// it's used. Call once at startup; the returned stop func must be called on
+// graceful shutdown to stop the subscriber goroutine.
+func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, listenAddr string, userAgent string) (stop func()) {
 	s.valkey = &serverValkeyBacking{
-		client:    v,
-		peerAddrs: localPeerAddrs(listenAddr),
+		client:     v,
+		peerAddrs:  localPeerAddrs(listenAddr),
+		instanceID: newInstanceID(),
 		// 30s, not the original 10s: production logs showed this timing out
 		// ("Client.Timeout exceeded while awaiting headers") for ordinary
 		// Packages.zst-sized fetches whenever the peer replica was itself busy
 		// (e.g. mid rebuild for a large layout), forcing an unnecessary local
 		// rebuild instead of the cheap peer adopt this path exists for.
-		peerHTTP: &http.Client{Timeout: 30 * time.Second},
-		notices:  map[string]liveUpdatedMsg{},
+		peerHTTP: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &peerUserAgentTransport{
+				base:       http.DefaultTransport,
+				configured: userAgent,
+				fallback:   debproxyUserAgentFallback(),
+			},
+		},
+		notices: map[string]liveUpdatedMsg{},
 	}
 
 	subCtx, cancel := context.WithCancel(ctx)
@@ -125,7 +139,79 @@ type liveUpdatedMsg struct {
 	BuiltAt  time.Time         `json:"built_at"`
 	Expiry   time.Time         `json:"expiry"`
 	Hashes   map[string]string `json:"hashes"`
-	Files    []string          `json:"files"` // entry.files map keys, e.g. "dists/noble/main/binary-amd64/Packages.gz"
+	Files    []string          `json:"files"`     // entry.files map keys, e.g. "dists/noble/main/binary-amd64/Packages.gz"
+	SourceID string            `json:"source_id"` // publisher's serverValkeyBacking.instanceID, see handleLiveUpdatedMessage
+}
+
+// newInstanceID returns a random per-process identifier, used to recognize
+// and ignore this replica's own notices (see handleLiveUpdatedMessage): every
+// replica subscribes to the exact channel it also publishes on, so without
+// this it would receive its own live-updated notice back and could
+// proactively "adopt" its own just-built files from itself over HTTP.
+func newInstanceID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is effectively impossible in practice; a fixed
+		// fallback still can't collide with another replica's real random
+		// draw, so self-notice filtering keeps working either way.
+		return "unknown-instance"
+	}
+	return hex.EncodeToString(b)
+}
+
+// debproxyUserAgentFallback returns "debproxy <commit>[-dirty]", built the
+// same way as the `debproxy version` CLI command (cmd/debproxy/main.go's
+// runVersion) -- used as peerUserAgentTransport's last-resort User-Agent when
+// neither a live client's own UA nor a configured one is available.
+func debproxyUserAgentFallback() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "debproxy"
+	}
+	commit, dirty := "unknown", ""
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			commit = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	return fmt.Sprintf("debproxy %s%s", commit, dirty)
+}
+
+// peerUserAgentTransport sets the outgoing User-Agent for peer-to-peer
+// live-cache fetches. Priority: the real apt client's own User-Agent (via
+// upstream.WithUserAgent -- only present when this fetch is running
+// synchronously in front of a live client request, i.e. getLive's /live
+// cold-start path; every background rebuild -- a stale entry's refresh, the
+// notice-driven proactive adopt -- runs on a detached context.Background()
+// and carries none) > the configured cfg.UserAgent > a fixed
+// "debproxy <commit>" identifier. This is the opposite precedence from
+// upstream mirror fetches (internal/upstream/transport.go's
+// userAgentTransport, configured > passthrough): a peer fetch never reaches
+// a real mirror, so there's no reason to prefer a static configured value
+// over the real client's own UA when both are available, and when neither
+// is, an identifiable fallback beats leaking Go's bare default.
+type peerUserAgentTransport struct {
+	base       http.RoundTripper
+	configured string
+	fallback   string
+}
+
+func (t *peerUserAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ua, _ := upstream.UserAgentFromContext(req.Context())
+	if ua == "" {
+		ua = t.configured
+	}
+	if ua == "" {
+		ua = t.fallback
+	}
+	req = req.Clone(req.Context())
+	req.Header.Set("User-Agent", ua)
+	return t.base.RoundTrip(req)
 }
 
 // liveUpdateInvalidateJitter bounds a random delay between receiving a
@@ -156,6 +242,15 @@ func (s *Server) handleLiveUpdatedMessage(msg valkey.PubSubMessage) {
 	var m liveUpdatedMsg
 	if err := json.Unmarshal([]byte(msg.Message), &m); err != nil {
 		slog.Warn("valkey: decode live-updated message failed", "err", err)
+		return
+	}
+	if s.valkey != nil && m.SourceID != "" && m.SourceID == s.valkey.instanceID {
+		// This replica's own notice, echoed back by the pub/sub subscription
+		// it also publishes on -- not a peer. Ignoring it here (rather than
+		// filtering only the proactive-adopt trigger) also keeps it out of
+		// the notices map entirely, so a later cold-start/stale-entry adopt
+		// attempt can never "fetch" from this replica's own advertised
+		// address either.
 		return
 	}
 	cacheKey := m.OS + "/" + m.Codename
@@ -366,6 +461,7 @@ func (s *Server) publishLiveUpdate(osName, codename string, files map[string][]b
 		Addrs:   b.peerAddrs,
 		BuiltAt: builtAt, Expiry: expiry,
 		Hashes: hashes, Files: relpaths,
+		SourceID: b.instanceID,
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {

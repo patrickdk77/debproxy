@@ -782,7 +782,7 @@ func runServe(args []string) int {
 	webServer := server.New(cfg, store, index, key, httpClient, indexCache, notifier, syncr.ExistsCache())
 	stopLiveValkey := func() {}
 	if cfg.Valkey.Enabled {
-		stopLiveValkey = webServer.EnableValkey(context.Background(), vclient, *addr)
+		stopLiveValkey = webServer.EnableValkey(context.Background(), vclient, *addr, cfg.UserAgent)
 	}
 
 	// If storage.file_cache.size is configured, store is a *filecache.Store
