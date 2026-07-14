@@ -754,6 +754,102 @@ func TestGCSrcReferencedByMetadataSourceEntryKept(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Tests: orphan-ratio safety check (checkOrphanRatio)
+// ---------------------------------------------------------------------------
+
+// TestGCPoolAbortsWhenOrphanRatioImplausiblyHigh is the regression test for
+// the actual incident: a broken/empty reference set (metadata index and
+// snapshots both empty) must not be allowed to delete a large, otherwise-
+// healthy pool. Below minFilesForRatioCheck this can't be distinguished from
+// routine small-scale GC, so the pool here is well above that floor.
+func TestGCPoolAbortsWhenOrphanRatioImplausiblyHigh(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{} // empty index -- nothing protected
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	now := time.Now()
+	for i := 0; i < 60; i++ {
+		path := fmt.Sprintf("pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo_%d.0_amd64.deb", i)
+		store.poolFiles[path] = struct{}{}
+		store.poolMTimes[path] = now.Add(-2 * time.Hour) // past grace period
+	}
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(store.deleted) != 0 {
+		t.Errorf("expected GC to abort rather than delete a mostly-orphaned pool, but deleted %d files: %v", len(store.deleted), store.deleted)
+	}
+}
+
+// TestGCPoolProceedsWhenOrphanRatioBelowThreshold proves the safety check
+// doesn't block ordinary GC: a small tail of genuinely superseded/orphaned
+// files among a large, mostly-referenced pool should still be deleted.
+func TestGCPoolProceedsWhenOrphanRatioBelowThreshold(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	var entries []model.IndexEntry
+	for i := 0; i < 50; i++ {
+		path := fmt.Sprintf("pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo-keep-%d_1.0_amd64.deb", i)
+		store.poolFiles[path] = struct{}{}
+		store.poolMTimes[path] = now.Add(-2 * time.Hour)
+		entries = append(entries, model.IndexEntry{
+			OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
+			Package: fmt.Sprintf("libfoo-keep-%d", i), Version: "1.0", PoolPath: path,
+		})
+	}
+	idx.entries = entries
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	// A small number of genuinely orphaned files -- well under maxOrphanRatio
+	// of the total 60 files scanned.
+	var orphans []string
+	for i := 0; i < 10; i++ {
+		path := fmt.Sprintf("pool/ubuntu/jammy/upstream/main/l/libfoo/libfoo-orphan-%d_1.0_amd64.deb", i)
+		store.poolFiles[path] = struct{}{}
+		store.poolMTimes[path] = now.Add(-2 * time.Hour)
+		orphans = append(orphans, path)
+	}
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	for _, path := range orphans {
+		if !contains(store.deleted, path) {
+			t.Errorf("expected genuinely orphaned file %q to be deleted when orphan ratio is low, deleted=%v", path, store.deleted)
+		}
+	}
+	if len(store.deleted) != len(orphans) {
+		t.Errorf("expected exactly %d deletions, got %d: %v", len(orphans), len(store.deleted), store.deleted)
+	}
+}
+
+// TestGCSrcAbortsWhenOrphanRatioImplausiblyHigh is gcSrc's counterpart to
+// TestGCPoolAbortsWhenOrphanRatioImplausiblyHigh.
+func TestGCSrcAbortsWhenOrphanRatioImplausiblyHigh(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	for i := 0; i < 60; i++ {
+		path := fmt.Sprintf("src/ubuntu/jammy/upstream/main/l/libfoo/libfoo_%d.0.orig.tar.gz", i)
+		store.publishedFiles[path] = "data"
+	}
+
+	if err := s.Cleanup(context.Background(), 0, 0, time.Now()); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(store.deleted) != 0 {
+		t.Errorf("expected src GC to abort rather than delete a mostly-orphaned tree, but deleted %d files: %v", len(store.deleted), store.deleted)
+	}
+}
+
 func TestGCSrcNotReferencedDeleted(t *testing.T) {
 	store := newMockStorage()
 	idx := &mockIndex{}

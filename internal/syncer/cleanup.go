@@ -166,9 +166,50 @@ func (s *Syncer) deleteOrphans(ctx context.Context, kind string, candidates []st
 	return deleted
 }
 
+// maxOrphanRatio bounds what fraction of a pool/src scan gcPool/gcSrc will
+// ever delete in one run. A correctly functioning reference set (built from
+// real published snapshots plus the metadata index) should only ever orphan
+// a small tail of superseded/abandoned files. If most or all scanned files
+// look unreferenced, that's overwhelmingly a sign the reference set itself
+// is broken -- an empty/thin metadata index, or snapshots that have been
+// publishing empty content -- not that the pool suddenly turned into
+// garbage. Refusing to delete in that case trades a skipped GC cycle (cheap,
+// recoverable next run) for what would otherwise be irreversible data loss.
+// This exists because exactly that happened: a silently-empty metadata index
+// drove gcPool to delete a multi-gigabyte pool down to a few tens of
+// megabytes, one weekly cleanup at a time, with nothing to stop it.
+const maxOrphanRatio = 0.5
+
+// minFilesForRatioCheck: below this many scanned files, a ratio judgment is
+// too noisy to be meaningful (a handful of superseded versions in a small
+// pool can easily exceed maxOrphanRatio while being completely routine) --
+// the safety check only engages once there's enough volume for the ratio to
+// mean something.
+const minFilesForRatioCheck = 50
+
+// checkOrphanRatio reports whether gcPool/gcSrc should abort this run rather
+// than delete, based on maxOrphanRatio. Logs at ERROR (not Warn, since this
+// is not routine housekeeping) and increments metrics.GCAbortedTotal so it's
+// visible/alertable -- an abort here should never pass silently.
+func checkOrphanRatio(kind string, total, orphaned int) bool {
+	if total < minFilesForRatioCheck {
+		return false
+	}
+	ratio := float64(orphaned) / float64(total)
+	if ratio <= maxOrphanRatio {
+		return false
+	}
+	slog.Error("cleanup: refusing to GC, orphan ratio implausibly high -- reference set (metadata index/snapshots) may be broken",
+		"kind", kind, "total_files", total, "orphaned", orphaned, "ratio", ratio, "max_allowed_ratio", maxOrphanRatio)
+	metrics.GCAbortedTotal.WithLabelValues(kind).Inc()
+	return true
+}
+
 // gcPool removes pool files not referenced by any remaining snapshot or the
 // metadata index, and returns the number of files deleted. Candidates newer
-// than gcGracePeriod are skipped this run (see gcGracePeriod).
+// than gcGracePeriod are skipped this run (see gcGracePeriod). Aborts
+// (deleting nothing) if the orphan ratio looks implausibly high -- see
+// checkOrphanRatio.
 func (s *Syncer) gcPool(ctx context.Context, now time.Time) (int, error) {
 	ref, err := s.buildPoolRefSet(ctx)
 	if err != nil {
@@ -176,13 +217,19 @@ func (s *Syncer) gcPool(ctx context.Context, now time.Time) (int, error) {
 	}
 
 	var candidates []storage.FileInfo
+	var total int
 	if err := s.store.WalkPool(ctx, func(info storage.FileInfo) error {
+		total++
 		if !ref[info.Path] {
 			candidates = append(candidates, info)
 		}
 		return nil
 	}); err != nil {
 		return 0, fmt.Errorf("walk pool: %w", err)
+	}
+
+	if checkOrphanRatio("pool", total, len(candidates)) {
+		return 0, nil
 	}
 
 	return s.deleteOrphans(ctx, "pool file", candidates, now), nil
@@ -276,7 +323,9 @@ func (s *Syncer) scanPackagesRefs(ctx context.Context, relPath string, ref map[s
 
 // gcSrc removes src/ files not referenced by any remaining snapshot or the
 // metadata source index, and returns the number of files deleted. Candidates
-// newer than gcGracePeriod are skipped this run (see gcGracePeriod).
+// newer than gcGracePeriod are skipped this run (see gcGracePeriod). Aborts
+// (deleting nothing) if the orphan ratio looks implausibly high -- see
+// checkOrphanRatio.
 func (s *Syncer) gcSrc(ctx context.Context, now time.Time) (int, error) {
 	ref, err := s.buildSrcRefSet(ctx)
 	if err != nil {
@@ -295,6 +344,10 @@ func (s *Syncer) gcSrc(ctx context.Context, now time.Time) (int, error) {
 		if !ref[fi.Path] {
 			candidates = append(candidates, fi)
 		}
+	}
+
+	if checkOrphanRatio("src", len(allSrc), len(candidates)) {
+		return 0, nil
 	}
 
 	return s.deleteOrphans(ctx, "src file", candidates, now), nil

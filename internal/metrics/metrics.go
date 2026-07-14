@@ -78,6 +78,17 @@ var (
 		Help: "Total snapshot directories pruned by cleanup runs.",
 	})
 
+	// GCAbortedTotal counts pool/src GC passes that refused to delete because
+	// the orphan ratio looked implausibly high (see maxOrphanRatio in
+	// internal/syncer/cleanup.go) -- a signal the reference set itself (the
+	// metadata index and/or published snapshots) is broken, not that the
+	// pool/src tree is suddenly mostly garbage. Should normally stay at 0;
+	// any increment needs investigating before the next cleanup run.
+	GCAbortedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "debproxy_gc_aborted_total",
+		Help: "GC passes aborted because the orphan ratio looked implausibly high, labeled by kind (pool/src).",
+	}, []string{"kind"})
+
 	// BuildInfo exposes the running binary's VCS revision as a gauge fixed at 1,
 	// labeled with revision info. Unlike the *Vec metrics above, it is set once
 	// here so it is always present in /metrics from process start, letting

@@ -23,6 +23,7 @@ import (
 	"github.com/debproxy/debproxy/internal/api"
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/metadata"
+	"github.com/debproxy/debproxy/internal/metadata/valkeystore"
 	"github.com/debproxy/debproxy/internal/metadatafactory"
 	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
@@ -245,6 +246,48 @@ func openBackends(ctx context.Context, cfg *config.Config) (storage.Storage, met
 		return nil, nil, err
 	}
 	return store, index, nil
+}
+
+// reconcileIndexIfEmpty checks whether index looks empty at startup and, if
+// so, repairs it before the server starts taking traffic: first restoring
+// whatever was last durably backed up (see valkeystore.Store.Restore -- only
+// applicable when index is Valkey-backed, since deb822store already
+// persists incrementally through its own files and can't itself go "empty"
+// independent of them), then reconciling any pool files newer than that
+// backup via the same on-demand-upstream-lookup logic `debproxy rebuild`
+// uses (called here with ResetIndex: false, so nothing already present is
+// ever touched).
+//
+// This exists because a silently-empty index was found driving snapshot
+// generation to publish nothing, which in turn made the weekly pool/src GC's
+// reference set look empty too -- see checkOrphanRatio (internal/syncer/
+// cleanup.go) for the safety net that now also guards against this, and
+// which this reconciliation is meant to make unnecessary in the first place
+// by not leaving the index empty across a restart.
+func reconcileIndexIfEmpty(ctx context.Context, cfg *config.Config, store storage.Storage, index metadata.MetadataIndex, client *http.Client) error {
+	entries, err := index.ListEntries(ctx, model.Selector{})
+	if err != nil {
+		return fmt.Errorf("check index: %w", err)
+	}
+	if len(entries) > 0 {
+		return nil
+	}
+
+	slog.Warn("metadata index is empty at startup, reconciling from backup and pool")
+
+	if vs, ok := index.(*valkeystore.Store); ok {
+		packages, sources, rErr := vs.Restore(ctx, store)
+		if rErr != nil {
+			slog.Error("restore metadata from backup failed, continuing to pool-walk reconciliation", "err", rErr)
+		} else {
+			slog.Info("restored metadata from backup", "packages", packages, "sources", sources)
+		}
+	}
+
+	if err := rebuild.Run(ctx, cfg, store, index, rebuild.Options{ResetIndex: false, HTTPClient: client}); err != nil {
+		return fmt.Errorf("reconcile pool: %w", err)
+	}
+	return nil
 }
 
 func runRebuild(args []string) int {
@@ -583,6 +626,11 @@ func runServe(args []string) int {
 
 	httpClient := upstream.NewHTTPClient(cfg.UserAgent)
 	indexCache := upstream.NewIndexCache()
+
+	if err := reconcileIndexIfEmpty(context.Background(), cfg, store, index, httpClient); err != nil {
+		slog.Error("reconcile metadata index", "err", err)
+		return 1
+	}
 
 	// vclient is shared between the upstream fetch cache/lock (below) and the
 	// /live serving-artifact cache (wired into server.New's result further
