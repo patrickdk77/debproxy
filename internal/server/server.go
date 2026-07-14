@@ -903,7 +903,7 @@ func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
 
 	slog.Debug("pull-through", "path", poolPath, "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
 	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
-	return in.Cache(ctx, osName, codename, p)
+	return in.Cache(ctx, osName, codename, p, true)
 }
 
 // buildAvail runs avail.Build under s.indexCache's build lock, shared with

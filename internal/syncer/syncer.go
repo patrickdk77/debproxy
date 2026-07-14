@@ -100,7 +100,7 @@ func (s *Syncer) Prime(ctx context.Context, osName, codename, component string, 
 	for _, arch := range av.Arches {
 		closure := av.DepClosure(component, arch, names)
 		for _, p := range closure {
-			if err := in.Cache(ctx, osName, codename, p); err != nil {
+			if err := in.Cache(ctx, osName, codename, p, true); err != nil {
 				return fmt.Errorf("cache %s: %w", p.Name, err)
 			}
 		}
@@ -232,6 +232,19 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache, only
 							slog.Warn("upsert source entry after auto-update download", "package", sp.Package, "err", err)
 						}
 						srcUpdated++
+						// One notification per source package, not per file --
+						// its files (.dsc, orig tarball, debian tarball/diff)
+						// are all one logical update, mirroring the binary
+						// side's one-webhook-per-updated-package rule.
+						s.notifier.Fire(webhook.Event{
+							Package:   sp.Package,
+							Version:   sp.Version,
+							OS:        k.osName,
+							Codename:  k.codename,
+							Component: comp,
+							Upstream:  sp.Upstream.Name,
+							PoolPath:  sp.LocalDir,
+						})
 					}
 				}
 			}
@@ -261,9 +274,14 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache, only
 			if debversion.Compare(p.Version, e.Version) <= 0 {
 				continue
 			}
+			// Downloading p itself is the notification-worthy event; the rest
+			// of the closure is only here to satisfy p's own Depends/
+			// Pre-Depends -- those downloads must still happen (an installed
+			// dependency requirement, not merely an optional nicety), but
+			// they're not separate updates of their own and stay silent.
 			closure := av.DepClosure(e.Component, e.Arch, []string{e.Package})
 			for _, dep := range closure {
-				if err := in.Cache(ctx, k.osName, k.codename, dep); err != nil {
+				if err := in.Cache(ctx, k.osName, k.codename, dep, dep.Name == e.Package); err != nil {
 					return fmt.Errorf("update cache %s: %w", dep.Name, err)
 				}
 			}

@@ -50,8 +50,14 @@ func New(store storage.Storage, index metadata.MetadataIndex, client *http.Clien
 }
 
 // Cache ensures the package's .deb is in the pool (downloading and verifying if
-// needed) and records its index entry. It is idempotent.
-func (in *Ingestor) Cache(ctx context.Context, osName, codename string, p avail.Pkg) error {
+// needed) and records its index entry. It is idempotent. notify controls
+// whether a freshly-downloaded package fires a webhook event: callers
+// downloading a whole dependency closure (Syncer.Prime, and pull-through) want
+// every real download notified, but Syncer.runUpdate's auto_update pass wants
+// only the top-level package whose newer version triggered the update to
+// notify -- a dependency pulled in solely to satisfy that package's
+// requirements isn't itself a separate update worth notifying about.
+func (in *Ingestor) Cache(ctx context.Context, osName, codename string, p avail.Pkg, notify bool) error {
 	if in.exists == nil || !in.exists.Has(p.PoolPath) {
 		exists, err := in.store.Exists(ctx, p.PoolPath)
 		if err != nil {
@@ -71,18 +77,20 @@ func (in *Ingestor) Cache(ctx context.Context, osName, codename string, p avail.
 			if p.Upstream.AutoUpdate {
 				metrics.AutoUpdateFilesTotal.WithLabelValues(osName, codename, p.Upstream.Name).Inc()
 			}
-			in.notifier.Fire(webhook.Event{
-				Package:   p.Name,
-				Version:   p.Version,
-				Arch:      p.Arch,
-				OS:        osName,
-				Codename:  codename,
-				Component: p.Component,
-				Section:   p.Section,
-				Upstream:  p.Upstream.Name,
-				PoolPath:  p.PoolPath,
-				Size:      p.Size,
-			})
+			if notify {
+				in.notifier.Fire(webhook.Event{
+					Package:   p.Name,
+					Version:   p.Version,
+					Arch:      p.Arch,
+					OS:        osName,
+					Codename:  codename,
+					Component: p.Component,
+					Section:   p.Section,
+					Upstream:  p.Upstream.Name,
+					PoolPath:  p.PoolPath,
+					Size:      p.Size,
+				})
+			}
 		}
 		if in.exists != nil {
 			in.exists.Add(p.PoolPath)

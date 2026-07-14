@@ -29,6 +29,7 @@ import (
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storagefactory"
 	"github.com/debproxy/debproxy/internal/syncer"
+	"github.com/debproxy/debproxy/internal/webhook"
 )
 
 func TestEndToEnd(t *testing.T) {
@@ -328,6 +329,205 @@ signing:
 	}
 	if !versions["2.0"] {
 		t.Fatalf("expected hello 2.0 after update, got versions %v", versions)
+	}
+}
+
+// TestUpdateJobWebhookOnlyFiresForTopLevelPackageNotDependencies is the direct
+// regression test for the auto_update webhook fix: hello (auto_update: true)
+// Depends on libhello, served by a separate upstream with auto_update: false.
+// When hello's newer version pulls in a newer libhello too (to satisfy that
+// Depends), only hello -- the package whose version bump actually triggered
+// the update -- should fire a webhook. libhello's download must still happen
+// (its own newer version is a real dependency requirement), but silently: it
+// isn't a separate update of its own, just part of satisfying hello's.
+func TestUpdateJobWebhookOnlyFiresForTopLevelPackageNotDependencies(t *testing.T) {
+	dir := t.TempDir()
+
+	upstreamPriv := filepath.Join(dir, "upstream.priv.asc")
+	upstreamPub := filepath.Join(dir, "upstream.pub.asc")
+	writeKeyPair(t, upstreamPriv, upstreamPub)
+	repoPriv := filepath.Join(dir, "repo.priv.asc")
+	writeKeyPair(t, repoPriv, "")
+	upstreamKey, err := signing.Load(upstreamPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// newUpstream stands up one single-package upstream archive (its own
+	// dists/trixie/InRelease etc.), independent of any other so each package
+	// can be given its own auto_update setting in the config below.
+	newUpstream := func(pkgName, extraControl string) (srv *httptest.Server, setVersion func(string)) {
+		var mu sync.Mutex
+		files := map[string][]byte{}
+		set := func(version string) {
+			control := fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: amd64\nSection: utils\nMaintainer: T <t@example.com>\nDescription: %s\n%s",
+				pkgName, version, pkgName, extraControl)
+			deb := buildDeb(t, control)
+			upstreamPath := fmt.Sprintf("pool/main/%s/%s_%s_amd64.deb", pkgName, pkgName, version)
+			packages := packagesStanza(t, control, upstreamPath, deb)
+			gz := gzipBytes(t, packages)
+			release := buildUpstreamRelease(packages, gz)
+			inRelease, err := upstreamKey.SignInline([]byte(release))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			files["/"+upstreamPath] = deb
+			files["/dists/trixie/main/binary-amd64/Packages"] = packages
+			files["/dists/trixie/main/binary-amd64/Packages.gz"] = gz
+			files["/dists/trixie/InRelease"] = inRelease
+		}
+		set("1.0")
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			data, ok := files[r.URL.Path]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(data)
+		}))
+		return s, set
+	}
+
+	helloSrv, setHello := newUpstream("hello", "Depends: libhello\n")
+	defer helloSrv.Close()
+	libSrv, setLib := newUpstream("libhello", "")
+	defer libSrv.Close()
+
+	var hookMu sync.Mutex
+	var received []string
+	hookSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		hookMu.Lock()
+		received = append(received, string(body))
+		hookMu.Unlock()
+	}))
+	defer hookSrv.Close()
+	notifier, err := webhook.New([]webhook.Def{{URL: hookSrv.URL, Body: "{{.Package}} {{.Version}}"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := fmt.Sprintf(`storage:
+  backend: filesystem
+  filesystem:
+    root: %s
+upstreams:
+  hello-src:
+    url: %s
+    suite: "{codename}"
+    keys: [%s]
+    auto_update: true
+  lib-src:
+    url: %s
+    suite: "{codename}"
+    keys: [%s]
+    auto_update: false
+layouts:
+  - os: debian
+    architectures: [amd64]
+    codenames:
+      - codename: trixie
+        components:
+          - component: main
+            upstreams: [hello-src, lib-src]
+signing:
+  private_key: %s
+`, filepath.Join(dir, "store"), helloSrv.URL, upstreamPub, libSrv.URL, upstreamPub, repoPriv)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storagefactory.New(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := deb822store.New(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoKey, err := signing.Load(repoPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// waitForHooks blocks until at least want events have landed (Notifier.Fire
+	// dispatches each hook in its own goroutine, so arrival isn't synchronous
+	// with the Cache call that triggered it), then a short grace period to
+	// catch any further, unwanted arrivals, and returns everything received.
+	waitForHooks := func(want int) []string {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			hookMu.Lock()
+			n := len(received)
+			hookMu.Unlock()
+			if n >= want || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(200 * time.Millisecond) // grace period for stragglers
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		return append([]string(nil), received...)
+	}
+
+	sy := syncer.New(loaded, store, index, repoKey, nil, nil, notifier)
+	if err := sy.Prime(context.Background(), "debian", "trixie", "main", []string{"hello"}); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if got := waitForHooks(2); len(got) != 2 {
+		t.Fatalf("expected exactly 2 webhooks fired by Prime (hello and libhello), got %d: %v", len(got), got)
+	}
+
+	// Prime's own webhooks aren't what this test is about -- only Update's
+	// behavior is.
+	hookMu.Lock()
+	received = nil
+	hookMu.Unlock()
+
+	setHello("2.0")
+	setLib("2.0")
+	if err := sy.Update(context.Background()); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	got := waitForHooks(1)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 webhook fired by Update (hello only), got %d: %v", len(got), got)
+	}
+	if got[0] != "hello 2.0" {
+		t.Errorf("webhook fired for %q, want \"hello 2.0\"", got[0])
+	}
+
+	if err := sy.Snapshot(context.Background(), time.Now()); err != nil {
+		t.Fatalf("snapshot after update: %v", err)
+	}
+	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, notifier, nil).Handler())
+	defer srv.Close()
+	gz := httpGet(t, srv.URL+"/current/debian/dists/trixie/main/binary-amd64/Packages.gz")
+	paras, err := apt.ParseParagraphs(bytes.NewReader(gunzip(t, gz)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions := map[string]string{}
+	for _, p := range paras {
+		versions[p.Get("Package")] = p.Get("Version")
+	}
+	if versions["hello"] != "2.0" {
+		t.Errorf("hello version = %q, want 2.0", versions["hello"])
+	}
+	if versions["libhello"] != "2.0" {
+		t.Errorf("libhello version = %q, want 2.0 (dependency must still be downloaded, just silently)", versions["libhello"])
 	}
 }
 
