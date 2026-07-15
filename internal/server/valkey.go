@@ -34,6 +34,7 @@ import (
 // once Valkey never carries file content at all.
 type serverValkeyBacking struct {
 	client     valkey.Client
+	keys       valkeycache.Keys
 	peerAddrs  []string     // this replica's own "host:port" candidates, advertised in its own notices
 	peerHTTP   *http.Client // bounded-timeout client used for peer-to-peer fetches
 	instanceID string       // random per-process ID stamped on this replica's own notices, see handleLiveUpdatedMessage
@@ -52,11 +53,14 @@ type serverValkeyBacking struct {
 // listen on a different port than this one, so each replica must always
 // advertise its own, never assume a shared value. userAgent is the
 // configured cfg.UserAgent (may be empty); see peerUserAgentTransport for how
-// it's used. Call once at startup; the returned stop func must be called on
-// graceful shutdown to stop the subscriber goroutine.
-func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, listenAddr string, userAgent string) (stop func()) {
+// it's used. keys is used for LiveBuildLock (see rebuildLive), keeping this
+// replica's Valkey keys consistent with the rest of the shared cache. Call
+// once at startup; the returned stop func must be called on graceful
+// shutdown to stop the subscriber goroutine.
+func (s *Server) EnableValkey(ctx context.Context, v valkey.Client, keys valkeycache.Keys, listenAddr string, userAgent string) (stop func()) {
 	s.valkey = &serverValkeyBacking{
 		client:     v,
+		keys:       keys,
 		peerAddrs:  localPeerAddrs(listenAddr),
 		instanceID: newInstanceID(),
 		// 30s, not the original 10s: production logs showed this timing out

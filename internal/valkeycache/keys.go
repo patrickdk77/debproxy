@@ -55,6 +55,24 @@ func (k Keys) FetchLock(upstream, suite, component string) string {
 	return k.Prefix + "lock:fetch:" + k.upstreamTag(upstream, suite, component)
 }
 
+// LiveBuildLock is the distributed lock guarding the /live cache rebuild
+// step for one os/codename layout. Without it, every replica whose entry
+// happens to go stale around the same moment (the common case: they were
+// all built around the same original time, so they all expire together)
+// independently regenerates and recompresses the same files, and then every
+// *other* replica's next stale check tries to adopt the result over HTTP at
+// once too -- a second, uncoordinated thundering herd on whichever replica
+// published first. Held only for the local build (see rebuildLive); a
+// replica that loses the race skips its own rebuild entirely rather than
+// immediately trying to adopt from the winner (which hasn't published
+// anything yet while it's still building) -- the winner's notice, once
+// published, reaches every replica via the existing jittered proactive
+// adopt (see liveUpdateInvalidateJitter), which already spreads out peer
+// fetches; failing that, the next client request re-checks this lock fresh.
+func (k Keys) LiveBuildLock(os, codename string) string {
+	return k.Prefix + "lock:livebuild:{" + os + ":" + codename + "}"
+}
+
 func (k Keys) pkgTag(os, codename, component, arch string) string {
 	return "{" + os + ":" + codename + ":" + component + ":" + arch + "}"
 }

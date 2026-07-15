@@ -15,6 +15,7 @@ import (
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/testsupport"
 	"github.com/debproxy/debproxy/internal/upstream"
+	"github.com/debproxy/debproxy/internal/valkeycache"
 )
 
 // roundTripFunc lets a plain func satisfy http.RoundTripper for tests below.
@@ -30,7 +31,7 @@ func newValkeyEnabledServer(t *testing.T, listenAddr string) *Server {
 	t.Helper()
 	client := testsupport.NewTestClient(t, TestValkeyAddr)
 	s := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
-	stop := s.EnableValkey(context.Background(), client, listenAddr, "")
+	stop := s.EnableValkey(context.Background(), client, valkeycache.Keys{Prefix: "test:"}, listenAddr, "")
 	t.Cleanup(stop)
 	return s
 }
@@ -435,5 +436,62 @@ func TestLocalPeerAddrs(t *testing.T) {
 
 	if got := localPeerAddrs("not-a-valid-addr"); got != nil {
 		t.Errorf("localPeerAddrs(invalid) = %v, want nil", got)
+	}
+}
+
+// TestRebuildLiveSkipsWhenAnotherReplicaHoldsTheBuildLock is the direct
+// regression test for the cross-replica rebuild race: when many replicas'
+// entries for the same layout go stale around the same moment (the common
+// case, since they were usually all built around the same original time),
+// every one of them used to independently call generateLiveFiles for
+// itself, and then every other replica's next stale check would also try
+// to adopt the winner's result over HTTP at once -- a second thundering
+// herd. Simulates two replicas sharing one Valkey (real container, not a
+// mock -- this project's convention for anything lock/expiry-dependent) by
+// pre-acquiring LiveBuildLock as replica A, then calling replica B's
+// rebuildLive directly: B must skip its own rebuild entirely (no swap, no
+// generateLiveFiles) rather than duplicate A's in-flight work.
+func TestRebuildLiveSkipsWhenAnotherReplicaHoldsTheBuildLock(t *testing.T) {
+	replicaA := newValkeyEnabledServer(t, ":19001")
+	replicaB := newValkeyEnabledServer(t, ":19002")
+	ctx := context.Background()
+
+	lockA, ok, err := valkeycache.AcquireLock(ctx, replicaA.valkey.client, replicaA.valkey.keys.LiveBuildLock("debian", "trixie"), time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected replica A to acquire the previously-unheld lock")
+	}
+	t.Cleanup(func() { _ = lockA.Release(context.Background()) })
+
+	cacheKey := "debian/trixie"
+	original := &liveEntry{expiry: time.Now().Add(-time.Hour)} // stale, deliberately
+	replicaB.liveCache[cacheKey] = original
+	wait := make(chan struct{})
+	replicaB.liveBuilding[cacheKey] = wait
+
+	done := make(chan struct{})
+	go func() {
+		replicaB.rebuildLive("debian", "trixie", cacheKey, wait)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for rebuildLive to return -- it should skip immediately when the lock is held elsewhere")
+	}
+
+	replicaB.mu.Lock()
+	entryAfter := replicaB.liveCache[cacheKey]
+	_, stillBuilding := replicaB.liveBuilding[cacheKey]
+	replicaB.mu.Unlock()
+
+	if entryAfter != original {
+		t.Fatal("replica B rebuilt/swapped its entry despite replica A holding the live build lock -- the redundant-rebuild race is not actually prevented")
+	}
+	if stillBuilding {
+		t.Fatal("expected liveBuilding to be cleared even on the early-skip path, or a stuck flag would block all future rebuilds for this layout")
 	}
 }

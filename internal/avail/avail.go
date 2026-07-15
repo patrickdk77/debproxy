@@ -4,9 +4,12 @@ package avail
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +64,67 @@ type Available struct {
 	// Srcs[component][name] = selected source package. Only populated when at
 	// least one upstream in the layout has FetchSources set.
 	Srcs map[string]map[string]SrcPkg
+}
+
+// QuickFingerprint returns a stable digest of every upstream job's current
+// Release file (its own SHA256:/SHA512: listing of the Packages/Sources
+// files it references), for every upstream configured in os/codename's
+// layout -- without ever loading a single package's data. Uses only
+// Fetcher.ReleaseOnly (local cache, or a single lightweight Valkey meta
+// read), never AdoptFromValkeyOutright/FetchIndex's much more expensive
+// per-arch load (Valkey: a paginated SSCAN plus chunked MGET over
+// potentially tens of thousands of entries; real fetch: an actual
+// Packages.gz download and parse).
+//
+// A Release's file digests are content-addressed: they change if and only
+// if the Packages/Sources data they reference changed. So comparing this
+// fingerprint against the one recorded for an existing built result (see
+// Server.rebuildLive) answers "is there any real reason to rebuild at all"
+// for the cost of one cheap read per upstream, before ever paying for the
+// full Build a rebuild would otherwise require unconditionally.
+//
+// ok is false if any job has nothing cached yet at all (a cold local cache
+// with Valkey unreachable or also empty) -- the caller has no basis for
+// comparison then and should just do a real Build.
+func QuickFingerprint(ctx context.Context, cfg *config.Config, client *http.Client, cache *upstream.IndexCache, osName, codename string) (fingerprint string, ok bool) {
+	type digestEntry struct {
+		key    string // upstream name + component, disambiguates a shared upstream used in >1 component
+		digest string
+	}
+	var entries []digestEntry
+
+	for _, layout := range cfg.ResolvedLayouts {
+		if layout.OS != osName || layout.Codename != codename {
+			continue
+		}
+		for _, src := range layout.Upstreams {
+			f := upstream.NewFetcherWithCache(src, client, cache)
+			rel, relOK := f.ReleaseOnly(ctx)
+			if !relOK {
+				return "", false
+			}
+
+			paths := make([]string, 0, len(rel.Files))
+			for p := range rel.Files {
+				paths = append(paths, p)
+			}
+			sort.Strings(paths)
+
+			h := sha256.New()
+			for _, p := range paths {
+				fe := rel.Files[p]
+				fmt.Fprintf(h, "%s\x00%s\x00", p, fe.SHA256)
+			}
+			entries = append(entries, digestEntry{src.Name + "\x00" + layout.Component, hex.EncodeToString(h.Sum(nil))})
+		}
+	}
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
+	h := sha256.New()
+	for _, e := range entries {
+		fmt.Fprintf(h, "%s\x00%s\x00", e.key, e.digest)
+	}
+	return hex.EncodeToString(h.Sum(nil)), true
 }
 
 // upstreamResult holds the parsed index for one upstream source within a layout.

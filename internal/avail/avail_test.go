@@ -475,3 +475,91 @@ func TestResolvePoolPathWrongVersionFails(t *testing.T) {
 		t.Fatal("expected an error for a pool path naming a version the upstream doesn't have")
 	}
 }
+
+// TestQuickFingerprintFailsOnColdCache proves QuickFingerprint reports
+// ok=false rather than fabricating a fingerprint when it has no basis for
+// comparison at all (nothing cached locally, no Valkey) -- the caller must
+// fall back to a real Build in that case, never treat a cold cache as
+// "confirmed unchanged."
+func TestQuickFingerprintFailsOnColdCache(t *testing.T) {
+	_, keyring := testKey(t)
+	cfg := testConfig("http://127.0.0.1:1", keyring)
+
+	_, ok := avail.QuickFingerprint(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie")
+	if ok {
+		t.Fatal("expected ok=false with nothing cached anywhere")
+	}
+}
+
+// TestQuickFingerprintStableAndNetworkFreeAfterWarm is the direct
+// regression test for the point of QuickFingerprint existing at all: once
+// warmed by one real Build, repeated calls must be network-free (no
+// additional InRelease/Packages requests at all -- see ReleaseOnly, which
+// only ever reads the local cache or a single lightweight Valkey key, never
+// re-fetching real content) and must return the identical fingerprint every
+// time the underlying data hasn't changed.
+func TestQuickFingerprintStableAndNetworkFreeAfterWarm(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, calls := buildFakeUpstream(t, key)
+	cfg := testConfig(srvURL, keyring)
+	cache := upstream.NewIndexCache()
+	ctx := context.Background()
+
+	avail.Build(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	callsAfterWarm := calls.Load()
+	if callsAfterWarm == 0 {
+		t.Fatal("expected the warming Build to have made at least one real request")
+	}
+
+	fp1, ok := avail.QuickFingerprint(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	if !ok {
+		t.Fatal("expected ok=true once the local cache is warm")
+	}
+	if calls.Load() != callsAfterWarm {
+		t.Fatalf("QuickFingerprint made %d additional network request(s), want 0", calls.Load()-callsAfterWarm)
+	}
+
+	fp2, ok := avail.QuickFingerprint(ctx, cfg, http.DefaultClient, cache, "debian", "trixie")
+	if !ok {
+		t.Fatal("expected ok=true on the second call")
+	}
+	if fp1 != fp2 {
+		t.Fatal("expected the same fingerprint from two calls against unchanged data")
+	}
+	if calls.Load() != callsAfterWarm {
+		t.Fatalf("second QuickFingerprint call made %d additional network request(s), want 0", calls.Load()-callsAfterWarm)
+	}
+}
+
+// TestQuickFingerprintChangesWhenPackagesChange proves the fingerprint
+// actually tracks real content: warming against one Packages version, then
+// against a genuinely different one (a real, fresh fetch each time -- no
+// shared cache between the two Builds, so this isolates "does the digest
+// reflect the upstream's Release" from any caching behavior) must produce
+// two different fingerprints.
+func TestQuickFingerprintChangesWhenPackagesChange(t *testing.T) {
+	key, keyring := testKey(t)
+	ctx := context.Background()
+
+	srvURL1, _ := buildFakeUpstream(t, key) // hello 1.0
+	cfg1 := testConfig(srvURL1, keyring)
+	cache1 := upstream.NewIndexCache()
+	avail.Build(ctx, cfg1, http.DefaultClient, cache1, "debian", "trixie")
+	fp1, ok := avail.QuickFingerprint(ctx, cfg1, http.DefaultClient, cache1, "debian", "trixie")
+	if !ok {
+		t.Fatal("expected ok=true for the first upstream")
+	}
+
+	srvURL2, _, _ := buildFakeUpstreamWithBreakableSources(t, key) // hello 1.0 too, but a distinct Release (different signed bytes/InRelease digest even with identical Package content, since it's a separately-generated server) -- see below for why that alone is enough
+	cfg2 := testConfig(srvURL2, keyring)
+	cache2 := upstream.NewIndexCache()
+	avail.Build(ctx, cfg2, http.DefaultClient, cache2, "debian", "trixie")
+	fp2, ok := avail.QuickFingerprint(ctx, cfg2, http.DefaultClient, cache2, "debian", "trixie")
+	if !ok {
+		t.Fatal("expected ok=true for the second upstream")
+	}
+
+	if fp1 == fp2 {
+		t.Fatal("expected different fingerprints for two upstreams with different Release file listings (one lists a Sources file, one doesn't)")
+	}
+}

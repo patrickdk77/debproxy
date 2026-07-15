@@ -314,6 +314,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 
 	archPkgs := make(map[string][]apt.RawPkg, len(archs))
 	var hasStaleMismatch bool
+	archsComplete := true
 	for _, arch := range archs {
 		// fetchCtx: bounded when a stale fallback exists for this upstream at
 		// all (see above) so a hung Packages download degrades fast into the
@@ -347,6 +348,20 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 				slog.Error("fetch failed, no stale data available",
 					"upstream", f.src.Name, "suite", f.src.Suite, "arch", arch, "err", err)
 			}
+			// This arch is now silently absent from archPkgs -- not a stale
+			// duplicate of what we had, not a confirmed "nothing here" (see
+			// releaseServedArchs, which already restricted archs to only
+			// what the Release itself claims exists), but a genuine unknown.
+			// archsComplete must reflect that, or a caller trusting this
+			// entry as confirmed-complete (AdoptFromValkeyOutright, the
+			// Valkey-adopt fast path, the 304 shortcut) would silently drop
+			// this arch's packages from the live index the moment this
+			// entry gets published/adopted -- exactly what happened in
+			// production: a periodic refresh's real fetch hit a transient
+			// per-arch failure with no stale data yet cached for it, still
+			// marked the result complete, and every subsequent build
+			// adopted it outright with that arch's packages simply gone.
+			archsComplete = false
 			continue
 		}
 		archPkgs[arch] = paras
@@ -356,7 +371,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 		entry := &indexCacheEntry{
 			release:       rel,
 			archPkgs:      archPkgs,
-			archsComplete: true,
+			archsComplete: archsComplete,
 		}
 		if resp != nil {
 			entry.etag = resp.Header.Get("ETag")
@@ -426,6 +441,34 @@ func (f *Fetcher) AdoptSourcesFromValkeyOutright(ctx context.Context) ([]apt.Raw
 		f.cache.updateSrcs(cacheKey, cached.srcsRelease, cached.srcs)
 	}
 	return cached.srcs, true
+}
+
+// ReleaseOnly returns this upstream's cached/adopted Release -- via the
+// local cache if present, otherwise a single lightweight Valkey meta read
+// -- without loading any per-arch Packages data at all, unlike
+// AdoptFromValkeyOutright/FetchIndex's fast paths, which both do (Valkey: a
+// paginated SSCAN plus chunked MGET per arch; a real fetch: an actual
+// Packages.gz download). Meant for a caller that only needs the Release's
+// own file digests (see avail.QuickFingerprint) to cheaply tell "has
+// anything really changed" apart from "definitely hasn't," before ever
+// paying for the much more expensive full load a real check would
+// otherwise require unconditionally. ok is false if neither the local
+// cache nor Valkey (if enabled) has anything cached at all yet.
+func (f *Fetcher) ReleaseOnly(ctx context.Context) (rel *apt.Release, ok bool) {
+	if f.cache == nil {
+		return nil, false
+	}
+	if cached, ok := f.cache.get(f.cacheKey()); ok && cached.release != nil {
+		return cached.release, true
+	}
+	if f.cache.valkey == nil {
+		return nil, false
+	}
+	meta, ok := f.cache.valkey.getMetaRaw(ctx, f.src.Name, f.src.Suite, f.src.Component)
+	if !ok {
+		return nil, false
+	}
+	return meta.Release, true
 }
 
 // cachedForComparison returns the best available entry to use as a

@@ -37,6 +37,7 @@ import (
 	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/upstream"
+	"github.com/debproxy/debproxy/internal/valkeycache"
 	"github.com/debproxy/debproxy/internal/webhook"
 )
 
@@ -111,6 +112,13 @@ type liveEntry struct {
 	hashes map[string]string // plain file key -> sha256 from Release; O(1) ETag lookup
 	built  time.Time
 	expiry time.Time
+	// fingerprint is avail.QuickFingerprint's result as of this entry's
+	// build. Lets the next rebuild (see rebuildLive) tell "upstreams
+	// reported no real change" apart from "something is actually
+	// different" for the cost of one cheap Release-digest read per
+	// upstream, before ever paying for a full avail.Build -- see
+	// QuickFingerprint's own doc comment.
+	fingerprint string
 }
 
 // lookupByHash finds the plain-named file whose hash (from Release, see
@@ -1223,7 +1231,8 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	delete(s.liveBuilding, cacheKey)
 	s.mu.Unlock()
 	if err == nil {
-		entry = &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
+		fingerprint, _ := avail.QuickFingerprint(buildCtx, s.cfg, s.client, s.indexCache, osName, codename)
+		entry = &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry, fingerprint: fingerprint}
 		s.swapLiveEntry(osName, codename, entry, fresh)
 		slog.Info("live cache built", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
@@ -1244,10 +1253,70 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 // rebuildLive runs avail.Build + generateLiveFiles in the background, updating
 // the live cache on success. It is launched when a stale entry is served to
 // avoid blocking the client on re-generation.
+// liveBuildLockTTL bounds how long a replica may hold LiveBuildLock for a
+// single rebuild -- generous relative to any real build observed in
+// production (worst case seen: ~48s for a large multi-upstream layout under
+// load) so a slow-but-healthy build is never preempted, while still well
+// short of rebuildLive's own 10-minute retryTimeout bound in case a holder
+// crashes or hangs without releasing it.
+const liveBuildLockTTL = 5 * time.Minute
+
 func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct{}) {
 	defer close(wait)
 	ctx, cancel := context.WithTimeout(context.Background(), retryTimeout)
 	defer cancel()
+
+	// Cheap check first, before taking the build lock or touching any real
+	// package data at all: if every upstream's Release file digests are
+	// identical to what produced the entry we already have, there is
+	// nothing to rebuild -- just extend its expiry in place. See
+	// avail.QuickFingerprint's own doc comment for why this is safe to call
+	// unlocked and uncoordinated (a handful of replicas independently
+	// reading the same small Valkey keys is not the "hammering" problem the
+	// build lock below exists for).
+	if quickFP, ok := avail.QuickFingerprint(ctx, s.cfg, s.client, s.indexCache, osName, codename); ok {
+		s.mu.Lock()
+		existing, hasExisting := s.liveCache[cacheKey]
+		s.mu.Unlock()
+		if hasExisting && existing.fingerprint == quickFP {
+			extended := *existing
+			extended.built = time.Now()
+			extended.expiry = extended.built.Add(liveTTLBase + valkeycache.RandDuration(liveTTLJitter))
+			s.mu.Lock()
+			delete(s.liveBuilding, cacheKey)
+			s.liveCache[cacheKey] = &extended
+			s.mu.Unlock()
+			slog.Debug("live cache content unchanged, extending expiry without rebuilding", "os", osName, "codename", codename)
+			return
+		}
+	}
+
+	if s.valkey != nil {
+		lock, acquired, err := valkeycache.AcquireLock(ctx, s.valkey.client, s.valkey.keys.LiveBuildLock(osName, codename), liveBuildLockTTL)
+		if err != nil {
+			slog.Warn("live build lock unavailable, rebuilding directly", "os", osName, "codename", codename, "err", err)
+		} else if !acquired {
+			// Another replica is already rebuilding this exact layout --
+			// don't duplicate the (possibly expensive) local build. Don't
+			// try to adopt from it either: it hasn't published anything
+			// yet while it's still building. Its notice, once published,
+			// reaches this replica via handleLiveUpdatedMessage (already
+			// jittered -- see liveUpdateInvalidateJitter -- so peers don't
+			// all fetch from the winner at once either); failing that, the
+			// next client request re-checks this lock fresh.
+			slog.Debug("live build already in progress on another replica, skipping redundant rebuild", "os", osName, "codename", codename)
+			s.mu.Lock()
+			delete(s.liveBuilding, cacheKey)
+			s.mu.Unlock()
+			return
+		} else {
+			defer func() {
+				if err := lock.Release(context.WithoutCancel(ctx)); err != nil {
+					slog.Warn("live build lock release failed", "os", osName, "codename", codename, "err", err)
+				}
+			}()
+		}
+	}
 
 	buildStart := time.Now()
 	av := s.buildAvail(ctx, osName, codename)
@@ -1259,7 +1328,8 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 	s.mu.Unlock()
 	swapped := err == nil
 	if err == nil {
-		newEntry := &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry}
+		fingerprint, _ := avail.QuickFingerprint(ctx, s.cfg, s.client, s.indexCache, osName, codename)
+		newEntry := &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry, fingerprint: fingerprint}
 		s.swapLiveEntry(osName, codename, newEntry, fresh)
 		slog.Debug("live cache refreshed in background", "os", osName, "codename", codename, "elapsed", elapsed)
 	} else {
