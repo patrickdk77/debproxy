@@ -77,39 +77,51 @@ func (k Keys) pkgTag(os, codename, component, arch string) string {
 	return "{" + os + ":" + codename + ":" + component + ":" + arch + "}"
 }
 
-// PkgEntry is the HASH of model.IndexEntry fields for one package+version.
-func (k Keys) PkgEntry(os, codename, component, arch, pkg, version string) string {
-	return k.Prefix + "pkg:" + k.pkgTag(os, codename, component, arch) + ":" + pkg + ":" + version
+// PkgEntry is the HASH of model.IndexEntry fields for one upstream+package+version.
+// Upstream is part of the key (not just a stored field) because two upstreams
+// routinely carry the identical package+version at once (e.g. a security fix
+// folded into the next point release) -- without it, whichever upstream's
+// entry was written second would silently overwrite the first's, even though
+// both pool files remain separately and validly stored.
+func (k Keys) PkgEntry(os, codename, component, arch, upstream, pkg, version string) string {
+	return k.Prefix + "pkg:" + k.pkgTag(os, codename, component, arch) + ":" + upstream + ":" + pkg + ":" + version
 }
 
-// PkgBucket is the SET of "{package}:{version}" members for one bucket.
+// PkgBucket is the SET of "{upstream}:{package}:{version}" members for one bucket.
 func (k Keys) PkgBucket(os, codename, component, arch string) string {
 	return k.Prefix + "pkgs:" + k.pkgTag(os, codename, component, arch)
 }
 
-// PkgLatest is the HASH of package -> highest known version for one bucket,
-// maintained by a compare-and-set script alongside PkgEntry (same hash tag).
-func (k Keys) PkgLatest(os, codename, component, arch string) string {
-	return k.Prefix + "pkg-latest:" + k.pkgTag(os, codename, component, arch)
+// PkgLatest is the HASH of package -> highest known version for one
+// (bucket, upstream) pair, maintained by a compare-and-set script alongside
+// PkgEntry (same hash tag). Scoped per-upstream for the same reason PkgEntry
+// is: a bare "highest version across every upstream" would flatten the same
+// multi-upstream ambiguity this key format exists to avoid.
+func (k Keys) PkgLatest(os, codename, component, arch, upstream string) string {
+	return k.Prefix + "pkg-latest:" + k.pkgTag(os, codename, component, arch) + ":" + upstream
 }
 
 func (k Keys) srcTag(os, codename, component string) string {
 	return "{" + os + ":" + codename + ":" + component + "}"
 }
 
-// SrcEntry is the HASH of model.SourceEntry fields for one package+version.
-func (k Keys) SrcEntry(os, codename, component, pkg, version string) string {
-	return k.Prefix + "src:" + k.srcTag(os, codename, component) + ":" + pkg + ":" + version
+// SrcEntry is the HASH of model.SourceEntry fields for one
+// upstream+package+version. Upstream is part of the key for the same reason
+// as PkgEntry above -- see its doc comment.
+func (k Keys) SrcEntry(os, codename, component, upstream, pkg, version string) string {
+	return k.Prefix + "src:" + k.srcTag(os, codename, component) + ":" + upstream + ":" + pkg + ":" + version
 }
 
-// SrcBucket is the SET of "{package}:{version}" members for one bucket.
+// SrcBucket is the SET of "{upstream}:{package}:{version}" members for one bucket.
 func (k Keys) SrcBucket(os, codename, component string) string {
 	return k.Prefix + "srcs:" + k.srcTag(os, codename, component)
 }
 
-// SrcLatest is the HASH of package -> highest known version for one bucket.
-func (k Keys) SrcLatest(os, codename, component string) string {
-	return k.Prefix + "src-latest:" + k.srcTag(os, codename, component)
+// SrcLatest is the HASH of package -> highest known version for one
+// (bucket, upstream) pair -- see PkgLatest's doc comment for why it's scoped
+// per-upstream.
+func (k Keys) SrcLatest(os, codename, component, upstream string) string {
+	return k.Prefix + "src-latest:" + k.srcTag(os, codename, component) + ":" + upstream
 }
 
 // BucketsIndex is the global SET of every "{os}:{codename}:{component}:{arch}"

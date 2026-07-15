@@ -28,8 +28,8 @@ type MetadataIndex interface {
 	// UpsertEntry inserts or updates a package placement.
 	UpsertEntry(ctx context.Context, entry model.IndexEntry) error
 	// RemoveEntry deletes the package placement matching entry's identity
-	// (OS/Codename/Component/Arch/Package/Version); other fields are ignored
-	// for matching. A no-op (nil error) if no matching entry exists -- callers
+	// (OS/Codename/Component/Arch/Upstream/Package/Version); other fields are
+	// ignored for matching. A no-op (nil error) if no matching entry exists -- callers
 	// (e.g. Syncer's missing-pool-file reconciliation) call this only after
 	// independently confirming the entry's pool file is gone, so a concurrent
 	// removal racing this one is expected, not an error condition.
@@ -39,7 +39,12 @@ type MetadataIndex interface {
 	// EntryByDigest returns any entry for the given content digest (dedup lookup).
 	EntryByDigest(ctx context.Context, digest model.Digest) (*model.IndexEntry, error)
 	// FindEntry returns the matching entry; if version is empty, the highest
-	// version within the selector is returned. Returns nil if not found.
+	// version within the selector is returned. If sel.Upstream is set, the
+	// search (and, for an empty version, the "highest" comparison) is
+	// restricted to that upstream's own entries -- two upstreams can each
+	// carry a package at the same name (even the same version) as separate
+	// entries. An empty Upstream matches any, like Selector's other fields.
+	// Returns nil if not found.
 	FindEntry(ctx context.Context, sel model.Selector, pkg, version string) (*model.IndexEntry, error)
 
 	UpsertUpstreamState(ctx context.Context, state model.UpstreamPackageState) error
@@ -48,15 +53,18 @@ type MetadataIndex interface {
 	// UpsertSourceEntry inserts or updates a source package record.
 	UpsertSourceEntry(ctx context.Context, entry model.SourceEntry) error
 	// RemoveSourceEntry deletes the source package record matching entry's
-	// identity (OS/Codename/Component/Package/Version); other fields are
-	// ignored for matching. A no-op (nil error) if no matching entry exists --
+	// identity (OS/Codename/Component/Upstream/Package/Version); other fields
+	// are ignored for matching. A no-op (nil error) if no matching entry exists --
 	// see RemoveEntry's doc comment for why that's expected, not an error.
 	RemoveSourceEntry(ctx context.Context, entry model.SourceEntry) error
 	// ListSourceEntries returns source entries matching the selector (empty fields match any).
 	// Arch is ignored for source entries since sources are architecture-independent.
 	ListSourceEntries(ctx context.Context, sel model.Selector) ([]model.SourceEntry, error)
 	// FindSourceEntry returns the matching source entry; if version is empty, the highest
-	// version within the selector is returned. Returns nil if not found.
+	// version within the selector is returned. If sel.Upstream is set, the
+	// search (and, for an empty version, the "highest" comparison) is
+	// restricted to that upstream's own entries -- see FindEntry's doc
+	// comment above for why. Returns nil if not found.
 	FindSourceEntry(ctx context.Context, sel model.Selector, pkg, version string) (*model.SourceEntry, error)
 }
 

@@ -18,13 +18,13 @@ func (s *Store) UpsertEntry(ctx context.Context, e model.IndexEntry) error {
 		e.FirstSeen = metadata.Now()
 	}
 
-	entryKey := s.keys.PkgEntry(e.OS, e.Codename, e.Component, e.Arch, e.Package, e.Version)
+	entryKey := s.keys.PkgEntry(e.OS, e.Codename, e.Component, e.Arch, e.Upstream, e.Package, e.Version)
 	if err := valkeycache.SetJSON(ctx, s.v, entryKey, e); err != nil {
 		return fmt.Errorf("write pkg entry: %w", err)
 	}
 
 	bucketSet := s.keys.PkgBucket(e.OS, e.Codename, e.Component, e.Arch)
-	member := bucketMember(e.Package, e.Version)
+	member := bucketMember(e.Upstream, e.Package, e.Version)
 	if err := s.v.Do(ctx, s.v.B().Sadd().Key(bucketSet).Member(member).Build()).Error(); err != nil {
 		return fmt.Errorf("index pkg bucket: %w", err)
 	}
@@ -41,7 +41,7 @@ func (s *Store) UpsertEntry(ctx context.Context, e model.IndexEntry) error {
 		}
 	}
 
-	latestKey := s.keys.PkgLatest(e.OS, e.Codename, e.Component, e.Arch)
+	latestKey := s.keys.PkgLatest(e.OS, e.Codename, e.Component, e.Arch, e.Upstream)
 	if err := s.bumpLatest(ctx, latestKey, e.Package, e.Version); err != nil {
 		return err
 	}
@@ -82,13 +82,13 @@ func (s *Store) bumpLatest(ctx context.Context, key, field, version string) erro
 // FindEntry and read the entry back (see FindEntry finding a now-empty
 // getEntry result as a real "not found").
 func (s *Store) RemoveEntry(ctx context.Context, e model.IndexEntry) error {
-	entryKey := s.keys.PkgEntry(e.OS, e.Codename, e.Component, e.Arch, e.Package, e.Version)
+	entryKey := s.keys.PkgEntry(e.OS, e.Codename, e.Component, e.Arch, e.Upstream, e.Package, e.Version)
 	if err := s.v.Do(ctx, s.v.B().Del().Key(entryKey).Build()).Error(); err != nil {
 		return fmt.Errorf("delete pkg entry: %w", err)
 	}
 
 	bucketSet := s.keys.PkgBucket(e.OS, e.Codename, e.Component, e.Arch)
-	member := bucketMember(e.Package, e.Version)
+	member := bucketMember(e.Upstream, e.Package, e.Version)
 	if err := s.v.Do(ctx, s.v.B().Srem().Key(bucketSet).Member(member).Build()).Error(); err != nil {
 		return fmt.Errorf("unindex pkg bucket: %w", err)
 	}
@@ -147,11 +147,11 @@ func (s *Store) ListEntries(ctx context.Context, sel model.Selector) ([]model.In
 		}
 		entryKeys := make([]string, 0, len(members))
 		for _, m := range members {
-			pkg, ver, ok := splitBucketMember(m)
+			upstream, pkg, ver, ok := splitBucketMember(m)
 			if !ok {
 				continue
 			}
-			entryKeys = append(entryKeys, s.keys.PkgEntry(b.os, b.codename, b.component, b.arch, pkg, ver))
+			entryKeys = append(entryKeys, s.keys.PkgEntry(b.os, b.codename, b.component, b.arch, upstream, pkg, ver))
 		}
 		if len(entryKeys) == 0 {
 			continue
@@ -201,6 +201,38 @@ func (s *Store) getEntry(ctx context.Context, entryKey string) (*model.IndexEntr
 	return e, nil
 }
 
+// pkgUpstreamVersion is one upstream's placement of a package at a version,
+// as scanned directly from a bucket's members.
+type pkgUpstreamVersion struct{ upstream, version string }
+
+// scanPkgBucketByUpstream returns every (upstream, version) placement of pkg
+// within bucket b, by scanning the bucket's own members. Used as the
+// fallback when sel.Upstream is empty: once entry storage and latest-
+// tracking both became upstream-scoped (see PkgEntry/PkgLatest's doc
+// comments), there is no O(1) "across every upstream" index left to read,
+// so an unscoped query pays for a scan instead. A slice, not a map keyed by
+// upstream: the same upstream commonly carries more than one version of a
+// package at once (e.g. while an older version awaits GC), and collapsing
+// to one entry per upstream would silently drop all but the last one seen.
+// No current caller passes an empty Upstream, but Selector's other fields
+// all treat empty as "match any", so FindEntry keeps that same convention
+// rather than silently requiring Upstream.
+func (s *Store) scanPkgBucketByUpstream(ctx context.Context, b pkgBucket, pkg string) ([]pkgUpstreamVersion, error) {
+	members, err := valkeycache.ScanSetMembers(ctx, s.v, s.keys.PkgBucket(b.os, b.codename, b.component, b.arch))
+	if err != nil {
+		return nil, fmt.Errorf("list pkg bucket: %w", err)
+	}
+	var out []pkgUpstreamVersion
+	for _, m := range members {
+		upstream, mpkg, mver, ok := splitBucketMember(m)
+		if !ok || mpkg != pkg {
+			continue
+		}
+		out = append(out, pkgUpstreamVersion{upstream, mver})
+	}
+	return out, nil
+}
+
 func (s *Store) FindEntry(ctx context.Context, sel model.Selector, pkg, version string) (*model.IndexEntry, error) {
 	buckets, err := s.matchingPkgBuckets(ctx, sel)
 	if err != nil {
@@ -209,37 +241,73 @@ func (s *Store) FindEntry(ctx context.Context, sel model.Selector, pkg, version 
 
 	if version != "" {
 		for _, b := range buckets {
-			entryKey := s.keys.PkgEntry(b.os, b.codename, b.component, b.arch, pkg, version)
-			e, err := s.getEntry(ctx, entryKey)
+			if sel.Upstream != "" {
+				e, err := s.getEntry(ctx, s.keys.PkgEntry(b.os, b.codename, b.component, b.arch, sel.Upstream, pkg, version))
+				if err != nil {
+					return nil, err
+				}
+				if e != nil {
+					return e, nil
+				}
+				continue
+			}
+			placements, err := s.scanPkgBucketByUpstream(ctx, b, pkg)
 			if err != nil {
 				return nil, err
 			}
-			if e != nil {
-				return e, nil
+			for _, pl := range placements {
+				if pl.version != version {
+					continue
+				}
+				e, err := s.getEntry(ctx, s.keys.PkgEntry(b.os, b.codename, b.component, b.arch, pl.upstream, pkg, version))
+				if err != nil {
+					return nil, err
+				}
+				if e != nil {
+					return e, nil
+				}
 			}
 		}
 		return nil, nil
 	}
 
 	// No version given: find the highest version for pkg across all matching
-	// buckets via each bucket's latest-version hash, then read that one entry.
+	// buckets (restricted to sel.Upstream's own latest-version hash when set,
+	// otherwise scanning every upstream directly -- see
+	// scanPkgBucketByUpstream's doc comment), then read that one entry.
 	var bestBucket pkgBucket
+	var bestUpstream string
 	var bestVersion string
 	for _, b := range buckets {
-		v, err := s.v.Do(ctx, s.v.B().Hget().Key(s.keys.PkgLatest(b.os, b.codename, b.component, b.arch)).Field(pkg).Build()).ToString()
-		if err != nil {
-			if valkey.IsValkeyNil(err) {
-				continue
+		if sel.Upstream != "" {
+			v, err := s.v.Do(ctx, s.v.B().Hget().Key(s.keys.PkgLatest(b.os, b.codename, b.component, b.arch, sel.Upstream)).Field(pkg).Build()).ToString()
+			if err != nil {
+				if valkey.IsValkeyNil(err) {
+					continue
+				}
+				return nil, fmt.Errorf("read latest version: %w", err)
 			}
-			return nil, fmt.Errorf("read latest version: %w", err)
+			if bestVersion == "" || debversion.Compare(v, bestVersion) > 0 {
+				bestVersion = v
+				bestBucket = b
+				bestUpstream = sel.Upstream
+			}
+			continue
 		}
-		if bestVersion == "" || debversion.Compare(v, bestVersion) > 0 {
-			bestVersion = v
-			bestBucket = b
+		placements, err := s.scanPkgBucketByUpstream(ctx, b, pkg)
+		if err != nil {
+			return nil, err
+		}
+		for _, pl := range placements {
+			if bestVersion == "" || debversion.Compare(pl.version, bestVersion) > 0 {
+				bestVersion = pl.version
+				bestBucket = b
+				bestUpstream = pl.upstream
+			}
 		}
 	}
 	if bestVersion == "" {
 		return nil, nil
 	}
-	return s.getEntry(ctx, s.keys.PkgEntry(bestBucket.os, bestBucket.codename, bestBucket.component, bestBucket.arch, pkg, bestVersion))
+	return s.getEntry(ctx, s.keys.PkgEntry(bestBucket.os, bestBucket.codename, bestBucket.component, bestBucket.arch, bestUpstream, pkg, bestVersion))
 }

@@ -41,22 +41,27 @@ func splitSrcBucketKey(k string) (os, codename, component string, ok bool) {
 	return parts[0], parts[1], parts[2], true
 }
 
-// bucketMember is the SET member recording one package's presence in a
-// bucket. Split on the FIRST ":" only: Debian package names never contain
-// ":" (policy restricts them to lowercase alphanumerics and +-.), but
-// versions frequently do (an epoch prefix like "2:1.4-1"), so splitting on
-// the first colon is exactly the package/version boundary regardless of how
-// many further colons the version itself contains.
-func bucketMember(pkg, version string) string {
-	return pkg + ":" + version
+// bucketMember is the SET member recording one upstream's package presence
+// in a bucket. Split on the first TWO ":" only: Debian package names never
+// contain ":" (policy restricts them to lowercase alphanumerics and +-.),
+// and upstream names are config-defined identifiers that never contain ":"
+// either, but versions frequently do (an epoch prefix like "2:1.4-1"), so
+// splitting on the first two colons is exactly the upstream/package/version
+// boundary regardless of how many further colons the version itself
+// contains. Upstream leads the member (rather than trailing) so two
+// upstreams sharing an identical package+version produce distinct members
+// instead of colliding -- see PkgEntry/SrcEntry's doc comments for why this
+// matters.
+func bucketMember(upstream, pkg, version string) string {
+	return upstream + ":" + pkg + ":" + version
 }
 
-func splitBucketMember(m string) (pkg, version string, ok bool) {
-	parts := strings.SplitN(m, ":", 2)
-	if len(parts) != 2 {
-		return "", "", false
+func splitBucketMember(m string) (upstream, pkg, version string, ok bool) {
+	parts := strings.SplitN(m, ":", 3)
+	if len(parts) != 3 {
+		return "", "", "", false
 	}
-	return parts[0], parts[1], true
+	return parts[0], parts[1], parts[2], true
 }
 
 func pkgBucketMatches(sel model.Selector, os, codename, component, arch string) bool {

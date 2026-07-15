@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -170,5 +171,63 @@ func TestRebuildLiveSkipsExpensiveWorkWhenUpstreamUnchanged(t *testing.T) {
 	}
 	if !second.built.After(firstBuilt) {
 		t.Fatal("expected the second call to still record a later built time, even though it skipped rebuilding")
+	}
+}
+
+// TestRebuildLiveKeepsExistingEntryOnUpstreamFetchFailure is the direct
+// regression test for avail.Available.HasFetchFailure: when the configured
+// upstream is entirely unreachable (not a partial per-arch hiccup -- the
+// whole fetch fails, with nothing cached locally yet for this fresh
+// IndexCache, so QuickFingerprint's fast path can't apply either) and a
+// good entry is already cached, rebuildLive must keep serving that good
+// entry (with a freshly extended expiry) rather than swap in whatever
+// avail.Build produced -- which, with the only upstream unreachable, would
+// have no packages in it at all.
+func TestRebuildLiveKeepsExistingEntryOnUpstreamFetchFailure(t *testing.T) {
+	cfg := &config.Config{
+		ResolvedLayouts: []model.Layout{{
+			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
+			Upstreams: []model.UpstreamSource{{
+				// Nothing listens here -- guaranteed connection failure.
+				Name: "test-upstream", URL: "http://127.0.0.1:1", Suite: "trixie", Component: "main",
+				Archs: []string{"amd64"},
+			}},
+		}},
+	}
+	s := New(cfg, nil, nil, nil, http.DefaultClient, upstream.NewIndexCache(), nil, nil)
+
+	cacheKey := "debian/trixie"
+	goodEntry := &liveEntry{
+		files:       map[string][]byte{"dists/trixie/main/binary-amd64/Packages": []byte("Package: hello\nVersion: 1.0\n")},
+		hashes:      map[string]string{"dists/trixie/main/binary-amd64/Packages": "deadbeef"},
+		built:       time.Now().Add(-time.Hour),
+		expiry:      time.Now().Add(-time.Minute), // stale, deliberately -- this is what triggers a rebuild attempt
+		fingerprint: "arbitrary-fingerprint-that-nothing-will-match",
+	}
+	s.liveCache[cacheKey] = goodEntry
+
+	wait := make(chan struct{})
+	s.liveBuilding[cacheKey] = wait
+	s.rebuildLive("debian", "trixie", cacheKey, wait)
+
+	s.mu.Lock()
+	after, ok := s.liveCache[cacheKey]
+	_, stillBuilding := s.liveBuilding[cacheKey]
+	s.mu.Unlock()
+
+	if !ok {
+		t.Fatal("expected an entry to still be present")
+	}
+	if stillBuilding {
+		t.Fatal("expected liveBuilding to be cleared")
+	}
+	if string(after.files["dists/trixie/main/binary-amd64/Packages"]) != "Package: hello\nVersion: 1.0\n" {
+		t.Fatal("expected the previous good entry's files to still be served, not replaced by an incomplete build")
+	}
+	if !after.built.After(goodEntry.built) {
+		t.Fatal("expected built to still be refreshed even though the content was kept")
+	}
+	if !after.expiry.After(time.Now()) {
+		t.Fatal("expected expiry to be extended into the future, not left in the past")
 	}
 }

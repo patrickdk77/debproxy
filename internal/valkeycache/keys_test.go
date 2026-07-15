@@ -52,9 +52,9 @@ func TestKeysPkgGroupSharesHashTag(t *testing.T) {
 	k := Keys{}
 	tag := "{debian:trixie:main:amd64}"
 
-	entry := k.PkgEntry("debian", "trixie", "main", "amd64", "curl", "8.0-1")
+	entry := k.PkgEntry("debian", "trixie", "main", "amd64", "debian-main", "curl", "8.0-1")
 	bucket := k.PkgBucket("debian", "trixie", "main", "amd64")
-	latest := k.PkgLatest("debian", "trixie", "main", "amd64")
+	latest := k.PkgLatest("debian", "trixie", "main", "amd64", "debian-main")
 
 	for name, got := range map[string]string{"entry": entry, "bucket": bucket, "latest": latest} {
 		if !strings.Contains(got, tag) {
@@ -71,9 +71,9 @@ func TestKeysSrcGroupSharesHashTag(t *testing.T) {
 	tag := "{debian:trixie:main}"
 
 	for name, got := range map[string]string{
-		"entry":  k.SrcEntry("debian", "trixie", "main", "curl", "8.0-1"),
+		"entry":  k.SrcEntry("debian", "trixie", "main", "debian-main", "curl", "8.0-1"),
 		"bucket": k.SrcBucket("debian", "trixie", "main"),
-		"latest": k.SrcLatest("debian", "trixie", "main"),
+		"latest": k.SrcLatest("debian", "trixie", "main", "debian-main"),
 	} {
 		if !strings.Contains(got, tag) {
 			t.Errorf("%s key %q missing expected hash tag %q", name, got, tag)

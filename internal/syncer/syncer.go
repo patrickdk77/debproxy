@@ -178,66 +178,77 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache, only
 			prevSrcVersion = make(map[string]string, len(prevSrcEntries))
 			for _, e := range prevSrcEntries {
 				if e.FilesDownloaded {
-					prevSrcVersion[e.Component+"/"+e.Package] = e.Version
+					// Keyed by upstream too, not just component+package: two
+					// upstreams can each have their own independently-tracked
+					// source package at the same name, and conflating their
+					// prior-download state would let one upstream's history
+					// mask or falsely trigger the other's auto-update check.
+					prevSrcVersion[e.Component+"/"+e.Upstream+"/"+e.Package] = e.Version
 				}
 			}
 		}
 		var srcUpdated int
 
-		// Record source entries from upstream Sources indices.
-		for comp, srcMap := range av.Srcs {
-			for _, sp := range srcMap {
-				files := make([]model.SourceFile, len(sp.Files))
-				for i, f := range sp.Files {
-					files[i] = model.SourceFile{
-						Filename: f.Filename,
-						Size:     f.Size,
-						SHA256:   model.Digest(f.SHA256),
-					}
+		// Record source entries from upstream Sources indices. Iterates
+		// av.AllSrcs (every upstream's own SrcPkg), not the collapsed
+		// av.Srcs map -- see AllSrcs's doc comment on avail.Available: two
+		// upstreams commonly carry a source package at the identical version
+		// at once, and only persisting the version-tie-break winner would
+		// mean the losing upstream's SourceEntry never exists at all, so a
+		// pull-through request naming that specific upstream would resolve
+		// against the wrong upstream's directory/version metadata.
+		for _, sp := range av.AllSrcs {
+			comp := sp.Component
+			files := make([]model.SourceFile, len(sp.Files))
+			for i, f := range sp.Files {
+				files[i] = model.SourceFile{
+					Filename: f.Filename,
+					Size:     f.Size,
+					SHA256:   model.Digest(f.SHA256),
 				}
-				entry := model.SourceEntry{
-					OS:          k.osName,
-					Codename:    k.codename,
-					Component:   comp,
-					Package:     sp.Package,
-					Version:     sp.Version,
-					Upstream:    sp.Upstream.Name,
-					LocalDir:    sp.LocalDir,
-					UpstreamDir: sp.UpstreamDir,
-					Files:       files,
-					Stanza:      sp.StanzaStr,
-				}
-				if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
-					slog.Warn("upsert source entry", "package", sp.Package, "version", sp.Version, "err", err)
-				}
-				if sp.Upstream.AutoUpdate && prevSrcVersion != nil {
-					if prevVer, wasSeen := prevSrcVersion[comp+"/"+sp.Package]; wasSeen && debversion.Compare(sp.Version, prevVer) > 0 {
-						for _, sf := range files {
-							if err := in.CacheSourceFile(ctx, entry, sp.Upstream, sf.Filename); err != nil {
-								slog.Warn("auto-update source: cache file",
-									"package", sp.Package, "version", sp.Version,
-									"file", sf.Filename, "err", err)
-							}
+			}
+			entry := model.SourceEntry{
+				OS:          k.osName,
+				Codename:    k.codename,
+				Component:   comp,
+				Package:     sp.Package,
+				Version:     sp.Version,
+				Upstream:    sp.Upstream.Name,
+				LocalDir:    sp.LocalDir,
+				UpstreamDir: sp.UpstreamDir,
+				Files:       files,
+				Stanza:      sp.StanzaStr,
+			}
+			if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
+				slog.Warn("upsert source entry", "package", sp.Package, "version", sp.Version, "upstream", sp.Upstream.Name, "err", err)
+			}
+			if sp.Upstream.AutoUpdate && prevSrcVersion != nil {
+				if prevVer, wasSeen := prevSrcVersion[comp+"/"+sp.Upstream.Name+"/"+sp.Package]; wasSeen && debversion.Compare(sp.Version, prevVer) > 0 {
+					for _, sf := range files {
+						if err := in.CacheSourceFile(ctx, entry, sp.Upstream, sf.Filename); err != nil {
+							slog.Warn("auto-update source: cache file",
+								"package", sp.Package, "version", sp.Version,
+								"file", sf.Filename, "err", err)
 						}
-						entry.FilesDownloaded = true
-						if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
-							slog.Warn("upsert source entry after auto-update download", "package", sp.Package, "err", err)
-						}
-						srcUpdated++
-						// One notification per source package, not per file --
-						// its files (.dsc, orig tarball, debian tarball/diff)
-						// are all one logical update, mirroring the binary
-						// side's one-webhook-per-updated-package rule.
-						s.notifier.Fire(webhook.Event{
-							Package:   sp.Package,
-							Version:   sp.Version,
-							OS:        k.osName,
-							Codename:  k.codename,
-							Component: comp,
-							Upstream:  sp.Upstream.Name,
-							PoolPath:  sp.LocalDir,
-						})
 					}
+					entry.FilesDownloaded = true
+					if err := s.index.UpsertSourceEntry(ctx, entry); err != nil {
+						slog.Warn("upsert source entry after auto-update download", "package", sp.Package, "err", err)
+					}
+					srcUpdated++
+					// One notification per source package, not per file --
+					// its files (.dsc, orig tarball, debian tarball/diff)
+					// are all one logical update, mirroring the binary
+					// side's one-webhook-per-updated-package rule.
+					s.notifier.Fire(webhook.Event{
+						Package:   sp.Package,
+						Version:   sp.Version,
+						OS:        k.osName,
+						Codename:  k.codename,
+						Component: comp,
+						Upstream:  sp.Upstream.Name,
+						PoolPath:  sp.LocalDir,
+					})
 				}
 			}
 		}

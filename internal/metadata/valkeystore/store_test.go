@@ -306,6 +306,61 @@ func TestFindEntryEpochVersionSurvivesBucketMemberSplit(t *testing.T) {
 	}
 }
 
+// TestUpsertEntryKeepsBothUpstreamsAtIdenticalVersion is the regression test
+// for the IndexEntry counterpart of avail's ByPoolPath merge-ambiguity fix:
+// two upstreams (e.g. ubuntu-security and ubuntu-updates) commonly carry a
+// package at the identical version at once, each independently cached (pull-
+// through or prime) under its own PoolPath. Before Upstream became part of
+// PkgEntry's key, the second upstream's UpsertEntry call silently overwrote
+// the first's IndexEntry -- both files remained correctly stored, but only
+// one upstream's metadata survived, which is exactly what let cleanup's
+// buildPoolRefSet treat the other upstream's still-real file as an orphan.
+func TestUpsertEntryKeepsBothUpstreamsAtIdenticalVersion(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	a := entry("hello", "1.0", "amd64")
+	a.Upstream = "ubuntu-security"
+	a.PoolPath = model.PoolPath("ubuntu", "noble", "ubuntu-security", "main", "hello", "1.0", "amd64")
+	a.OS, a.Codename = "ubuntu", "noble"
+
+	b := entry("hello", "1.0", "amd64")
+	b.Upstream = "ubuntu-updates"
+	b.PoolPath = model.PoolPath("ubuntu", "noble", "ubuntu-updates", "main", "hello", "1.0", "amd64")
+	b.OS, b.Codename = "ubuntu", "noble"
+
+	if err := s.UpsertEntry(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "ubuntu", Codename: "noble"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected both upstreams' entries to survive, got %d: %v", len(entries), entries)
+	}
+
+	gotA, err := s.FindEntry(ctx, model.Selector{OS: "ubuntu", Codename: "noble", Upstream: "ubuntu-security"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotA == nil || gotA.PoolPath != a.PoolPath {
+		t.Fatalf("expected ubuntu-security's own entry, got %v", gotA)
+	}
+
+	gotB, err := s.FindEntry(ctx, model.Selector{OS: "ubuntu", Codename: "noble", Upstream: "ubuntu-updates"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotB == nil || gotB.PoolPath != b.PoolPath {
+		t.Fatalf("expected ubuntu-updates's own entry, got %v", gotB)
+	}
+}
+
 func TestSelectorFiltering(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

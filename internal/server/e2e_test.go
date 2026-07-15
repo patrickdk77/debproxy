@@ -729,6 +729,149 @@ signing:
 	}
 }
 
+// TestLiveSourcePullThroughScopesToRequestedUpstream is the regression test
+// for pullThroughSource's Upstream-scoped FindSourceEntry fix: two upstreams
+// (e.g. debian-main and debian-security) can each have their own persisted
+// SourceEntry for a source package at the identical version, each pointing
+// at its own upstream's base URL and Directory. Before FindSourceEntry was
+// scoped by the upstream named in the request path, an unscoped "latest
+// regardless of upstream" lookup could return either one, pairing the
+// requested upstream's base URL with a *different* upstream's Directory --
+// which 404s or 502s here because the two upstream mock servers each only
+// serve their own file at their own path, never both.
+func TestLiveSourcePullThroughScopesToRequestedUpstream(t *testing.T) {
+	dir := t.TempDir()
+	repoPriv := filepath.Join(dir, "repo.priv.asc")
+	writeKeyPair(t, repoPriv, "")
+	// Each upstream needs a configured key even though this test bypasses
+	// real InRelease verification entirely (the metadata index is
+	// pre-populated below) -- config validation requires at least one.
+	upstreamPub := filepath.Join(dir, "upstream.pub.asc")
+	writeKeyPair(t, filepath.Join(dir, "upstream.priv.asc"), upstreamPub)
+
+	const filename = "hello_1.0.orig.tar.gz"
+	contentA := []byte("content from debian-main")
+	contentB := []byte("content from debian-security")
+
+	upstreamA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/pool/main/h/hello/"+filename {
+			_, _ = w.Write(contentA)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstreamA.Close()
+
+	upstreamB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/pool/updates/main/h/hello/"+filename {
+			_, _ = w.Write(contentB)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstreamB.Close()
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := fmt.Sprintf(`storage:
+  backend: filesystem
+  filesystem:
+    root: %s
+upstreams:
+  debian-main:
+    url: %s
+    keys: [%s]
+    auto_update: false
+  debian-security:
+    url: %s
+    keys: [%s]
+    auto_update: false
+layouts:
+  - os: debian
+    architectures: [amd64]
+    codenames:
+      - codename: trixie
+        components:
+          - component: main
+            upstreams: [debian-main, debian-security]
+            sources: true
+signing:
+  private_key: %s
+`, filepath.Join(dir, "store"), upstreamA.URL, upstreamPub, upstreamB.URL, upstreamPub, repoPriv)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storagefactory.New(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := deb822store.New(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoKey, err := signing.Load(repoPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-populate the metadata index as if an update job already ran
+	// against both upstreams -- each upstream gets its own SourceEntry for
+	// the identical "hello" 1.0, with its own UpstreamDir.
+	ctx := context.Background()
+	entryFor := func(upstream, upstreamDir string, content []byte) model.SourceEntry {
+		sum := sha256.Sum256(content)
+		return model.SourceEntry{
+			OS: "debian", Codename: "trixie", Component: "main",
+			Package: "hello", Version: "1.0", Upstream: upstream,
+			LocalDir:    model.SourceDir("debian", "trixie", upstream, "main", "hello"),
+			UpstreamDir: upstreamDir,
+			Files: []model.SourceFile{{
+				Filename: filename, Size: int64(len(content)), SHA256: model.Digest(hex.EncodeToString(sum[:])),
+			}},
+		}
+	}
+	if err := index.UpsertSourceEntry(ctx, entryFor("debian-main", "pool/main/h/hello", contentA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.UpsertSourceEntry(ctx, entryFor("debian-security", "pool/updates/main/h/hello", contentB)); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, nil, nil).Handler())
+	defer srv.Close()
+
+	get := func(upstream string) (int, []byte) {
+		url := srv.URL + "/live/debian/src/debian/trixie/" + upstream + "/main/h/hello/" + filename
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, body
+	}
+
+	statusA, bodyA := get("debian-main")
+	if statusA != http.StatusOK {
+		t.Fatalf("GET debian-main's own file -> status=%d body=%q", statusA, bodyA)
+	}
+	if string(bodyA) != string(contentA) {
+		t.Fatalf("expected debian-main's own content, got %q", bodyA)
+	}
+
+	statusB, bodyB := get("debian-security")
+	if statusB != http.StatusOK {
+		t.Fatalf("GET debian-security's own file -> status=%d body=%q", statusB, bodyB)
+	}
+	if string(bodyB) != string(contentB) {
+		t.Fatalf("expected debian-security's own content, got %q", bodyB)
+	}
+}
+
 // setupHelloUpstream builds a signed InRelease/Packages/Packages.gz set for a
 // single "hello" package and returns the .deb bytes plus a config-ready
 // upstream base handler (InRelease/Packages/Packages.gz only -- the .deb path

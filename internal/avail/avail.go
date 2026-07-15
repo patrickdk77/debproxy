@@ -58,12 +58,26 @@ type Available struct {
 	Components       []string
 	Arches           []string
 	HasStaleMismatch bool // true if any upstream fell back to stale due to a digest mismatch
+	// HasFetchFailure is true if any upstream's FetchIndex call failed
+	// outright this Build (no stale fallback available at all, not just one
+	// arch -- see the per-job goroutine below) -- that upstream is then
+	// entirely absent from Pkgs/ByPoolPath/Srcs, not merely incomplete. A
+	// caller about to replace previously-good, more-complete data with this
+	// Available (see Server.rebuildLive) should check this first: swapping
+	// in a build that's missing a whole upstream is strictly worse than
+	// keeping what's already served, even though it's now a cycle staler.
+	HasFetchFailure bool
 	// Pkgs[component][arch][name] = selected package.
 	Pkgs       map[string]map[string]map[string]Pkg
 	ByPoolPath map[string]Pkg
 	// Srcs[component][name] = selected source package. Only populated when at
 	// least one upstream in the layout has FetchSources set.
 	Srcs map[string]map[string]SrcPkg
+	// AllSrcs holds every upstream's own SrcPkg seen while building Srcs,
+	// including ones that lost that name's version tie-break -- see the
+	// merge loop's own comment for why. Consumed by Syncer.runUpdate so every
+	// upstream's SourceEntry gets persisted, not just the collapsed winner.
+	AllSrcs []SrcPkg
 }
 
 // QuickFingerprint returns a stable digest of every upstream job's current
@@ -271,6 +285,24 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 
 	// Phase 2a: merge binary-arch results. Must run before Phase 2b so the
 	// per-arch maps are initialized before arch=all packages are fanned into them.
+	//
+	// ByPoolPath is deliberately populated for every entry seen here, not
+	// only whichever one wins the name -> Pkg slot in dest (used solely to
+	// generate the served Packages listing, which must show exactly one
+	// canonical entry per name). Two upstreams commonly carry the exact
+	// same package version at once (e.g. Ubuntu routinely publishes a
+	// security fix to both -security and -updates) -- when they do, dest's
+	// winner is whichever of entries' goroutines happened to finish first,
+	// which is not deterministic between rebuilds. Before this, the loser
+	// vanished from ByPoolPath entirely, even though its pool path is just
+	// as real and fetchable as the winner's -- a client whose own
+	// previously-served Packages listing named that exact (now-losing)
+	// upstream's path then found nothing at that path in this rebuild,
+	// needing the live-path fallback (avail.ResolvePoolPath) on every
+	// request until goroutine scheduling happened to flip the tie back, a
+	// genuinely nondeterministic recurrence rather than a fetch failure of
+	// any kind (see this session's HasFetchFailure/archsComplete fixes,
+	// which cover a different class of cause entirely).
 	for _, e := range entries {
 		if e.arch == "all" {
 			continue
@@ -284,17 +316,19 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			av.Pkgs[e.component][e.arch] = dest
 		}
 		for name, p := range e.pkgs {
+			av.ByPoolPath[p.PoolPath] = p
 			if existing, ok := dest[name]; ok && debversion.Compare(p.Version, existing.Version) <= 0 {
 				continue
 			}
 			dest[name] = p
-			av.ByPoolPath[p.PoolPath] = p
 		}
 	}
 
 	// Phase 2b: fan arch=all packages into every binary arch we serve.
 	// These come from upstreams that publish a separate binary-all/Packages
 	// (e.g. Debian main) and may include packages absent from the per-arch files.
+	// See Phase 2a's comment above for why ByPoolPath is populated
+	// unconditionally here too.
 	for _, e := range entries {
 		if e.arch != "all" {
 			continue
@@ -304,11 +338,11 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 		}
 		for _, dest := range av.Pkgs[e.component] {
 			for name, p := range e.pkgs {
+				av.ByPoolPath[p.PoolPath] = p
 				if existing, ok := dest[name]; ok && debversion.Compare(p.Version, existing.Version) <= 0 {
 					continue
 				}
 				dest[name] = p
-				av.ByPoolPath[p.PoolPath] = p
 			}
 		}
 	}
@@ -383,15 +417,10 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 				if raw.Package == "" || raw.Version == "" {
 					continue
 				}
-				if existing, ok := av.Srcs[r.component][raw.Package]; ok {
-					if strings.Compare(raw.Version, existing.Version) <= 0 {
-						continue
-					}
-				}
 				localDir := model.SourceDir(osName, codename, r.src.Name, r.component, raw.Package)
 				files := make([]apt.RawSrcFile, len(raw.Files))
 				copy(files, raw.Files)
-				av.Srcs[r.component][raw.Package] = SrcPkg{
+				sp := SrcPkg{
 					Package:     raw.Package,
 					Version:     raw.Version,
 					Component:   r.component,
@@ -401,6 +430,23 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 					Upstream:    r.src,
 					StanzaStr:   raw.WithDirectory(localDir),
 				}
+				// AllSrcs retains every upstream's own SrcPkg unconditionally,
+				// for the same reason ByPoolPath retains every upstream's own
+				// Pkg in the binary merge above: two upstreams commonly carry
+				// a source package at the identical version at once (e.g.
+				// debian-main and debian-security), and the persisted
+				// SourceEntry index (see Syncer.runUpdate, which iterates this
+				// slice rather than the collapsed map below) needs every
+				// upstream's own record to survive, not just whichever wins
+				// the name tie-break for the served Sources listing.
+				av.AllSrcs = append(av.AllSrcs, sp)
+
+				if existing, ok := av.Srcs[r.component][raw.Package]; ok {
+					if debversion.Compare(raw.Version, existing.Version) <= 0 {
+						continue
+					}
+				}
+				av.Srcs[r.component][raw.Package] = sp
 			}
 		}
 	}
@@ -438,6 +484,7 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			cache.MarkLayoutDataFresh(ctx, osName, codename, refreshInterval)
 		}
 	}
+	av.HasFetchFailure = realFetchFailed.Load()
 
 	return av
 }

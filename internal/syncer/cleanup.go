@@ -431,13 +431,24 @@ func (s *Syncer) buildPoolRefSet(ctx context.Context) (map[string]bool, error) {
 	// so protecting its pool file here forever would only accumulate disk
 	// usage with no purpose -- EntryByDigest, the only mechanism that could
 	// have needed old-version entries for content-dedup, is unused.
+	//
+	// Upstream is part of the grouping key, not just OS/Codename/Component/
+	// Arch/Package: two upstreams commonly carry a package at the identical
+	// version at once (e.g. a security fix folded into the next point
+	// release), and each has its own separately-stored, separately-valid
+	// pool file. Grouping without Upstream would keep only one of them --
+	// arbitrarily, by map iteration order, when both are the same version --
+	// and the next gcPool run would delete the other upstream's still-real,
+	// still-referenced file as an orphan.
 	entries, err := s.index.ListEntries(ctx, model.Selector{})
 	if err != nil {
 		return nil, fmt.Errorf("list metadata entries: %w", err)
 	}
-	type entryKey struct{ os, codename, comp, arch, pkg string }
+	type entryKey struct{ os, codename, comp, arch, upstream, pkg string }
 	best := highestVersionByKey(entries,
-		func(e model.IndexEntry) entryKey { return entryKey{e.OS, e.Codename, e.Component, e.Arch, e.Package} },
+		func(e model.IndexEntry) entryKey {
+			return entryKey{e.OS, e.Codename, e.Component, e.Arch, e.Upstream, e.Package}
+		},
 		func(e model.IndexEntry) string { return e.Version })
 	for _, e := range best {
 		ref[e.PoolPath] = true
@@ -540,14 +551,15 @@ func (s *Syncer) buildSrcRefSet(ctx context.Context) (map[string]bool, error) {
 
 	// Also include all src paths for the highest version of each source
 	// package known to the metadata index -- see buildPoolRefSet for why
-	// superseded versions are deliberately excluded.
+	// superseded versions are deliberately excluded, and why Upstream is
+	// part of the grouping key rather than left out.
 	srcEntries, err := s.index.ListSourceEntries(ctx, model.Selector{})
 	if err != nil {
 		return nil, fmt.Errorf("list source entries: %w", err)
 	}
-	type srcKey struct{ os, codename, comp, pkg string }
+	type srcKey struct{ os, codename, comp, upstream, pkg string }
 	bestSrc := highestVersionByKey(srcEntries,
-		func(e model.SourceEntry) srcKey { return srcKey{e.OS, e.Codename, e.Component, e.Package} },
+		func(e model.SourceEntry) srcKey { return srcKey{e.OS, e.Codename, e.Component, e.Upstream, e.Package} },
 		func(e model.SourceEntry) string { return e.Version })
 	for _, e := range bestSrc {
 		for _, f := range e.Files {

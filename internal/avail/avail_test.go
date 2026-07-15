@@ -563,3 +563,217 @@ func TestQuickFingerprintChangesWhenPackagesChange(t *testing.T) {
 		t.Fatal("expected different fingerprints for two upstreams with different Release file listings (one lists a Sources file, one doesn't)")
 	}
 }
+
+// TestBuildSetsHasFetchFailureWhenUpstreamUnreachable is the direct
+// regression test for the production symptom "an update ran, no new
+// packages were found, but packages went missing" one layer up from the
+// archsComplete fix: a *total* FetchIndex failure (upstream unreachable, no
+// stale fallback cached at all -- not one arch out of several) must be
+// surfaced on the returned Available so a caller about to publish it (see
+// Server.rebuildLive) can tell "this build is missing a whole upstream"
+// apart from "this build is complete." Before HasFetchFailure existed,
+// nothing distinguished the two -- Build just silently returned an
+// Available with that upstream absent and no signal anywhere on it.
+func TestBuildSetsHasFetchFailureWhenUpstreamUnreachable(t *testing.T) {
+	_, keyring := testKey(t)
+	// Nothing listens here -- guaranteed connection failure -- and cache is
+	// freshly created below, so there is no stale fallback of any kind.
+	cfg := testConfig("http://127.0.0.1:1", keyring)
+
+	av := avail.Build(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie")
+	if !av.HasFetchFailure {
+		t.Fatal("expected HasFetchFailure=true when the only configured upstream is unreachable with no stale fallback")
+	}
+	if len(av.ByPoolPath) != 0 {
+		t.Fatalf("expected no packages at all from a fully-failed upstream, got %+v", av.ByPoolPath)
+	}
+}
+
+// buildFakeUpstreamWithSection is like buildFakeUpstream but sets an
+// explicit Section: utils on the one package it serves ("hello" 1.0) --
+// needed whenever a test computes the expected pool path via
+// model.PoolPath, which (unlike the unexported poolPathFromFilename actually
+// used to build it) defaults an empty section to "misc" rather than leaving
+// it blank, so the two would otherwise disagree for a section-less stanza.
+func buildFakeUpstreamWithSection(t *testing.T, key *signing.Key) (srvURL string) {
+	t.Helper()
+
+	control, err := apt.ParseStanza("Package: hello\nVersion: 1.0\nArchitecture: amd64\nSection: utils\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deb := []byte("fake deb content")
+	sum := sha256.Sum256(deb)
+	const upstreamFilename = "pool/main/h/hello/hello_1.0_amd64.deb"
+	stanza := apt.BuildPackagesStanza(control, upstreamFilename, int64(len(deb)), hex.EncodeToString(sum[:]), "")
+	stanzaStr, err := apt.StanzaString(stanza)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagesContent := []byte(stanzaStr)
+
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if _, err := gz.Write(packagesContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gzSum := sha256.Sum256(gzBuf.Bytes())
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages.gz\n",
+		hex.EncodeToString(gzSum[:]), gzBuf.Len(),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzBuf.Bytes())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// buildFakeSourceUpstream serves a signed repo with an empty binary index
+// (no packages -- irrelevant to this test) and a single Sources stanza for
+// "hello" at the given version.
+func buildFakeSourceUpstream(t *testing.T, key *signing.Key, version string) (srvURL string) {
+	t.Helper()
+
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gzSum := sha256.Sum256(gzBuf.Bytes())
+
+	sourcesContent := []byte(fmt.Sprintf("Package: hello\nVersion: %s\nDirectory: pool/main/h/hello\n", version))
+	sourcesSum := sha256.Sum256(sourcesContent)
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages.gz\n %s %d main/source/Sources\n",
+		hex.EncodeToString(gzSum[:]), gzBuf.Len(),
+		hex.EncodeToString(sourcesSum[:]), len(sourcesContent),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzBuf.Bytes())
+	})
+	mux.HandleFunc("/dists/trixie/main/source/Sources", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(sourcesContent)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestBuildPicksHigherSourceVersionByDebianOrderingNotLexicographic is the
+// regression test for a second, distinct bug found alongside the ByPoolPath
+// merge-ambiguity issue: the Srcs merge compared versions with
+// strings.Compare (plain lexicographic ordering) instead of
+// debversion.Compare (real Debian version ordering). "10" sorts before "9"
+// lexicographically but must rank higher under Debian version rules -- with
+// the bug, an upstream offering the genuinely newer "10" would lose to an
+// upstream offering "9", exactly backwards, with no error anywhere to
+// suggest anything went wrong.
+func TestBuildPicksHigherSourceVersionByDebianOrderingNotLexicographic(t *testing.T) {
+	key, keyring := testKey(t)
+	srvOld := buildFakeSourceUpstream(t, key, "9")
+	srvNew := buildFakeSourceUpstream(t, key, "10")
+
+	cfg := &config.Config{
+		ResolvedLayouts: []model.Layout{{
+			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
+			Upstreams: []model.UpstreamSource{
+				{Name: "upstream-old", URL: srvOld, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring, FetchSources: true},
+				{Name: "upstream-new", URL: srvNew, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring, FetchSources: true},
+			},
+		}},
+	}
+
+	av := avail.Build(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie")
+	got, ok := av.Srcs["main"]["hello"]
+	if !ok {
+		t.Fatal("expected a merged Srcs entry for hello")
+	}
+	if got.Version != "10" {
+		t.Fatalf("expected version 10 (the real latest under Debian ordering) to win, got %q", got.Version)
+	}
+}
+
+// TestBuildKeepsBothPoolPathsWhenTwoUpstreamsShareAVersion is the direct
+// regression test for a real, previously unexamined cause of "package not
+// in current live index" that has nothing to do with any fetch failure:
+// two upstreams commonly carry the exact identical version of the same
+// package at once (e.g. Ubuntu routinely publishes a security fix to both
+// -security and -updates), and Phase 2a/2b's merge only ever recorded
+// ByPoolPath for whichever upstream's entry happened to win the
+// name -> Pkg "canonical" slot -- decided by which of several concurrent
+// goroutines finished first, not by anything deterministic. The loser's
+// pool path -- exactly as real and fetchable as the winner's -- vanished
+// from ByPoolPath entirely. A client whose own previously-served Packages
+// listing named that exact upstream then found nothing at that path on
+// this rebuild, needing the live-path fallback every time, with no error
+// or incompleteness anywhere in the fetch itself. Run with -count and race
+// detection in mind: the whole point is this must hold regardless of which
+// upstream's goroutine happens to finish first.
+func TestBuildKeepsBothPoolPathsWhenTwoUpstreamsShareAVersion(t *testing.T) {
+	key, keyring := testKey(t)
+	srvA := buildFakeUpstreamWithSection(t, key) // serves "hello" 1.0, Section: utils
+	srvB := buildFakeUpstreamWithSection(t, key) // an independent server, same signed content
+
+	cfg := &config.Config{
+		ResolvedLayouts: []model.Layout{{
+			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
+			Upstreams: []model.UpstreamSource{
+				{Name: "upstream-a", URL: srvA, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
+				{Name: "upstream-b", URL: srvB, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
+			},
+		}},
+	}
+
+	poolPathA := model.PoolPath("debian", "trixie", "upstream-a", "utils", "hello", "1.0", "amd64")
+	poolPathB := model.PoolPath("debian", "trixie", "upstream-b", "utils", "hello", "1.0", "amd64")
+
+	// Run several times: the "winner" of the canonical Pkgs slot is decided
+	// by goroutine completion order, which varies run to run. Both pool
+	// paths must survive every single time regardless of which one wins.
+	for i := 0; i < 10; i++ {
+		av := avail.Build(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie")
+		if _, ok := av.ByPoolPath[poolPathA]; !ok {
+			t.Fatalf("run %d: upstream-a's pool path missing from ByPoolPath", i)
+		}
+		if _, ok := av.ByPoolPath[poolPathB]; !ok {
+			t.Fatalf("run %d: upstream-b's pool path missing from ByPoolPath", i)
+		}
+		// The served Packages listing must still show exactly one canonical
+		// entry per name -- this fix must not cause duplicates there.
+		if _, ok := av.Pkgs["main"]["amd64"]["hello"]; !ok {
+			t.Fatalf("run %d: expected exactly one canonical entry in Pkgs", i)
+		}
+	}
+}

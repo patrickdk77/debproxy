@@ -22,7 +22,7 @@ func (s *Store) UpsertSourceEntry(ctx context.Context, e model.SourceEntry) erro
 	// deb822store's UpsertSourceEntry: an update that hasn't downloaded files
 	// itself must not clear a prior download, and the original first-seen
 	// time must survive later metadata-only updates.
-	entryKey := s.keys.SrcEntry(e.OS, e.Codename, e.Component, e.Package, e.Version)
+	entryKey := s.keys.SrcEntry(e.OS, e.Codename, e.Component, e.Upstream, e.Package, e.Version)
 	if existing, err := s.getSourceEntry(ctx, entryKey); err != nil {
 		return err
 	} else if existing != nil {
@@ -35,7 +35,7 @@ func (s *Store) UpsertSourceEntry(ctx context.Context, e model.SourceEntry) erro
 	}
 
 	bucketSet := s.keys.SrcBucket(e.OS, e.Codename, e.Component)
-	member := bucketMember(e.Package, e.Version)
+	member := bucketMember(e.Upstream, e.Package, e.Version)
 	if err := s.v.Do(ctx, s.v.B().Sadd().Key(bucketSet).Member(member).Build()).Error(); err != nil {
 		return fmt.Errorf("index src bucket: %w", err)
 	}
@@ -45,7 +45,7 @@ func (s *Store) UpsertSourceEntry(ctx context.Context, e model.SourceEntry) erro
 		return fmt.Errorf("register src bucket: %w", err)
 	}
 
-	latestKey := s.keys.SrcLatest(e.OS, e.Codename, e.Component)
+	latestKey := s.keys.SrcLatest(e.OS, e.Codename, e.Component, e.Upstream)
 	if err := s.bumpLatest(ctx, latestKey, e.Package, e.Version); err != nil {
 		return err
 	}
@@ -57,13 +57,13 @@ func (s *Store) UpsertSourceEntry(ctx context.Context, e model.SourceEntry) erro
 // if no matching entry exists. Does not touch SrcLatest -- see RemoveEntry's
 // doc comment for why that hash is left best-effort rather than recomputed.
 func (s *Store) RemoveSourceEntry(ctx context.Context, e model.SourceEntry) error {
-	entryKey := s.keys.SrcEntry(e.OS, e.Codename, e.Component, e.Package, e.Version)
+	entryKey := s.keys.SrcEntry(e.OS, e.Codename, e.Component, e.Upstream, e.Package, e.Version)
 	if err := s.v.Do(ctx, s.v.B().Del().Key(entryKey).Build()).Error(); err != nil {
 		return fmt.Errorf("delete src entry: %w", err)
 	}
 
 	bucketSet := s.keys.SrcBucket(e.OS, e.Codename, e.Component)
-	member := bucketMember(e.Package, e.Version)
+	member := bucketMember(e.Upstream, e.Package, e.Version)
 	if err := s.v.Do(ctx, s.v.B().Srem().Key(bucketSet).Member(member).Build()).Error(); err != nil {
 		return fmt.Errorf("unindex src bucket: %w", err)
 	}
@@ -107,11 +107,11 @@ func (s *Store) ListSourceEntries(ctx context.Context, sel model.Selector) ([]mo
 		}
 		entryKeys := make([]string, 0, len(members))
 		for _, m := range members {
-			pkg, ver, ok := splitBucketMember(m)
+			upstream, pkg, ver, ok := splitBucketMember(m)
 			if !ok {
 				continue
 			}
-			entryKeys = append(entryKeys, s.keys.SrcEntry(b.os, b.codename, b.component, pkg, ver))
+			entryKeys = append(entryKeys, s.keys.SrcEntry(b.os, b.codename, b.component, upstream, pkg, ver))
 		}
 		if len(entryKeys) == 0 {
 			continue
@@ -143,6 +143,31 @@ func (s *Store) getSourceEntry(ctx context.Context, entryKey string) (*model.Sou
 	return e, nil
 }
 
+// scanSrcBucketByUpstream returns every upstream -> version pairing for pkg
+// within bucket b, by scanning the bucket's own members. A slice, not a map
+// keyed by upstream -- see
+// valkeystore.(*Store).scanPkgBucketByUpstream's doc comment for why: the
+// same upstream commonly carries more than one version of a source package
+// at once, and collapsing to one entry per upstream would silently drop all
+// but the last one seen. Used as the fallback when sel.Upstream is empty --
+// no O(1) "across every upstream" index exists once entry storage and
+// latest-tracking both became upstream-scoped.
+func (s *Store) scanSrcBucketByUpstream(ctx context.Context, b srcBucket, pkg string) ([]pkgUpstreamVersion, error) {
+	members, err := valkeycache.ScanSetMembers(ctx, s.v, s.keys.SrcBucket(b.os, b.codename, b.component))
+	if err != nil {
+		return nil, fmt.Errorf("list src bucket: %w", err)
+	}
+	var out []pkgUpstreamVersion
+	for _, m := range members {
+		upstream, mpkg, mver, ok := splitBucketMember(m)
+		if !ok || mpkg != pkg {
+			continue
+		}
+		out = append(out, pkgUpstreamVersion{upstream, mver})
+	}
+	return out, nil
+}
+
 func (s *Store) FindSourceEntry(ctx context.Context, sel model.Selector, pkg, version string) (*model.SourceEntry, error) {
 	buckets, err := s.matchingSrcBuckets(ctx, sel)
 	if err != nil {
@@ -151,34 +176,69 @@ func (s *Store) FindSourceEntry(ctx context.Context, sel model.Selector, pkg, ve
 
 	if version != "" {
 		for _, b := range buckets {
-			e, err := s.getSourceEntry(ctx, s.keys.SrcEntry(b.os, b.codename, b.component, pkg, version))
+			if sel.Upstream != "" {
+				e, err := s.getSourceEntry(ctx, s.keys.SrcEntry(b.os, b.codename, b.component, sel.Upstream, pkg, version))
+				if err != nil {
+					return nil, err
+				}
+				if e != nil {
+					return e, nil
+				}
+				continue
+			}
+			placements, err := s.scanSrcBucketByUpstream(ctx, b, pkg)
 			if err != nil {
 				return nil, err
 			}
-			if e != nil {
-				return e, nil
+			for _, pl := range placements {
+				if pl.version != version {
+					continue
+				}
+				e, err := s.getSourceEntry(ctx, s.keys.SrcEntry(b.os, b.codename, b.component, pl.upstream, pkg, version))
+				if err != nil {
+					return nil, err
+				}
+				if e != nil {
+					return e, nil
+				}
 			}
 		}
 		return nil, nil
 	}
 
 	var bestBucket srcBucket
+	var bestUpstream string
 	var bestVersion string
 	for _, b := range buckets {
-		v, err := s.v.Do(ctx, s.v.B().Hget().Key(s.keys.SrcLatest(b.os, b.codename, b.component)).Field(pkg).Build()).ToString()
-		if err != nil {
-			if valkey.IsValkeyNil(err) {
-				continue
+		if sel.Upstream != "" {
+			v, err := s.v.Do(ctx, s.v.B().Hget().Key(s.keys.SrcLatest(b.os, b.codename, b.component, sel.Upstream)).Field(pkg).Build()).ToString()
+			if err != nil {
+				if valkey.IsValkeyNil(err) {
+					continue
+				}
+				return nil, fmt.Errorf("read latest version: %w", err)
 			}
-			return nil, fmt.Errorf("read latest version: %w", err)
+			if bestVersion == "" || debversion.Compare(v, bestVersion) > 0 {
+				bestVersion = v
+				bestBucket = b
+				bestUpstream = sel.Upstream
+			}
+			continue
 		}
-		if bestVersion == "" || debversion.Compare(v, bestVersion) > 0 {
-			bestVersion = v
-			bestBucket = b
+		placements, err := s.scanSrcBucketByUpstream(ctx, b, pkg)
+		if err != nil {
+			return nil, err
+		}
+		for _, pl := range placements {
+			if bestVersion == "" || debversion.Compare(pl.version, bestVersion) > 0 {
+				bestVersion = pl.version
+				bestBucket = b
+				bestUpstream = pl.upstream
+			}
 		}
 	}
 	if bestVersion == "" {
 		return nil, nil
 	}
-	return s.getSourceEntry(ctx, s.keys.SrcEntry(bestBucket.os, bestBucket.codename, bestBucket.component, pkg, bestVersion))
+	return s.getSourceEntry(ctx, s.keys.SrcEntry(bestBucket.os, bestBucket.codename, bestBucket.component, bestUpstream, pkg, bestVersion))
 }

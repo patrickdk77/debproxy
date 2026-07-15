@@ -79,6 +79,13 @@ type Selector struct {
 	Codename  string
 	Component string
 	Arch      string
+	// Upstream, when set, is honored by FindSourceEntry to scope the lookup
+	// to a specific upstream's record. Two upstreams commonly carry a source
+	// package at the identical version at once (e.g. debian-main and
+	// debian-security); an empty Upstream matches any. Ignored by
+	// ListEntries/ListSourceEntries and the binary package lookups, which
+	// have no need to disambiguate by upstream.
+	Upstream string
 }
 
 // IndexEntry is one placement of a package within a layout (os/codename/

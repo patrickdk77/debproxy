@@ -586,6 +586,45 @@ func TestGCPoolSupersededVersionNotProtected(t *testing.T) {
 	}
 }
 
+// TestGCPoolTwoUpstreamsAtIdenticalVersionBothProtected proves
+// buildPoolRefSet's belt-and-suspenders step doesn't collapse two
+// upstreams' entries into one just because they share a version: two
+// upstreams (e.g. ubuntu-security and ubuntu-updates) commonly carry a
+// package at the identical version at once, each with its own separately-
+// stored, separately-valid pool file. Grouping by
+// (os,codename,component,arch,package) without Upstream would keep only
+// one of them -- arbitrarily, by map iteration order -- and delete the
+// other upstream's still-real file as an orphan on this exact GC pass.
+func TestGCPoolTwoUpstreamsAtIdenticalVersionBothProtected(t *testing.T) {
+	store := newMockStorage()
+	pathA := "pool/ubuntu/jammy/ubuntu-security/main/l/libfoo/libfoo_1.0_amd64.deb"
+	pathB := "pool/ubuntu/jammy/ubuntu-updates/main/l/libfoo/libfoo_1.0_amd64.deb"
+	idx := &mockIndex{
+		entries: []model.IndexEntry{
+			{OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64", Package: "libfoo", Version: "1.0", Upstream: "ubuntu-security", PoolPath: pathA},
+			{OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64", Package: "libfoo", Version: "1.0", Upstream: "ubuntu-updates", PoolPath: pathB},
+		},
+	}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	store.poolFiles[pathA] = struct{}{}
+	store.poolFiles[pathB] = struct{}{}
+	now := time.Now()
+	store.poolMTimes[pathA] = now.Add(-2 * time.Hour) // past the GC grace period
+	store.poolMTimes[pathB] = now.Add(-2 * time.Hour)
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if contains(store.deleted, pathA) {
+		t.Errorf("ubuntu-security's pool file must not be deleted, deleted=%v", store.deleted)
+	}
+	if contains(store.deleted, pathB) {
+		t.Errorf("ubuntu-updates's pool file must not be deleted, deleted=%v", store.deleted)
+	}
+}
+
 // TestCleanup_GCDoesNotCallStat proves gcPool/gcSrc get ModTime from
 // WalkPool/ListPublishedInfo directly instead of issuing a separate Stat per
 // orphan candidate.

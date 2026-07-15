@@ -122,6 +122,61 @@ func TestFindSourceEntry(t *testing.T) {
 	}
 }
 
+// TestUpsertSourceEntryKeepsBothUpstreamsAtIdenticalVersion is the
+// SourceEntry counterpart of the same-named IndexEntry test: two upstreams
+// (e.g. debian-main and debian-security) can each carry a source package at
+// the identical version at once, and before Upstream became part of
+// SrcEntry's key, the second upstream's UpsertSourceEntry call silently
+// overwrote the first's record -- which is exactly what let
+// pullThroughSource pair one upstream's base URL with a different
+// upstream's Directory/Version metadata (see server.go's own doc comment on
+// the fix).
+func TestUpsertSourceEntryKeepsBothUpstreamsAtIdenticalVersion(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	a := srcEntry("hello", "1.0")
+	a.Upstream = "debian-main"
+	a.UpstreamDir = "pool/main/h/hello"
+	a.LocalDir = model.SourceDir("debian", "trixie", "debian-main", "main", "hello")
+
+	b := srcEntry("hello", "1.0")
+	b.Upstream = "debian-security"
+	b.UpstreamDir = "pool/updates/main/h/hello"
+	b.LocalDir = model.SourceDir("debian", "trixie", "debian-security", "main", "hello")
+
+	if err := s.UpsertSourceEntry(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSourceEntry(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListSourceEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected both upstreams' source entries to survive, got %d: %v", len(entries), entries)
+	}
+
+	gotA, err := s.FindSourceEntry(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Upstream: "debian-main"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotA == nil || gotA.UpstreamDir != a.UpstreamDir {
+		t.Fatalf("expected debian-main's own entry, got %v", gotA)
+	}
+
+	gotB, err := s.FindSourceEntry(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Upstream: "debian-security"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotB == nil || gotB.UpstreamDir != b.UpstreamDir {
+		t.Fatalf("expected debian-security's own entry, got %v", gotB)
+	}
+}
+
 func TestSourceEntrySelectorFiltering(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

@@ -876,9 +876,15 @@ func (s *Server) pullThroughSource(ctx context.Context, osName, srcPath string) 
 	codename, upstreamName, component, pkgName, filename :=
 		segs[2], segs[3], segs[4], segs[6], segs[7]
 
-	// Try the metadata index first (populated by update job).
+	// Try the metadata index first (populated by update job), scoped to the
+	// specific upstream srcPath names: two upstreams can independently carry
+	// a source package at the same name (even the same version), each with
+	// its own SourceEntry now that the index keys on Upstream too -- without
+	// scoping here, an unscoped "latest regardless of upstream" lookup could
+	// return a different upstream's entry than the one requested, pairing
+	// its Directory/Version metadata with the requested upstream's base URL.
 	entry, err := s.index.FindSourceEntry(ctx,
-		model.Selector{OS: osName, Codename: codename, Component: component},
+		model.Selector{OS: osName, Codename: codename, Component: component, Upstream: upstreamName},
 		pkgName, "")
 	if err != nil {
 		return err
@@ -1261,6 +1267,19 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 // crashes or hangs without releasing it.
 const liveBuildLockTTL = 5 * time.Minute
 
+// extendExpiry returns a copy of existing with a freshly-computed
+// built/expiry, for a rebuildLive cycle that decided there's no reason (or
+// no safe way -- see HasFetchFailure below) to actually publish a new
+// generation. Never mutates existing itself: getLive's fast path hands out
+// *liveEntry pointers to callers outside s.mu, so another goroutine may
+// already be reading this exact one concurrently.
+func extendExpiry(existing *liveEntry) *liveEntry {
+	extended := *existing
+	extended.built = time.Now()
+	extended.expiry = extended.built.Add(liveTTLBase + valkeycache.RandDuration(liveTTLJitter))
+	return &extended
+}
+
 func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct{}) {
 	defer close(wait)
 	ctx, cancel := context.WithTimeout(context.Background(), retryTimeout)
@@ -1279,12 +1298,9 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 		existing, hasExisting := s.liveCache[cacheKey]
 		s.mu.Unlock()
 		if hasExisting && existing.fingerprint == quickFP {
-			extended := *existing
-			extended.built = time.Now()
-			extended.expiry = extended.built.Add(liveTTLBase + valkeycache.RandDuration(liveTTLJitter))
 			s.mu.Lock()
 			delete(s.liveBuilding, cacheKey)
-			s.liveCache[cacheKey] = &extended
+			s.liveCache[cacheKey] = extendExpiry(existing)
 			s.mu.Unlock()
 			slog.Debug("live cache content unchanged, extending expiry without rebuilding", "os", osName, "codename", codename)
 			return
@@ -1320,6 +1336,34 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 
 	buildStart := time.Now()
 	av := s.buildAvail(ctx, osName, codename)
+
+	if av.HasFetchFailure {
+		// At least one upstream's real fetch failed outright this cycle --
+		// not one arch out of several (see the archsComplete-based guards
+		// upstream.FetchIndex/AdoptFromValkeyOutright already have for
+		// that), but the whole upstream, with no stale fallback available
+		// for it at all. av is missing that upstream's packages entirely.
+		// Publishing it would replace complete, correct data with
+		// incomplete data -- strictly worse than just serving what's
+		// already cached for one more cycle. (The pull-through fallback,
+		// resolvePoolPackage -> avail.ResolvePoolPath, already covers any
+		// request landing in a gap like this; the point here is to avoid
+		// manufacturing the gap in the first place when it's easy not to.)
+		// No existing entry at all (cold start) leaves no better option --
+		// av.HasFetchFailure or not, it's the only data there is to serve.
+		s.mu.Lock()
+		existing, hasExisting := s.liveCache[cacheKey]
+		s.mu.Unlock()
+		if hasExisting {
+			s.mu.Lock()
+			delete(s.liveBuilding, cacheKey)
+			s.liveCache[cacheKey] = extendExpiry(existing)
+			s.mu.Unlock()
+			slog.Warn("upstream fetch failed this cycle, keeping previous live cache instead of publishing an incomplete one", "os", osName, "codename", codename)
+			return
+		}
+	}
+
 	files, hashes, builtAt, expiry, fresh, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 

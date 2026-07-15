@@ -198,6 +198,55 @@ func TestRemoveSourceEntryUnknownIsNoop(t *testing.T) {
 	}
 }
 
+// TestUpsertSourceEntryKeepsBothUpstreamsAtIdenticalVersion mirrors
+// valkeystore's test of the same name -- see its doc comment for the full
+// reasoning.
+func TestUpsertSourceEntryKeepsBothUpstreamsAtIdenticalVersion(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	a := sourceEntry("hello", "1.0")
+	a.Upstream = "debian-main"
+	a.UpstreamDir = "pool/main/h/hello"
+	a.LocalDir = model.SourceDir("debian", "trixie", "debian-main", "main", "hello")
+
+	b := sourceEntry("hello", "1.0")
+	b.Upstream = "debian-security"
+	b.UpstreamDir = "pool/updates/main/h/hello"
+	b.LocalDir = model.SourceDir("debian", "trixie", "debian-security", "main", "hello")
+
+	if err := s.UpsertSourceEntry(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSourceEntry(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListSourceEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected both upstreams' source entries to survive, got %d: %v", len(entries), entries)
+	}
+
+	gotA, err := s.FindSourceEntry(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Upstream: "debian-main"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotA == nil || gotA.UpstreamDir != a.UpstreamDir {
+		t.Fatalf("expected debian-main's own entry, got %v", gotA)
+	}
+
+	gotB, err := s.FindSourceEntry(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Upstream: "debian-security"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotB == nil || gotB.UpstreamDir != b.UpstreamDir {
+		t.Fatalf("expected debian-security's own entry, got %v", gotB)
+	}
+}
+
 func TestEntryByDigest(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()
@@ -263,6 +312,56 @@ func TestFindEntry(t *testing.T) {
 	}
 	if none != nil {
 		t.Fatal("expected nil for unknown package")
+	}
+}
+
+// TestUpsertEntryKeepsBothUpstreamsAtIdenticalVersion mirrors
+// valkeystore's test of the same name: two upstreams commonly carry a
+// package at the identical version at once, each independently cached
+// under its own PoolPath, and both must survive as distinct entries.
+func TestUpsertEntryKeepsBothUpstreamsAtIdenticalVersion(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	a := entry("hello", "1.0", "amd64")
+	a.Upstream = "ubuntu-security"
+	a.PoolPath = model.PoolPath("ubuntu", "noble", "ubuntu-security", "main", "hello", "1.0", "amd64")
+	a.OS, a.Codename = "ubuntu", "noble"
+
+	b := entry("hello", "1.0", "amd64")
+	b.Upstream = "ubuntu-updates"
+	b.PoolPath = model.PoolPath("ubuntu", "noble", "ubuntu-updates", "main", "hello", "1.0", "amd64")
+	b.OS, b.Codename = "ubuntu", "noble"
+
+	if err := s.UpsertEntry(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "ubuntu", Codename: "noble"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected both upstreams' entries to survive, got %d: %v", len(entries), entries)
+	}
+
+	gotA, err := s.FindEntry(ctx, model.Selector{OS: "ubuntu", Codename: "noble", Upstream: "ubuntu-security"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotA == nil || gotA.PoolPath != a.PoolPath {
+		t.Fatalf("expected ubuntu-security's own entry, got %v", gotA)
+	}
+
+	gotB, err := s.FindEntry(ctx, model.Selector{OS: "ubuntu", Codename: "noble", Upstream: "ubuntu-updates"}, "hello", "1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotB == nil || gotB.PoolPath != b.PoolPath {
+		t.Fatalf("expected ubuntu-updates's own entry, got %v", gotB)
 	}
 }
 

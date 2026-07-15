@@ -297,7 +297,7 @@ func (s *Store) UpsertEntry(_ context.Context, e model.IndexEntry) error {
 	entries := s.entries[key]
 	updated := false
 	for i, existing := range entries {
-		if existing.Package == e.Package && existing.Version == e.Version {
+		if existing.Package == e.Package && existing.Version == e.Version && existing.Upstream == e.Upstream {
 			entries[i] = e
 			updated = true
 			break
@@ -314,8 +314,8 @@ func (s *Store) UpsertEntry(_ context.Context, e model.IndexEntry) error {
 }
 
 // RemoveEntry deletes the entry matching e's identity (OS/Codename/Component/
-// Arch/Package/Version); other fields are ignored for matching. A no-op if no
-// matching entry exists.
+// Arch/Package/Version/Upstream); other fields are ignored for matching. A
+// no-op if no matching entry exists.
 func (s *Store) RemoveEntry(_ context.Context, e model.IndexEntry) error {
 	key := entryKey(e.OS, e.Codename, e.Component, e.Arch)
 
@@ -324,7 +324,7 @@ func (s *Store) RemoveEntry(_ context.Context, e model.IndexEntry) error {
 
 	entries := s.entries[key]
 	for i, existing := range entries {
-		if existing.Package == e.Package && existing.Version == e.Version {
+		if existing.Package == e.Package && existing.Version == e.Version && existing.Upstream == e.Upstream {
 			entries = append(entries[:i:i], entries[i+1:]...)
 			s.entries[key] = entries
 			relPath := IndexRelPath(e.OS, e.Codename, e.Component, e.Arch)
@@ -407,6 +407,9 @@ func (s *Store) FindEntry(_ context.Context, sel model.Selector, pkg, version st
 		}
 		for _, e := range entries {
 			if e.Package != pkg {
+				continue
+			}
+			if sel.Upstream != "" && e.Upstream != sel.Upstream {
 				continue
 			}
 			if version != "" {
@@ -855,7 +858,7 @@ func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error 
 	srcs := s.sources[key]
 	updated := false
 	for i, existing := range srcs {
-		if existing.Package == e.Package && existing.Version == e.Version {
+		if existing.Package == e.Package && existing.Version == e.Version && existing.Upstream == e.Upstream {
 			e.FilesDownloaded = e.FilesDownloaded || existing.FilesDownloaded
 			e.FirstSeen = existing.FirstSeen
 			srcs[i] = e
@@ -873,8 +876,8 @@ func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error 
 }
 
 // RemoveSourceEntry deletes the source entry matching e's identity
-// (OS/Codename/Component/Package/Version); other fields are ignored for
-// matching. A no-op if no matching entry exists.
+// (OS/Codename/Component/Package/Version/Upstream); other fields are
+// ignored for matching. A no-op if no matching entry exists.
 func (s *Store) RemoveSourceEntry(_ context.Context, e model.SourceEntry) error {
 	key := sourceKey(e.OS, e.Codename, e.Component)
 	relPath := SourceRelPath(e.OS, e.Codename, e.Component)
@@ -884,7 +887,7 @@ func (s *Store) RemoveSourceEntry(_ context.Context, e model.SourceEntry) error 
 
 	srcs := s.sources[key]
 	for i, existing := range srcs {
-		if existing.Package == e.Package && existing.Version == e.Version {
+		if existing.Package == e.Package && existing.Version == e.Version && existing.Upstream == e.Upstream {
 			srcs = append(srcs[:i:i], srcs[i+1:]...)
 			s.sources[key] = srcs
 			s.dirty[relPath] = true
@@ -945,6 +948,9 @@ func (s *Store) FindSourceEntry(_ context.Context, sel model.Selector, pkg, vers
 		}
 		for _, e := range srcs {
 			if e.Package != pkg {
+				continue
+			}
+			if sel.Upstream != "" && e.Upstream != sel.Upstream {
 				continue
 			}
 			if version != "" {
