@@ -601,35 +601,3 @@ func TestFetchSourcesStaleFallbackOnDownloadError(t *testing.T) {
 		t.Fatalf("expected stale version 1.0 fallback, got %+v", srcs2)
 	}
 }
-
-func TestDownloadDeb(t *testing.T) {
-	key, keyring := testKey(t)
-	srvURL, _, debContent := buildFakeUpstream(t, key)
-
-	src := makeSource(t, srvURL, keyring)
-	f := upstream.NewFetcher(src, nil)
-
-	debSum := sha256.Sum256(debContent)
-	debSHA256 := hex.EncodeToString(debSum[:])
-
-	got, err := f.DownloadDeb(context.Background(), "pool/main/h/hello/hello_1.0_amd64.deb", debSHA256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, debContent) {
-		t.Fatal("downloaded content does not match original")
-	}
-}
-
-func TestDownloadDebBadDigest(t *testing.T) {
-	key, keyring := testKey(t)
-	srvURL, _, _ := buildFakeUpstream(t, key)
-
-	src := makeSource(t, srvURL, keyring)
-	f := upstream.NewFetcher(src, nil)
-
-	_, err := f.DownloadDeb(context.Background(), "pool/main/h/hello/hello_1.0_amd64.deb", "badhash")
-	if err == nil {
-		t.Fatal("expected error on SHA256 mismatch")
-	}
-}

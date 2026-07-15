@@ -11,9 +11,9 @@ import (
 type RawSrc struct {
 	Package   string
 	Version   string
-	Directory string   // upstream-relative directory path
+	Directory string // upstream-relative directory path
 	Files     []RawSrcFile
-	Raw       string   // verbatim deb822 stanza text from upstream
+	Raw       string // verbatim deb822 stanza text from upstream
 }
 
 // RawSrcFile is one file listed in a Sources stanza's Checksums-Sha256: field.

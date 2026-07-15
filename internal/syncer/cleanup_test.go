@@ -939,7 +939,7 @@ func TestCleanupRemovesEntryForMissingPoolFile(t *testing.T) {
 	gone := model.IndexEntry{
 		OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
 		Package: "vanished", Version: "1.0",
-		PoolPath: "pool/ubuntu/jammy/upstream/main/v/vanished/vanished_1.0_amd64.deb",
+		PoolPath:  "pool/ubuntu/jammy/upstream/main/v/vanished/vanished_1.0_amd64.deb",
 		FirstSeen: now.Add(-2 * time.Hour), // past the grace period
 	}
 	idx.entries = []model.IndexEntry{gone}

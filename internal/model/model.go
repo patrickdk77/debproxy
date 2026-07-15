@@ -120,21 +120,21 @@ type SourceFile struct {
 
 // SourceEntry records one source package's placement within a layout component.
 type SourceEntry struct {
-	OS          string
-	Codename    string
-	Component   string
-	Package     string
-	Version     string
-	Upstream    string
+	OS        string
+	Codename  string
+	Component string
+	Package   string
+	Version   string
+	Upstream  string
 	// LocalDir is the storage directory for this source package's files:
 	// src/{os}/{codename}/{upstream}/{component}/{letter}/{name}
-	LocalDir    string
+	LocalDir string
 	// UpstreamDir is the upstream's original Directory: field, used for pull-through.
 	UpstreamDir string
 	Files       []SourceFile
 	// Stanza is the full deb822 Sources stanza with Directory: rewritten to LocalDir.
-	Stanza         string
-	FirstSeen      time.Time
+	Stanza    string
+	FirstSeen time.Time
 	// FilesDownloaded is true when at least one file for this source package
 	// version has been stored locally. Only entries with this flag set are
 	// eligible for auto-update downloads on a version bump.
@@ -167,9 +167,4 @@ func PoolPath(os, codename, upstream, section, name, version, arch string) strin
 	}
 	debName := fmt.Sprintf("%s_%s_%s.deb", name, version, arch)
 	return path.Join("pool", os, codename, upstream, section, first, name, debName)
-}
-
-// PackagesFilename returns the Filename field for a Packages index entry relative to archive root.
-func PackagesFilename(poolPath string) string {
-	return poolPath
 }

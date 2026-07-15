@@ -563,14 +563,3 @@ func poolPathFromFilename(os, codename, upstreamName, section, pkgName, upstream
 	}
 	return "pool/" + os + "/" + codename + "/" + upstreamName + "/" + section + "/" + first + "/" + pkgName + "/" + debFile
 }
-
-func parseInt64(s string) int64 {
-	var n int64
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return n
-		}
-		n = n*10 + int64(r-'0')
-	}
-	return n
-}

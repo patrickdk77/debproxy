@@ -166,21 +166,21 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 	}
 
 	return &Server{
-		cfg:             cfg,
-		store:           store,
-		index:           index,
-		key:             key,
-		client:          client,
-		indexCache:      indexCache,
-		notifier:        notifier,
-		exists:          exists,
+		cfg:              cfg,
+		store:            store,
+		index:            index,
+		key:              key,
+		client:           client,
+		indexCache:       indexCache,
+		notifier:         notifier,
+		exists:           exists,
 		liveCache:        map[string]*liveEntry{},
 		liveBuilding:     map[string]chan struct{}{},
 		retryCancel:      map[string]context.CancelFunc{},
 		retiredLive:      map[string][]*retiredLiveEntry{},
 		pendingPeerAdopt: map[string]context.CancelFunc{},
-		validOSCodename: validOSCodename,
-		validTriple:     validTriple,
+		validOSCodename:  validOSCodename,
+		validTriple:      validTriple,
 	}
 }
 
@@ -901,11 +901,27 @@ func (s *Server) pullThroughSource(ctx context.Context, osName, srcPath string) 
 			if sf.Filename != filename {
 				continue
 			}
-			data, err := f.DownloadSourceFile(ctx, raw.Directory, filename, sf.SHA256)
-			if err != nil {
-				return err
+			// Reuses downloadAndCacheSourceFile (-> Ingestor.CacheSourceFile)
+			// rather than fetching+storing directly here: this used to call
+			// f.DownloadSourceFile and buffer the whole file into a []byte
+			// before writing it to storage, the same fully-buffered pattern
+			// fixed elsewhere in CacheSourceFile this session -- reusing that
+			// fix here instead of duplicating it gets streaming for free.
+			entry := model.SourceEntry{
+				OS:          osName,
+				Codename:    codename,
+				Component:   component,
+				Package:     raw.Package,
+				Version:     raw.Version,
+				Upstream:    upstreamName,
+				UpstreamDir: raw.Directory,
+				Files: []model.SourceFile{{
+					Filename: sf.Filename,
+					Size:     sf.Size,
+					SHA256:   model.Digest(sf.SHA256),
+				}},
 			}
-			return s.store.PutFile(ctx, srcPath, bytes.NewReader(data), int64(len(data)))
+			return s.downloadAndCacheSourceFile(ctx, entry, upstreamName, filename)
 		}
 		return fmt.Errorf("file %s not listed in source package %s", filename, pkgName)
 	}

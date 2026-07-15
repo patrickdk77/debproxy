@@ -129,19 +129,11 @@ func (s *Syncer) Update(ctx context.Context) error {
 	return s.runUpdate(ctx, s.indexCache, nil)
 }
 
-// UpdateWithCache runs the same update logic as Update but reuses an already-
-// populated index cache (e.g. from a background refresh) instead of fetching
-// from scratch. Takes cache's build lock for the same reason Update does --
-// see its doc comment.
-func (s *Syncer) UpdateWithCache(ctx context.Context, cache *upstream.IndexCache) error {
-	cache.Lock()
-	defer cache.Unlock()
-	return s.runUpdate(ctx, cache, nil)
-}
-
-// UpdateLayoutWithCache is UpdateWithCache scoped to a single (os, codename)
-// layout grouping, for callers that refresh each layout independently (see
-// cmd/debproxy's per-layout refresh scheduler) rather than all of them in one
+// UpdateLayoutWithCache runs the same update logic as Update but reuses an
+// already-populated index cache (e.g. from a background refresh) instead of
+// fetching from scratch, scoped to a single (os, codename) layout grouping,
+// for callers that refresh each layout independently (see cmd/debproxy's
+// per-layout refresh scheduler) rather than all of them in one
 // pass.
 func (s *Syncer) UpdateLayoutWithCache(ctx context.Context, cache *upstream.IndexCache, osName, codename string) error {
 	only := osCodename{osName, codename}

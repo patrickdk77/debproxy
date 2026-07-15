@@ -27,6 +27,17 @@ import (
 // through without ever being buffered into memory.
 const maxEntryFraction = 10
 
+// maxEntryAbsoluteBytes additionally caps a single cached entry regardless
+// of the configured overall cache size. maxEntryFraction alone still lets a
+// large storage.file_cache.size (say, tens of GB, to get a good hit rate
+// over a big repo) push the per-entry budget up into multiple GB -- and
+// cachedOpen buffers a cache-miss read whole via io.ReadAll before ever
+// serving it, so any file under that budget, however large in absolute
+// terms, gets fully read into memory first. This is what actually caused
+// multi-GB RSS spikes on real downloads (a large-but-under-budget .deb),
+// not just the already-guarded "bigger than the fraction" case.
+const maxEntryAbsoluteBytes = 64 * 1024 * 1024 // 64 MiB
+
 type entry struct {
 	path string
 	data []byte
@@ -78,7 +89,13 @@ func Wrap(store storage.Storage, maxBytes int64) storage.Storage {
 	}
 }
 
-func (s *Store) maxEntryBytes() int64 { return s.maxBytes / maxEntryFraction }
+func (s *Store) maxEntryBytes() int64 {
+	limit := s.maxBytes / maxEntryFraction
+	if limit > maxEntryAbsoluteBytes {
+		limit = maxEntryAbsoluteBytes
+	}
+	return limit
+}
 
 func (s *Store) get(path string) (*entry, bool) {
 	s.mu.Lock()
@@ -216,13 +233,12 @@ func (s *Store) cachedOpen(
 
 	// Stat first, purely to pre-screen by size: a file too large to ever
 	// fit the per-entry budget is streamed straight through, never
-	// buffered into memory. A Stat failure here doesn't fail the read --
-	// Open below is what actually matters -- it just means this read can't
-	// be pre-screened by size, and (per the statErr check below) the
-	// resulting FileInfo is synthesized from what was actually read
-	// instead of coming from Stat.
+	// buffered into memory. A Stat failure must not fall through to the
+	// unconditional io.ReadAll below -- that would remove the one guard
+	// against buffering an arbitrarily large file whole, precisely when
+	// its size is the one thing not actually known.
 	info, statErr := statFn(ctx, path)
-	if statErr == nil && info.Size > s.maxEntryBytes() {
+	if statErr != nil || info.Size > s.maxEntryBytes() {
 		return openFn(ctx, path)
 	}
 
@@ -236,9 +252,6 @@ func (s *Store) cachedOpen(
 		return nil, err
 	}
 
-	if statErr != nil {
-		info = storage.FileInfo{Path: path, Size: int64(len(data))}
-	}
 	s.put(path, data, info)
 	return io.NopCloser(bytes.NewReader(data)), nil
 }

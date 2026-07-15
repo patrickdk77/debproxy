@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 )
 
@@ -193,14 +192,4 @@ func WriteParagraphs(w io.Writer, paras []*Paragraph) error {
 		}
 	}
 	return nil
-}
-
-// SortPackages orders paragraphs by Package then Version for stable output.
-func SortPackages(paras []*Paragraph) {
-	sort.SliceStable(paras, func(i, j int) bool {
-		if a, b := paras[i].Get("Package"), paras[j].Get("Package"); a != b {
-			return a < b
-		}
-		return paras[i].Get("Version") < paras[j].Get("Version")
-	})
 }

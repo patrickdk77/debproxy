@@ -1042,41 +1042,6 @@ func (f *Fetcher) fetchSourcesFile(ctx context.Context, rel *apt.Release, base s
 	return nil, nil
 }
 
-// DownloadSourceFile fetches a single source package file from the upstream.
-// directory is the upstream's Directory: field (e.g. "pool/main/a/apt");
-// filename is the bare filename (e.g. "apt_2.6.1.dsc").
-func (f *Fetcher) DownloadSourceFile(ctx context.Context, directory, filename, expectedSHA256 string) ([]byte, error) {
-	url := f.base() + "/" + strings.TrimLeft(directory, "/") + "/" + filename
-	data, resp, err := f.getConditional(ctx, url, "", "")
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("download source %s: status %d", filename, resp.StatusCode)
-	}
-	if err := verifyDigest(data, expectedSHA256); err != nil {
-		return nil, fmt.Errorf("source %s: %w", filename, err)
-	}
-	return data, nil
-}
-
-// DownloadDeb fetches a package by its upstream-relative Filename and verifies
-// its content against the expected SHA256 before returning the bytes.
-func (f *Fetcher) DownloadDeb(ctx context.Context, filename, expectedSHA256 string) ([]byte, error) {
-	url := f.base() + "/" + strings.TrimLeft(filename, "/")
-	data, resp, err := f.getConditional(ctx, url, "", "")
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("download %s: status %d", filename, resp.StatusCode)
-	}
-	if err := verifyDigest(data, expectedSHA256); err != nil {
-		return nil, fmt.Errorf("%s: %w", filename, err)
-	}
-	return data, nil
-}
-
 // FetchDebStream issues a GET for filename and returns the raw response body
 // stream without reading it into memory, for callers that want to tee it
 // directly into storage (and, when a live client request is waiting on it,
@@ -1104,6 +1069,36 @@ func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadC
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("download %s: status %d", filename, resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
+// FetchSourceFileStream is FetchDebStream's source-file counterpart: issues
+// a GET for directory/filename and returns the raw response body stream
+// without reading it into memory. directory is the upstream's Directory:
+// field (e.g. "pool/main/a/apt"); filename is the bare filename (e.g.
+// "apt_2.6.1.dsc"). The caller must Close the returned body; digest
+// verification is the caller's responsibility (see ingest.digestVerifyingReader).
+func (f *Fetcher) FetchSourceFileStream(ctx context.Context, directory, filename string) (io.ReadCloser, error) {
+	if f.src.Network != "" {
+		ctx = withNetwork(ctx, f.src.Network)
+	}
+	url := f.base() + "/" + strings.TrimLeft(directory, "/") + "/" + filename
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if f.src.Username != "" {
+		req.SetBasicAuth(f.src.Username, f.src.Password)
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("download source %s: status %d", filename, resp.StatusCode)
 	}
 	return resp.Body, nil
 }
@@ -1159,10 +1154,4 @@ func verifyDigest(data []byte, expected string) error {
 		return fmt.Errorf("%w: got %s want %s", ErrDigestMismatch, got, expected)
 	}
 	return nil
-}
-
-// Digest computes the hex SHA256 of data.
-func Digest(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
 }

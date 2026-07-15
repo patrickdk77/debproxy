@@ -203,7 +203,7 @@ func StanzaString(p *Paragraph) (string, error) {
 	for i, k := range p.keys {
 		v := p.values[p.lkeys[i]]
 		if strings.Contains(v, "\n") {
-			size += len(k) + 2          // "Key:\n"
+			size += len(k) + 2                          // "Key:\n"
 			size += len(v) + strings.Count(v, "\n") + 2 // indent each line + final \n
 		} else {
 			size += len(k) + 2 + len(v) + 1 // "Key: value\n"

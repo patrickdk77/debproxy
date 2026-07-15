@@ -549,7 +549,6 @@ func TestRefreshDetectsNewFiles(t *testing.T) {
 	}
 }
 
-
 func TestUpstreamStateRoundTrip(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()

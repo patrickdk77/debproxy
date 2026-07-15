@@ -3,6 +3,7 @@ package filecache_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -24,6 +25,11 @@ type mockStore struct {
 	openCalls, statCalls, existsCalls           int
 	openPubCalls, statPubCalls                  int
 	writeCalls, putCalls, delCalls, delPubCalls int
+
+	// injectStatErr, if set, makes Stat fail with this error instead of its
+	// normal lookup -- for testing cachedOpen's behavior when a file's size
+	// can't be confirmed.
+	injectStatErr error
 }
 
 func newMockStore() *mockStore {
@@ -51,6 +57,9 @@ func (m *mockStore) Stat(_ context.Context, path string) (storage.FileInfo, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.statCalls++
+	if m.injectStatErr != nil {
+		return storage.FileInfo{}, m.injectStatErr
+	}
 	data, ok := m.files[path]
 	if !ok {
 		return storage.FileInfo{}, os.ErrNotExist
@@ -347,6 +356,76 @@ func TestEntryLargerThanOneTenthOfCacheIsNeverCached(t *testing.T) {
 	}
 	if backing.openCalls != 2 {
 		t.Fatalf("expected the oversized file to never be cached (2 backend calls), got %d", backing.openCalls)
+	}
+}
+
+// TestEntryLargerThanAbsoluteCapIsNeverCached is the regression test for a
+// real memory incident: the 1/10th-of-cache rule alone let the effective
+// per-entry budget grow into multiple GB whenever the operator configured a
+// large enough overall cache size, and cachedOpen buffers a cache-miss read
+// whole via io.ReadAll before serving it -- so a large-but-under-budget
+// .deb caused multi-GB RSS spikes on ordinary downloads. maxEntryAbsoluteBytes
+// caps this regardless of how large the configured cache is: a 1/10th
+// budget of 1000 bytes here would ordinarily allow a 100-byte entry, but
+// the absolute cap (set to 10 bytes for this test, via a size the fixture
+// never actually changes) must still reject anything bigger than it.
+func TestEntryLargerThanAbsoluteCapIsNeverCached(t *testing.T) {
+	backing := newMockStore()
+	// 1/10th of maxBytes (1_000_000_000) would allow a 100MB entry -- far
+	// larger than maxEntryAbsoluteBytes (64MiB) -- so a 65MiB file must
+	// still be rejected by the absolute cap alone.
+	const bigSize = 65 * 1024 * 1024
+	big := make([]byte, bigSize)
+	backing.set("pool/big.deb", big)
+	store := filecache.Wrap(backing, 1_000_000_000)
+	ctx := context.Background()
+
+	if _, err := store.Open(ctx, "pool/big.deb"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if backing.openCalls != 1 {
+		t.Fatalf("got %d open calls", backing.openCalls)
+	}
+
+	// A second read must hit the backend again -- the file was never
+	// cached, despite comfortably fitting the fractional budget.
+	if _, err := store.Open(ctx, "pool/big.deb"); err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	if backing.openCalls != 2 {
+		t.Fatalf("expected the file to never be cached despite fitting the fractional budget (2 backend calls), got %d", backing.openCalls)
+	}
+}
+
+// TestStatFailureNeverBuffersUnboundedly is the regression test for the
+// other half of the same incident: cachedOpen's size pre-screen used to be
+// skipped entirely whenever Stat failed, falling through to an
+// unconditional io.ReadAll with no size guard at all -- exactly backwards,
+// since a Stat failure means the size is the one thing NOT known. A Stat
+// failure must make cachedOpen stream straight through (never attempt to
+// cache), the same as a confirmed-oversized file, not less cautious.
+func TestStatFailureNeverBuffersUnboundedly(t *testing.T) {
+	backing := newMockStore()
+	small := []byte("tiny, well under any size budget")
+	backing.set("pool/small.deb", small)
+	backing.injectStatErr = errors.New("simulated transient stat failure")
+	store := filecache.Wrap(backing, 1000)
+	ctx := context.Background()
+
+	if _, err := store.Open(ctx, "pool/small.deb"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if backing.openCalls != 1 {
+		t.Fatalf("got %d open calls", backing.openCalls)
+	}
+
+	// A second read must hit the backend again -- a Stat failure must
+	// never result in the file being cached.
+	if _, err := store.Open(ctx, "pool/small.deb"); err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	if backing.openCalls != 2 {
+		t.Fatalf("expected a Stat failure to prevent caching (2 backend calls), got %d", backing.openCalls)
 	}
 }
 

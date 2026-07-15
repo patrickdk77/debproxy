@@ -2,7 +2,6 @@
 package ingest
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -71,30 +70,18 @@ func New(store storage.Storage, index metadata.MetadataIndex, client *http.Clien
 // only the top-level package whose newer version triggered the update to
 // notify -- a dependency pulled in solely to satisfy that package's
 // requirements isn't itself a separate update worth notifying about.
+//
+// Equivalent to CacheStreaming with a nil w (see its doc comment): every
+// caller here (Prime's and auto-update's dependency-closure downloads, and
+// pull-through's Range-request-on-miss and re-index paths, none of which
+// have a live client response to tee bytes into) used to instead go through
+// upstream.Fetcher.DownloadDeb, which read the whole .deb into a []byte
+// before ever writing to storage -- fully resident in memory regardless of
+// file size. Real multi-GB packages made that a real memory spike; this
+// still ends up cached and indexed identically, just via the same bounded,
+// streamed write CacheStreaming already uses for the live pull-through path.
 func (in *Ingestor) Cache(ctx context.Context, osName, codename string, p avail.Pkg, notify bool) error {
-	if in.exists == nil || !in.exists.Has(p.PoolPath) {
-		exists, err := in.store.Exists(ctx, p.PoolPath)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			slog.Debug("downloading package", "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
-			f := upstream.NewFetcher(p.Upstream, in.client)
-			data, err := f.DownloadDeb(ctx, p.Filename, p.SHA256)
-			if err != nil {
-				return err
-			}
-			if err := in.store.PutFile(ctx, p.PoolPath, bytes.NewReader(data), int64(len(data))); err != nil {
-				return err
-			}
-			in.onDownloaded(osName, codename, p, notify)
-		}
-		if in.exists != nil {
-			in.exists.Add(p.PoolPath)
-		}
-	}
-
-	return in.upsertEntry(ctx, osName, codename, p)
+	return in.CacheStreaming(ctx, osName, codename, p, notify, nil)
 }
 
 // CacheStreaming is like Cache but, for the not-yet-cached case, streams the
@@ -300,11 +287,13 @@ func (in *Ingestor) CacheSourceFile(ctx context.Context, entry model.SourceEntry
 
 	slog.Debug("downloading source file", "package", entry.Package, "version", entry.Version, "file", filename, "upstream", entry.Upstream)
 	f := upstream.NewFetcher(us, in.client)
-	data, err := f.DownloadSourceFile(ctx, entry.UpstreamDir, filename, string(srcFile.SHA256))
+	body, err := f.FetchSourceFileStream(ctx, entry.UpstreamDir, filename)
 	if err != nil {
 		return err
 	}
-	if err := in.store.PutFile(ctx, filePath, bytes.NewReader(data), int64(len(data))); err != nil {
+	defer body.Close()
+	dvr := newDigestVerifyingReader(body, nil, string(srcFile.SHA256))
+	if err := in.store.PutFile(ctx, filePath, dvr, srcFile.Size); err != nil {
 		return err
 	}
 	slog.Info("cached source file", "package", entry.Package, "version", entry.Version, "file", filename, "upstream", entry.Upstream)

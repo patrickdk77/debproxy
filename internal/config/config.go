@@ -31,9 +31,9 @@ const (
 
 // Config is the top-level application configuration.
 type Config struct {
-	LogLevel  string                 `yaml:"log_level"`
-	Storage   StorageConfig          `yaml:"storage"`
-	UserAgent string                 `yaml:"user_agent"`
+	LogLevel  string        `yaml:"log_level"`
+	Storage   StorageConfig `yaml:"storage"`
+	UserAgent string        `yaml:"user_agent"`
 	// UpstreamNetwork forces upstream mirror fetches over a specific IP
 	// family: "ipv4", "ipv6", or "" (default) for standard dual-stack dialing
 	// (Happy Eyeballs races both, using whichever connects first). Set this
@@ -41,13 +41,13 @@ type Config struct {
 	// black-hole one family (a connection attempt that never completes at
 	// all, rather than failing fast), which a connect-time race alone
 	// doesn't protect against as reliably as just not attempting it.
-	UpstreamNetwork string `yaml:"upstream_network"`
-	Webhooks  []webhook.Def          `yaml:"webhooks"`
-	Upstreams map[string]UpstreamDef `yaml:"upstreams"`
-	Layouts   []OSLayout             `yaml:"layouts"`
-	Signing   SigningConfig          `yaml:"signing"`
-	Schedule  ScheduleConfig         `yaml:"schedule"`
-	Valkey    ValkeyConfig           `yaml:"valkey"`
+	UpstreamNetwork string                 `yaml:"upstream_network"`
+	Webhooks        []webhook.Def          `yaml:"webhooks"`
+	Upstreams       map[string]UpstreamDef `yaml:"upstreams"`
+	Layouts         []OSLayout             `yaml:"layouts"`
+	Signing         SigningConfig          `yaml:"signing"`
+	Schedule        ScheduleConfig         `yaml:"schedule"`
+	Valkey          ValkeyConfig           `yaml:"valkey"`
 	// MetricsAddr is the listen address for the Prometheus metrics endpoint
 	// (e.g. ":9090"). The endpoint is exposed at /metrics on this address.
 	// Leave empty to disable metrics.
