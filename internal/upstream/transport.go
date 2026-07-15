@@ -15,7 +15,24 @@ type contextKey int
 const (
 	userAgentKey contextKey = iota
 	clientWaitingKey
+	networkKey
 )
+
+// withNetwork stores network ("ipv4"/"ipv6") in ctx so upstream fetches made
+// with that context dial over that IP family, taking precedence over
+// NewHTTPClient's own static default -- see the dial closure in NewHTTPClient
+// for why a per-upstream override needs to win over the global default, the
+// opposite precedence from userAgentTransport's configured>context (an
+// operator's specific-mirror override should beat the general default, not
+// the other way around).
+func withNetwork(ctx context.Context, network string) context.Context {
+	return context.WithValue(ctx, networkKey, network)
+}
+
+func networkFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(networkKey).(string)
+	return v, ok
+}
 
 // WithUserAgent stores ua in ctx so that upstream fetches made with that
 // context will use it as the outgoing User-Agent (when no global UA is configured).
@@ -62,13 +79,38 @@ func UserAgentFromContext(ctx context.Context) (string, bool) {
 // userAgent is sent as the User-Agent header on every outgoing request. When
 // empty, the User-Agent stored in the request context by WithUserAgent is used
 // instead (allowing the server to pass through the apt client's UA).
-func NewHTTPClient(userAgent string) *http.Client {
+//
+// network is the default IP family forced for every dial: "ipv4", "ipv6", or
+// "" for the default dual-stack behavior (Happy Eyeballs races both, using
+// whichever connects first, per net.Dialer's own FallbackDelay). Set this
+// when one family is broken in a way a connect-time race doesn't reliably
+// protect against -- e.g. a network that silently black-holes one family
+// (hangs rather than failing fast) somewhere before or during the connect
+// attempt, not just a family that actively refuses connections quickly. A
+// per-upstream override carried in the request context (see withNetwork,
+// set by Fetcher for an UpstreamSource with its own Network value) takes
+// precedence over this default for that specific request.
+func NewHTTPClient(userAgent, network string) *http.Client {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
+	dialContext := func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		forced := network
+		if v, ok := networkFromContext(ctx); ok && v != "" {
+			forced = v
+		}
+		switch forced {
+		case "ipv4":
+			return dialer.DialContext(ctx, "tcp4", addr)
+		case "ipv6":
+			return dialer.DialContext(ctx, "tcp6", addr)
+		default:
+			return dialer.DialContext(ctx, netw, addr)
+		}
+	}
 	base := &http.Transport{
-		DialContext:           dialer.DialContext,
+		DialContext:           dialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		MaxIdleConns:          50,

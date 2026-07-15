@@ -36,6 +36,13 @@ type UpstreamSource struct {
 	// Leave empty for unauthenticated upstreams.
 	Username string
 	Password string
+	// Network forces fetches from this upstream over a specific IP family:
+	// "ipv4", "ipv6", or "" for the process-wide default (config's top-level
+	// upstream_network, itself "" for standard dual-stack behavior). Resolved
+	// from this upstream's own config (falling back to the global default)
+	// during config loading, so by the time a Fetcher sees it, it's already
+	// this upstream's final, effective value -- no further fallback needed.
+	Network string
 }
 
 // DedupKey returns a key identifying which upstream mirror u fetches from --

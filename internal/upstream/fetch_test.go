@@ -315,7 +315,7 @@ func TestFetchIndexFastFallbackTimeoutBoundsHangingUpstream(t *testing.T) {
 
 	src := makeSource(t, srv.URL, keyring)
 	cache := upstream.NewIndexCache()
-	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient(""), cache)
+	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient("", ""), cache)
 	ctx := upstream.WithClientWaiting(context.Background())
 
 	// First fetch succeeds and warms the cache with real archPkgs.
@@ -397,7 +397,7 @@ func TestFetchIndexBackgroundCallerToleratesSlowUpstream(t *testing.T) {
 
 	src := makeSource(t, srv.URL, keyring)
 	cache := upstream.NewIndexCache()
-	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient(""), cache)
+	f := upstream.NewFetcherWithCache(src, upstream.NewHTTPClient("", ""), cache)
 
 	// Deliberately not WithClientWaiting -- this mirrors the periodic
 	// refresher / background rebuild callers.

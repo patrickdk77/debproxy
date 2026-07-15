@@ -21,6 +21,12 @@ import (
 const (
 	BackendFilesystem = "filesystem"
 	BackendS3         = "s3"
+
+	// NetworkAuto is UpstreamNetwork's default: standard dual-stack dialing
+	// (Happy Eyeballs races IPv4/IPv6, using whichever connects first).
+	NetworkAuto = ""
+	NetworkIPv4 = "ipv4"
+	NetworkIPv6 = "ipv6"
 )
 
 // Config is the top-level application configuration.
@@ -28,6 +34,14 @@ type Config struct {
 	LogLevel  string                 `yaml:"log_level"`
 	Storage   StorageConfig          `yaml:"storage"`
 	UserAgent string                 `yaml:"user_agent"`
+	// UpstreamNetwork forces upstream mirror fetches over a specific IP
+	// family: "ipv4", "ipv6", or "" (default) for standard dual-stack dialing
+	// (Happy Eyeballs races both, using whichever connects first). Set this
+	// if one family is broken in your network -- some environments silently
+	// black-hole one family (a connection attempt that never completes at
+	// all, rather than failing fast), which a connect-time race alone
+	// doesn't protect against as reliably as just not attempting it.
+	UpstreamNetwork string `yaml:"upstream_network"`
 	Webhooks  []webhook.Def          `yaml:"webhooks"`
 	Upstreams map[string]UpstreamDef `yaml:"upstreams"`
 	Layouts   []OSLayout             `yaml:"layouts"`
@@ -380,6 +394,13 @@ type UpstreamDef struct {
 	// it is treated as an environment variable name and expanded at load time.
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+	// UpstreamNetwork overrides the top-level upstream_network for this
+	// specific upstream only: "ipv4" or "ipv6". Omit to use the global
+	// default. Set this when only one particular mirror has a broken IP
+	// family rather than your whole network -- e.g. one ports.ubuntu.com
+	// mirror over a flaky IPv6 path, while other upstreams are fine on the
+	// default dual-stack behavior.
+	UpstreamNetwork string `yaml:"upstream_network"`
 }
 
 type OSLayout struct {
@@ -463,6 +484,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("storage.filesystem.root is required")
 	}
 
+	switch c.UpstreamNetwork {
+	case NetworkAuto, NetworkIPv4, NetworkIPv6:
+	default:
+		return fmt.Errorf("unknown upstream_network %q (must be \"ipv4\", \"ipv6\", or omitted)", c.UpstreamNetwork)
+	}
+
 	if len(c.Upstreams) == 0 {
 		return fmt.Errorf("at least one upstream is required")
 	}
@@ -483,6 +510,11 @@ func (c *Config) resolveLayouts() error {
 		}
 		if len(def.Keys) == 0 {
 			return fmt.Errorf("upstream %q: at least one key is required", name)
+		}
+		switch def.UpstreamNetwork {
+		case NetworkAuto, NetworkIPv4, NetworkIPv6:
+		default:
+			return fmt.Errorf("upstream %q: unknown upstream_network %q (must be \"ipv4\", \"ipv6\", or omitted)", name, def.UpstreamNetwork)
 		}
 		kr, err := loadKeyring(def.Keys)
 		if err != nil {
@@ -551,6 +583,11 @@ func (c *Config) resolveLayouts() error {
 						upArchs = archs
 					}
 
+					network := def.UpstreamNetwork
+					if network == "" {
+						network = c.UpstreamNetwork
+					}
+
 					upstreams = append(upstreams, model.UpstreamSource{
 						Name:         upName,
 						URL:          url,
@@ -562,6 +599,7 @@ func (c *Config) resolveLayouts() error {
 						VerifyKeys:   keyrings[upName],
 						Username:     def.Username,
 						Password:     expandEnvRef(def.Password),
+						Network:      network,
 					})
 				}
 

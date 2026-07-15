@@ -1085,6 +1085,9 @@ func (f *Fetcher) DownloadDeb(ctx context.Context, filename, expectedSHA256 stri
 // isn't done here -- it can only be done against the fully-streamed content,
 // so it's the caller's responsibility (see ingest.digestVerifyingReader).
 func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadCloser, error) {
+	if f.src.Network != "" {
+		ctx = withNetwork(ctx, f.src.Network)
+	}
 	url := f.base() + "/" + strings.TrimLeft(filename, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -1108,6 +1111,9 @@ func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadC
 // getConditional issues a GET with optional ETag/Last-Modified validators.
 // On 304 the body is empty. The response is always non-nil on nil error.
 func (f *Fetcher) getConditional(ctx context.Context, url, etag, lastMod string) ([]byte, *http.Response, error) {
+	if f.src.Network != "" {
+		ctx = withNetwork(ctx, f.src.Network)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, nil, err

@@ -367,7 +367,7 @@ func runRebuild(args []string) int {
 		os.Exit(1)
 	}()
 
-	if err := rebuild.Run(ctx, cfg, store, index, rebuild.Options{ResetIndex: *reset, HTTPClient: upstream.NewHTTPClient(cfg.UserAgent)}); err != nil {
+	if err := rebuild.Run(ctx, cfg, store, index, rebuild.Options{ResetIndex: *reset, HTTPClient: upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork)}); err != nil {
 		slog.Error("rebuild", "err", err)
 		return 1
 	}
@@ -415,7 +415,7 @@ func runUpdate(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
-	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, notifier)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork), nil, notifier)
 	if err := s.PreloadExistsCache(ctx); err != nil {
 		slog.Warn("preload pool exists cache", "err", err)
 	}
@@ -455,7 +455,7 @@ func runSnapshot(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork), nil, nil)
 	snapNow := time.Now()
 	if err := s.Snapshot(ctx, snapNow); err != nil {
 		slog.Error("snapshot", "err", err)
@@ -489,7 +489,7 @@ func runCleanup(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
-	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, nil)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork), nil, nil)
 	if err := s.Cleanup(ctx, cfg.Schedule.History, maxAge, time.Now()); err != nil {
 		slog.Error("cleanup", "err", err)
 		return 1
@@ -539,7 +539,7 @@ func runPrime(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
 	defer cancel()
-	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent), nil, notifier)
+	s := syncerpkg.New(cfg, store, index, key, upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork), nil, notifier)
 	if err := s.PreloadExistsCache(ctx); err != nil {
 		slog.Warn("preload pool exists cache", "err", err)
 	}
@@ -671,7 +671,7 @@ func runServe(args []string) int {
 		slog.Debug("signing key already published", "fingerprint", key.Fingerprint())
 	}
 
-	httpClient := upstream.NewHTTPClient(cfg.UserAgent)
+	httpClient := upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork)
 	indexCache := upstream.NewIndexCache()
 
 	// vclient is shared between the upstream fetch cache/lock (below) and the
