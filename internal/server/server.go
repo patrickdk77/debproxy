@@ -902,6 +902,17 @@ func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
 	}
 
 	slog.Debug("pull-through", "path", poolPath, "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
+	if s.exists != nil {
+		// pullThrough is only ever called after servePool/serveSrc's own real
+		// store.Exists check -- either it just found poolPath missing, or (the
+		// re-index branch) found it present but unknown to the exists-cache.
+		// Either way, any stale positive entry ExistsCache holds for this
+		// exact path (e.g. surviving an out-of-band deletion, see
+		// pruneMissingEntries) is proven wrong right now: clear it so Cache
+		// re-verifies against real storage instead of trusting it and
+		// silently skipping the download.
+		s.exists.Remove(poolPath)
+	}
 	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
 	return in.Cache(ctx, osName, codename, p, true)
 }

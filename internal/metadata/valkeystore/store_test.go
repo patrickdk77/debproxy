@@ -132,6 +132,111 @@ func TestEntryByDigest(t *testing.T) {
 	}
 }
 
+func TestRemoveEntry(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	kept := entry("wget", "1.21", "amd64")
+	gone := entry("curl", "7.88", "amd64")
+	if err := s.UpsertEntry(ctx, kept); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RemoveEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Package != "wget" {
+		t.Fatalf("expected only wget to remain, got %v", entries)
+	}
+
+	// The removed entry's own key must actually be gone, not just unlisted
+	// (ListEntries only reflects bucket-set membership -- see the whole
+	// publishArchPkgs self-heal fix earlier this session for why membership
+	// and entry-key existence are two separate things worth checking
+	// independently).
+	found, err := s.FindEntry(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"}, "curl", "7.88")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != nil {
+		t.Fatalf("expected curl entry gone after RemoveEntry, got %v", found)
+	}
+}
+
+// TestRemoveEntryUnknownIsNoop is the bad-data counterpart to TestRemoveEntry:
+// pruneMissingEntries calls RemoveEntry only after independently confirming
+// via store.Exists that the entry's file is gone, so a concurrent removal
+// racing this one (another replica's cleanup run) is expected, not an error.
+func TestRemoveEntryUnknownIsNoop(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	if err := s.RemoveEntry(ctx, entry("never-existed", "1.0", "amd64")); err != nil {
+		t.Fatalf("RemoveEntry on unknown entry: %v", err)
+	}
+
+	e := entry("apt", "2.6.1", "amd64")
+	if err := s.UpsertEntry(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	wrongVersion := e
+	wrongVersion.Version = "9.9.9"
+	if err := s.RemoveEntry(ctx, wrongVersion); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "debian"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected apt entry untouched by a different-version remove, got %v", entries)
+	}
+}
+
+// TestRemoveEntryDigestPointerOnlyClearedIfStillOwned covers the edge case
+// RemoveEntry's own doc comment calls out: two entries can share one content
+// digest (identical file bytes placed at two OS/codename/component/arch
+// slots). Removing the older one must not take down the digest pointer if a
+// still-live entry has since claimed it.
+func TestRemoveEntryDigestPointerOnlyClearedIfStillOwned(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	original := entry("curl", "7.88", "amd64")
+	original.Checksums.SHA256 = "sharedbytes"
+	if err := s.UpsertEntry(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second placement of byte-for-byte identical content elsewhere;
+	// EntryByDigest's pointer now belongs to this entry.
+	other := entry("curl", "7.88", "arm64")
+	other.Checksums.SHA256 = "sharedbytes"
+	if err := s.UpsertEntry(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RemoveEntry(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.EntryByDigest(ctx, "sharedbytes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.Arch != "arm64" {
+		t.Fatalf("expected digest pointer to still resolve to the surviving arm64 entry, got %v", got)
+	}
+}
+
 func TestFindEntry(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

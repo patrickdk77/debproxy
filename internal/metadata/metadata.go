@@ -27,6 +27,13 @@ type MetadataIndex interface {
 
 	// UpsertEntry inserts or updates a package placement.
 	UpsertEntry(ctx context.Context, entry model.IndexEntry) error
+	// RemoveEntry deletes the package placement matching entry's identity
+	// (OS/Codename/Component/Arch/Package/Version); other fields are ignored
+	// for matching. A no-op (nil error) if no matching entry exists -- callers
+	// (e.g. Syncer's missing-pool-file reconciliation) call this only after
+	// independently confirming the entry's pool file is gone, so a concurrent
+	// removal racing this one is expected, not an error condition.
+	RemoveEntry(ctx context.Context, entry model.IndexEntry) error
 	// ListEntries returns entries matching the selector (empty fields match any).
 	ListEntries(ctx context.Context, sel model.Selector) ([]model.IndexEntry, error)
 	// EntryByDigest returns any entry for the given content digest (dedup lookup).
@@ -40,6 +47,11 @@ type MetadataIndex interface {
 
 	// UpsertSourceEntry inserts or updates a source package record.
 	UpsertSourceEntry(ctx context.Context, entry model.SourceEntry) error
+	// RemoveSourceEntry deletes the source package record matching entry's
+	// identity (OS/Codename/Component/Package/Version); other fields are
+	// ignored for matching. A no-op (nil error) if no matching entry exists --
+	// see RemoveEntry's doc comment for why that's expected, not an error.
+	RemoveSourceEntry(ctx context.Context, entry model.SourceEntry) error
 	// ListSourceEntries returns source entries matching the selector (empty fields match any).
 	// Arch is ignored for source entries since sources are architecture-independent.
 	ListSourceEntries(ctx context.Context, sel model.Selector) ([]model.SourceEntry, error)

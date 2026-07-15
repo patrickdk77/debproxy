@@ -89,6 +89,14 @@ var (
 		Help: "GC passes aborted because the orphan ratio looked implausibly high, labeled by kind (pool/src).",
 	}, []string{"kind"})
 
+	// MetadataEntriesPrunedTotal counts metadata index entries removed because
+	// their pool/src file no longer exists in storage -- the reverse of
+	// GCFilesDeletedTotal (which removes files with no metadata entry).
+	MetadataEntriesPrunedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "debproxy_metadata_entries_pruned_total",
+		Help: "Total metadata index entries removed because their pool/src file no longer exists.",
+	})
+
 	// BuildInfo exposes the running binary's VCS revision as a gauge fixed at 1,
 	// labeled with revision info. Unlike the *Vec metrics above, it is set once
 	// here so it is always present in /metrics from process start, letting

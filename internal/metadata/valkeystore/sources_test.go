@@ -38,6 +38,52 @@ func TestUpsertSourceEntryAndList(t *testing.T) {
 	}
 }
 
+func TestRemoveSourceEntry(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	kept := srcEntry("wget", "1.21")
+	gone := srcEntry("curl", "7.88")
+	if err := s.UpsertSourceEntry(ctx, kept); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSourceEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RemoveSourceEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListSourceEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Package != "wget" {
+		t.Fatalf("expected only wget source entry to remain, got %v", entries)
+	}
+
+	found, err := s.FindSourceEntry(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main"}, "curl", "7.88")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != nil {
+		t.Fatalf("expected curl source entry gone after RemoveSourceEntry, got %v", found)
+	}
+}
+
+// TestRemoveSourceEntryUnknownIsNoop is the bad-data counterpart to
+// TestRemoveSourceEntry -- see the equivalent binary-entry test's doc comment
+// for why a no-match remove must succeed silently, not error.
+func TestRemoveSourceEntryUnknownIsNoop(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	if err := s.RemoveSourceEntry(ctx, srcEntry("never-existed", "1.0")); err != nil {
+		t.Fatalf("RemoveSourceEntry on unknown entry: %v", err)
+	}
+}
+
 func TestFindSourceEntry(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

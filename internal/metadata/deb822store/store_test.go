@@ -88,6 +88,116 @@ func TestUpsertUpdatesExisting(t *testing.T) {
 	}
 }
 
+func TestRemoveEntry(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	kept := entry("wget", "1.21", "amd64")
+	gone := entry("curl", "7.88", "amd64")
+	if err := s.UpsertEntry(ctx, kept); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RemoveEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Package != "wget" {
+		t.Fatalf("expected only wget to remain, got %v", entries)
+	}
+}
+
+// TestRemoveEntryUnknownIsNoop is the bad-data counterpart to TestRemoveEntry:
+// pruneMissingEntries calls RemoveEntry only after independently confirming
+// via store.Exists that the entry's file is gone, so a concurrent removal
+// (another replica's cleanup run, a race with an upsert) racing this one is
+// expected, not an error -- RemoveEntry must not fail or panic when there's
+// nothing matching left to remove.
+func TestRemoveEntryUnknownIsNoop(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	if err := s.RemoveEntry(ctx, entry("never-existed", "1.0", "amd64")); err != nil {
+		t.Fatalf("RemoveEntry on unknown entry: %v", err)
+	}
+
+	e := entry("apt", "2.6.1", "amd64")
+	if err := s.UpsertEntry(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	// Same package, different version -- must not remove the real entry.
+	wrongVersion := e
+	wrongVersion.Version = "9.9.9"
+	if err := s.RemoveEntry(ctx, wrongVersion); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := s.ListEntries(ctx, model.Selector{OS: "debian"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected apt entry untouched by a different-version remove, got %v", entries)
+	}
+}
+
+func sourceEntry(pkg, version string) model.SourceEntry {
+	return model.SourceEntry{
+		OS:        "debian",
+		Codename:  "trixie",
+		Component: "main",
+		Package:   pkg,
+		Version:   version,
+		Upstream:  "debian-main",
+		LocalDir:  model.SourceDir("debian", "trixie", "debian-main", "main", pkg),
+		Files:     []model.SourceFile{{Filename: pkg + "_" + version + ".dsc", Size: 100}},
+	}
+}
+
+func TestRemoveSourceEntry(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	kept := sourceEntry("wget", "1.21")
+	gone := sourceEntry("curl", "7.88")
+	if err := s.UpsertSourceEntry(ctx, kept); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSourceEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.RemoveSourceEntry(ctx, gone); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListSourceEntries(ctx, model.Selector{OS: "debian", Codename: "trixie", Component: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Package != "wget" {
+		t.Fatalf("expected only wget source entry to remain, got %v", entries)
+	}
+}
+
+// TestRemoveSourceEntryUnknownIsNoop is the bad-data counterpart to
+// TestRemoveSourceEntry -- see TestRemoveEntryUnknownIsNoop's doc comment for
+// why a no-match remove must succeed silently, not error.
+func TestRemoveSourceEntryUnknownIsNoop(t *testing.T) {
+	s, _ := newStore(t)
+	ctx := context.Background()
+
+	if err := s.RemoveSourceEntry(ctx, sourceEntry("never-existed", "1.0")); err != nil {
+		t.Fatalf("RemoveSourceEntry on unknown entry: %v", err)
+	}
+}
+
 func TestEntryByDigest(t *testing.T) {
 	s, _ := newStore(t)
 	ctx := context.Background()

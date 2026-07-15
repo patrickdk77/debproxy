@@ -31,6 +31,25 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 	slog.Info("cleanup: snapshots pruned", "deleted", deleted)
 	metrics.SnapshotsPrunedTotal.Add(float64(deleted))
 
+	// Reconcile entries against reality before GC'ing files against entries:
+	// this direction (entry exists, file gone -- e.g. an out-of-band deletion,
+	// or a prior GC run that had to touch the pool without the index being
+	// perfectly in sync) must be fixed first so a stale entry doesn't keep
+	// masking a missing file forever (see pruneMissingEntries's doc comment).
+	entriesPruned, err := s.pruneMissingEntries(ctx, now)
+	if err != nil {
+		return err
+	}
+	slog.Info("cleanup: missing-file entry prune complete", "entries_removed", entriesPruned)
+	metrics.MetadataEntriesPrunedTotal.Add(float64(entriesPruned))
+
+	srcEntriesPruned, err := s.pruneMissingSrcEntries(ctx, now)
+	if err != nil {
+		return err
+	}
+	slog.Info("cleanup: missing-file src entry prune complete", "entries_removed", srcEntriesPruned)
+	metrics.MetadataEntriesPrunedTotal.Add(float64(srcEntriesPruned))
+
 	gcDeleted, err := s.gcPool(ctx, now)
 	if err != nil {
 		return err
@@ -203,6 +222,128 @@ func checkOrphanRatio(kind string, total, orphaned int) bool {
 		"kind", kind, "total_files", total, "orphaned", orphaned, "ratio", ratio, "max_allowed_ratio", maxOrphanRatio)
 	metrics.GCAbortedTotal.WithLabelValues(kind).Inc()
 	return true
+}
+
+// pruneMissingEntries removes metadata index entries whose pool file no
+// longer exists in storage, and returns the number removed. This is the
+// reverse of gcPool: gcPool deletes pool files with no metadata entry; this
+// deletes metadata entries whose pool file is gone. Both directions are
+// needed to keep the index and the pool in sync -- without this direction, a
+// stale entry surviving an out-of-band pool deletion (a prior GC incident, a
+// manual purge) permanently defeats pull-through's self-heal: Ingestor.Cache
+// trusts its in-memory ExistsCache (seeded from these same entries at
+// startup) and never re-downloads a file it believes is already cached,
+// so requests for that package 404 forever instead of being re-fetched.
+//
+// Entries newer than gcGracePeriod are skipped this run, for the same reason
+// deleteOrphans skips recently-written files: a just-cached package's
+// PutFile-then-index-commit sequence could otherwise race a storage backend
+// with less-than-immediate read-after-write visibility. Aborts (removing
+// nothing) if the missing-file ratio looks implausibly high -- see
+// checkOrphanRatio's doc comment for why that safety net exists; a broken or
+// misconfigured store.Exists (wrong bucket/mount, an outage) must not be
+// allowed to look like "every package's file is gone" and wipe the index.
+func (s *Syncer) pruneMissingEntries(ctx context.Context, now time.Time) (int, error) {
+	entries, err := s.index.ListEntries(ctx, model.Selector{})
+	if err != nil {
+		return 0, fmt.Errorf("list metadata entries: %w", err)
+	}
+
+	grace := s.gcGracePeriod()
+	var missing []model.IndexEntry
+	var checked int
+	for _, e := range entries {
+		if now.Sub(e.FirstSeen) < grace {
+			continue
+		}
+		checked++
+		exists, err := s.store.Exists(ctx, e.PoolPath)
+		if err != nil {
+			return 0, fmt.Errorf("check pool file %s: %w", e.PoolPath, err)
+		}
+		if !exists {
+			missing = append(missing, e)
+		}
+	}
+
+	if checkOrphanRatio("metadata entry", checked, len(missing)) {
+		return 0, nil
+	}
+
+	removed := 0
+	for _, e := range missing {
+		if err := s.index.RemoveEntry(ctx, e); err != nil {
+			slog.Warn("cleanup: remove entry for missing pool file failed",
+				"path", e.PoolPath, "package", e.Package, "version", e.Version, "err", err)
+			continue
+		}
+		slog.Debug("cleanup: removed metadata entry for missing pool file",
+			"path", e.PoolPath, "package", e.Package, "version", e.Version)
+		removed++
+	}
+	return removed, nil
+}
+
+// pruneMissingSrcEntries removes metadata source entries whose files are no
+// longer present in storage, and returns the number removed -- the source
+// counterpart to pruneMissingEntries (see its doc comment for the full
+// rationale). An entry with FilesDownloaded false is skipped entirely: no
+// files were ever expected to exist locally for it, so there's nothing to
+// reconcile. An entry with FilesDownloaded true is removed if any one of its
+// files is missing -- FilesDownloaded is a single flag, not tracked per
+// file, so a partial loss already means that flag's claim ("this version's
+// files are downloaded") is no longer true; removing the entry lets the next
+// auto_update/pull-through re-establish it cleanly rather than leaving a
+// claim that's provably wrong for at least one file.
+func (s *Syncer) pruneMissingSrcEntries(ctx context.Context, now time.Time) (int, error) {
+	entries, err := s.index.ListSourceEntries(ctx, model.Selector{})
+	if err != nil {
+		return 0, fmt.Errorf("list metadata source entries: %w", err)
+	}
+
+	grace := s.gcGracePeriod()
+	var missing []model.SourceEntry
+	var checked int
+	for _, e := range entries {
+		if !e.FilesDownloaded {
+			continue
+		}
+		if now.Sub(e.FirstSeen) < grace {
+			continue
+		}
+		checked++
+		anyMissing := false
+		for _, f := range e.Files {
+			exists, err := s.store.Exists(ctx, e.LocalDir+"/"+f.Filename)
+			if err != nil {
+				return 0, fmt.Errorf("check src file %s/%s: %w", e.LocalDir, f.Filename, err)
+			}
+			if !exists {
+				anyMissing = true
+				break
+			}
+		}
+		if anyMissing {
+			missing = append(missing, e)
+		}
+	}
+
+	if checkOrphanRatio("metadata src entry", checked, len(missing)) {
+		return 0, nil
+	}
+
+	removed := 0
+	for _, e := range missing {
+		if err := s.index.RemoveSourceEntry(ctx, e); err != nil {
+			slog.Warn("cleanup: remove src entry for missing file failed",
+				"dir", e.LocalDir, "package", e.Package, "version", e.Version, "err", err)
+			continue
+		}
+		slog.Debug("cleanup: removed metadata src entry for missing file",
+			"dir", e.LocalDir, "package", e.Package, "version", e.Version)
+		removed++
+	}
+	return removed, nil
 }
 
 // gcPool removes pool files not referenced by any remaining snapshot or the

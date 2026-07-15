@@ -52,6 +52,24 @@ func (s *Store) UpsertSourceEntry(ctx context.Context, e model.SourceEntry) erro
 	return nil
 }
 
+// RemoveSourceEntry deletes the entry matching e's identity (OS/Codename/
+// Component/Package/Version); other fields are ignored for matching. A no-op
+// if no matching entry exists. Does not touch SrcLatest -- see RemoveEntry's
+// doc comment for why that hash is left best-effort rather than recomputed.
+func (s *Store) RemoveSourceEntry(ctx context.Context, e model.SourceEntry) error {
+	entryKey := s.keys.SrcEntry(e.OS, e.Codename, e.Component, e.Package, e.Version)
+	if err := s.v.Do(ctx, s.v.B().Del().Key(entryKey).Build()).Error(); err != nil {
+		return fmt.Errorf("delete src entry: %w", err)
+	}
+
+	bucketSet := s.keys.SrcBucket(e.OS, e.Codename, e.Component)
+	member := bucketMember(e.Package, e.Version)
+	if err := s.v.Do(ctx, s.v.B().Srem().Key(bucketSet).Member(member).Build()).Error(); err != nil {
+		return fmt.Errorf("unindex src bucket: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) matchingSrcBuckets(ctx context.Context, sel model.Selector) ([]srcBucket, error) {
 	all, err := s.v.Do(ctx, s.v.B().Smembers().Key(s.keys.BucketsSrc()).Build()).AsStrSlice()
 	if err != nil {

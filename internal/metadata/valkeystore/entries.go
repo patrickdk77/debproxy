@@ -72,6 +72,45 @@ func (s *Store) bumpLatest(ctx context.Context, key, field, version string) erro
 	return nil
 }
 
+// RemoveEntry deletes the entry matching e's identity (OS/Codename/Component/
+// Arch/Package/Version); other fields are ignored for matching. A no-op if no
+// matching entry exists. Does not touch PkgLatest -- like bumpLatest itself,
+// that hash is already documented best-effort (see its own doc comment), and
+// recomputing it here would mean scanning the whole bucket on every removal
+// for a value nothing else in this codebase treats as authoritative; a
+// consumer wanting a guaranteed-live "latest" version already has to call
+// FindEntry and read the entry back (see FindEntry finding a now-empty
+// getEntry result as a real "not found").
+func (s *Store) RemoveEntry(ctx context.Context, e model.IndexEntry) error {
+	entryKey := s.keys.PkgEntry(e.OS, e.Codename, e.Component, e.Arch, e.Package, e.Version)
+	if err := s.v.Do(ctx, s.v.B().Del().Key(entryKey).Build()).Error(); err != nil {
+		return fmt.Errorf("delete pkg entry: %w", err)
+	}
+
+	bucketSet := s.keys.PkgBucket(e.OS, e.Codename, e.Component, e.Arch)
+	member := bucketMember(e.Package, e.Version)
+	if err := s.v.Do(ctx, s.v.B().Srem().Key(bucketSet).Member(member).Build()).Error(); err != nil {
+		return fmt.Errorf("unindex pkg bucket: %w", err)
+	}
+
+	if e.Checksums.SHA256 != "" {
+		digestKey := s.keys.PkgByDigest(string(e.Checksums.SHA256))
+		// Only clear the pointer if it still points at the entry being
+		// removed -- a different, still-live entry may have since claimed
+		// the same digest (two placements of identical content).
+		current, err := s.v.Do(ctx, s.v.B().Get().Key(digestKey).Build()).ToString()
+		if err != nil && !valkey.IsValkeyNil(err) {
+			return fmt.Errorf("read pkg digest: %w", err)
+		}
+		if current == entryKey {
+			if err := s.v.Do(ctx, s.v.B().Del().Key(digestKey).Build()).Error(); err != nil {
+				return fmt.Errorf("delete pkg digest: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Store) matchingPkgBuckets(ctx context.Context, sel model.Selector) ([]pkgBucket, error) {
 	all, err := s.v.Do(ctx, s.v.B().Smembers().Key(s.keys.BucketsIndex()).Build()).AsStrSlice()
 	if err != nil {

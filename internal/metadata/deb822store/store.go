@@ -313,6 +313,29 @@ func (s *Store) UpsertEntry(_ context.Context, e model.IndexEntry) error {
 	return nil
 }
 
+// RemoveEntry deletes the entry matching e's identity (OS/Codename/Component/
+// Arch/Package/Version); other fields are ignored for matching. A no-op if no
+// matching entry exists.
+func (s *Store) RemoveEntry(_ context.Context, e model.IndexEntry) error {
+	key := entryKey(e.OS, e.Codename, e.Component, e.Arch)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries := s.entries[key]
+	for i, existing := range entries {
+		if existing.Package == e.Package && existing.Version == e.Version {
+			entries = append(entries[:i:i], entries[i+1:]...)
+			s.entries[key] = entries
+			relPath := IndexRelPath(e.OS, e.Codename, e.Component, e.Arch)
+			s.dirty[relPath] = true
+			s.generation[relPath]++
+			return nil
+		}
+	}
+	return nil
+}
+
 func (s *Store) ListEntries(ctx context.Context, sel model.Selector) ([]model.IndexEntry, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -846,6 +869,29 @@ func (s *Store) UpsertSourceEntry(_ context.Context, e model.SourceEntry) error 
 	s.sources[key] = srcs
 	s.dirty[relPath] = true
 	s.generation[relPath]++
+	return nil
+}
+
+// RemoveSourceEntry deletes the source entry matching e's identity
+// (OS/Codename/Component/Package/Version); other fields are ignored for
+// matching. A no-op if no matching entry exists.
+func (s *Store) RemoveSourceEntry(_ context.Context, e model.SourceEntry) error {
+	key := sourceKey(e.OS, e.Codename, e.Component)
+	relPath := SourceRelPath(e.OS, e.Codename, e.Component)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	srcs := s.sources[key]
+	for i, existing := range srcs {
+		if existing.Package == e.Package && existing.Version == e.Version {
+			srcs = append(srcs[:i:i], srcs[i+1:]...)
+			s.sources[key] = srcs
+			s.dirty[relPath] = true
+			s.generation[relPath]++
+			return nil
+		}
+	}
 	return nil
 }
 

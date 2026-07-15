@@ -40,6 +40,9 @@ type mockStorage struct {
 	// don't issue a redundant per-candidate Stat now that WalkPool/
 	// ListPublishedInfo supply ModTime directly.
 	statCalls int
+
+	// existsErr, when set, is returned by every Exists call -- see Exists.
+	existsErr error
 }
 
 func newMockStorage() *mockStorage {
@@ -130,8 +133,21 @@ func (m *mockStorage) Stat(ctx context.Context, poolPath string) (storage.FileIn
 	return storage.FileInfo{}, fmt.Errorf("not found: %s", poolPath)
 }
 
+// Exists checks both poolFiles and publishedFiles, mirroring Stat's own
+// lookup (see its comment) -- src/ files live in publishedFiles in this mock.
+// If existsErr is set, it's returned unconditionally instead, simulating a
+// real storage failure (outage, misconfiguration) rather than a hit/miss.
 func (m *mockStorage) Exists(ctx context.Context, poolPath string) (bool, error) {
-	panic("not implemented: Exists")
+	if m.existsErr != nil {
+		return false, m.existsErr
+	}
+	if _, ok := m.poolFiles[poolPath]; ok {
+		return true, nil
+	}
+	if _, ok := m.publishedFiles[poolPath]; ok {
+		return true, nil
+	}
+	return false, nil
 }
 
 func (m *mockStorage) ComputeChecksums(ctx context.Context, poolPath string) (model.Checksums, error) {
@@ -179,6 +195,16 @@ func (m *mockIndex) Flush(ctx context.Context) error   { return nil }
 func (m *mockIndex) UpsertEntry(ctx context.Context, entry model.IndexEntry) error {
 	panic("not implemented: UpsertEntry")
 }
+func (m *mockIndex) RemoveEntry(ctx context.Context, entry model.IndexEntry) error {
+	for i, e := range m.entries {
+		if e.OS == entry.OS && e.Codename == entry.Codename && e.Component == entry.Component &&
+			e.Arch == entry.Arch && e.Package == entry.Package && e.Version == entry.Version {
+			m.entries = append(m.entries[:i:i], m.entries[i+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
 func (m *mockIndex) EntryByDigest(ctx context.Context, digest model.Digest) (*model.IndexEntry, error) {
 	panic("not implemented: EntryByDigest")
 }
@@ -193,6 +219,16 @@ func (m *mockIndex) GetUpstreamState(ctx context.Context, upstream, name, arch s
 }
 func (m *mockIndex) UpsertSourceEntry(ctx context.Context, entry model.SourceEntry) error {
 	panic("not implemented: UpsertSourceEntry")
+}
+func (m *mockIndex) RemoveSourceEntry(ctx context.Context, entry model.SourceEntry) error {
+	for i, e := range m.srcEntries {
+		if e.OS == entry.OS && e.Codename == entry.Codename && e.Component == entry.Component &&
+			e.Package == entry.Package && e.Version == entry.Version {
+			m.srcEntries = append(m.srcEntries[:i:i], m.srcEntries[i+1:]...)
+			return nil
+		}
+	}
+	return nil
 }
 func (m *mockIndex) FindSourceEntry(ctx context.Context, sel model.Selector, pkg, version string) (*model.SourceEntry, error) {
 	panic("not implemented: FindSourceEntry")
@@ -864,5 +900,240 @@ func TestGCSrcNotReferencedDeleted(t *testing.T) {
 
 	if !contains(store.deleted, orphan) {
 		t.Errorf("orphaned src file should have been deleted, deleted=%v", store.deleted)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: pruneMissingEntries / pruneMissingSrcEntries
+//
+// These are the reverse direction of gcPool/gcSrc: an entry whose pool/src
+// file no longer exists (an out-of-band deletion, a prior GC incident) must
+// be removed from the index, or pull-through's self-heal is permanently
+// defeated (Ingestor.Cache trusts its ExistsCache, seeded from these same
+// entries, and never re-downloads a file it believes already exists).
+// ---------------------------------------------------------------------------
+
+func TestCleanupRemovesEntryForMissingPoolFile(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	gone := model.IndexEntry{
+		OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
+		Package: "vanished", Version: "1.0",
+		PoolPath: "pool/ubuntu/jammy/upstream/main/v/vanished/vanished_1.0_amd64.deb",
+		FirstSeen: now.Add(-2 * time.Hour), // past the grace period
+	}
+	idx.entries = []model.IndexEntry{gone}
+	// Deliberately not adding gone.PoolPath to store.poolFiles -- it's gone.
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.entries) != 0 {
+		t.Errorf("expected entry for missing pool file to be removed, got %v", idx.entries)
+	}
+}
+
+func TestCleanupKeepsEntryForExistingPoolFile(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	present := model.IndexEntry{
+		OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
+		Package: "curl", Version: "8.0",
+		PoolPath:  "pool/ubuntu/jammy/upstream/main/c/curl/curl_8.0_amd64.deb",
+		FirstSeen: now.Add(-2 * time.Hour),
+	}
+	idx.entries = []model.IndexEntry{present}
+	store.poolFiles[present.PoolPath] = struct{}{}
+	store.poolMTimes[present.PoolPath] = now.Add(-2 * time.Hour)
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.entries) != 1 {
+		t.Errorf("expected entry with an existing pool file to survive, got %v", idx.entries)
+	}
+}
+
+// TestCleanupRecentMissingEntryProtectedByGracePeriod mirrors
+// TestGCPoolRecentlyWrittenProtectedByGracePeriod: an entry created moments
+// ago must not be pruned just because its file isn't visible yet, in case a
+// storage backend's read-after-write isn't instantaneous.
+func TestCleanupRecentMissingEntryProtectedByGracePeriod(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	recent := model.IndexEntry{
+		OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
+		Package: "fresh", Version: "1.0",
+		PoolPath:  "pool/ubuntu/jammy/upstream/main/f/fresh/fresh_1.0_amd64.deb",
+		FirstSeen: now.Add(-1 * time.Minute), // within the 1h default grace period
+	}
+	idx.entries = []model.IndexEntry{recent}
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.entries) != 1 {
+		t.Errorf("expected recently-created entry to be protected by the grace period, got %v", idx.entries)
+	}
+}
+
+// TestCleanupAbortsMissingEntryPruneWhenRatioImplausiblyHigh is the same
+// safety net as TestGCPoolAbortsWhenOrphanRatioImplausiblyHigh, applied to
+// the reverse direction: if store.Exists reports most entries' files gone,
+// that's overwhelmingly a sign store.Exists itself is broken (wrong bucket/
+// mount, an outage), not that the pool was actually wiped -- must abort
+// rather than empty out the whole metadata index.
+func TestCleanupAbortsMissingEntryPruneWhenRatioImplausiblyHigh(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	var entries []model.IndexEntry
+	for i := 0; i < 60; i++ {
+		entries = append(entries, model.IndexEntry{
+			OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
+			Package: fmt.Sprintf("pkg-%d", i), Version: "1.0",
+			PoolPath:  fmt.Sprintf("pool/ubuntu/jammy/upstream/main/p/pkg-%d/pkg-%d_1.0_amd64.deb", i, i),
+			FirstSeen: now.Add(-2 * time.Hour),
+		})
+	}
+	idx.entries = entries
+	// None of these pool files exist in store.poolFiles.
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.entries) != len(entries) {
+		t.Errorf("expected missing-entry prune to abort and remove nothing, got %d of %d entries remaining", len(idx.entries), len(entries))
+	}
+}
+
+// TestCleanupPruneMissingEntriesPropagatesStoreExistsError is the error-state
+// counterpart to the happy-path tests above: a real storage failure while
+// checking file existence must fail Cleanup, not be swallowed into "file
+// doesn't exist" (which would wrongly remove entries whose files are fine
+// but merely unreachable at that moment).
+func TestCleanupPruneMissingEntriesPropagatesStoreExistsError(t *testing.T) {
+	store := newMockStorage()
+	store.existsErr = fmt.Errorf("simulated storage outage")
+	idx := &mockIndex{}
+	now := time.Now()
+
+	idx.entries = []model.IndexEntry{{
+		OS: "ubuntu", Codename: "jammy", Component: "main", Arch: "amd64",
+		Package: "curl", Version: "8.0",
+		PoolPath:  "pool/ubuntu/jammy/upstream/main/c/curl/curl_8.0_amd64.deb",
+		FirstSeen: now.Add(-2 * time.Hour),
+	}}
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err == nil {
+		t.Fatal("expected Cleanup to fail when store.Exists errors, got nil")
+	}
+	if len(idx.entries) != 1 {
+		t.Errorf("expected entry untouched when store.Exists errors, got %v", idx.entries)
+	}
+}
+
+func TestCleanupRemovesSrcEntryForMissingFile(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	gone := model.SourceEntry{
+		OS: "ubuntu", Codename: "jammy", Component: "main",
+		Package: "vanished", Version: "1.0",
+		LocalDir:        "src/ubuntu/jammy/upstream/main/v/vanished",
+		Files:           []model.SourceFile{{Filename: "vanished_1.0.dsc"}},
+		FilesDownloaded: true,
+		FirstSeen:       now.Add(-2 * time.Hour),
+	}
+	idx.srcEntries = []model.SourceEntry{gone}
+	// Deliberately not adding the file to store.publishedFiles -- it's gone.
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.srcEntries) != 0 {
+		t.Errorf("expected src entry for missing file to be removed, got %v", idx.srcEntries)
+	}
+}
+
+// TestCleanupSkipsSrcEntryNotYetDownloaded proves FilesDownloaded=false
+// entries are left alone even though their (never-fetched) files obviously
+// aren't in storage -- there's nothing to reconcile for a source package
+// whose files were never claimed to be cached locally in the first place.
+func TestCleanupSkipsSrcEntryNotYetDownloaded(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	notDownloaded := model.SourceEntry{
+		OS: "ubuntu", Codename: "jammy", Component: "main",
+		Package: "neverfetched", Version: "1.0",
+		LocalDir:        "src/ubuntu/jammy/upstream/main/n/neverfetched",
+		Files:           []model.SourceFile{{Filename: "neverfetched_1.0.dsc"}},
+		FilesDownloaded: false,
+		FirstSeen:       now.Add(-2 * time.Hour),
+	}
+	idx.srcEntries = []model.SourceEntry{notDownloaded}
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.srcEntries) != 1 {
+		t.Errorf("expected not-yet-downloaded src entry to be left alone, got %v", idx.srcEntries)
+	}
+}
+
+// TestCleanupRemovesSrcEntryWhenAnyFileMissing proves a source entry with
+// several files is removed if even one is gone -- FilesDownloaded is a
+// single flag, not tracked per file, so a partial loss already makes its
+// "files are downloaded" claim false.
+func TestCleanupRemovesSrcEntryWhenAnyFileMissing(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	now := time.Now()
+
+	partial := model.SourceEntry{
+		OS: "ubuntu", Codename: "jammy", Component: "main",
+		Package: "partial", Version: "1.0",
+		LocalDir: "src/ubuntu/jammy/upstream/main/p/partial",
+		Files: []model.SourceFile{
+			{Filename: "partial_1.0.dsc"},
+			{Filename: "partial_1.0.orig.tar.gz"},
+		},
+		FilesDownloaded: true,
+		FirstSeen:       now.Add(-2 * time.Hour),
+	}
+	idx.srcEntries = []model.SourceEntry{partial}
+	// Only one of the two files still exists.
+	store.publishedFiles[partial.LocalDir+"/partial_1.0.dsc"] = "data"
+
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if len(idx.srcEntries) != 0 {
+		t.Errorf("expected src entry with a partially-missing file set to be removed, got %v", idx.srcEntries)
 	}
 }

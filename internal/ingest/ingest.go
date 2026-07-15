@@ -19,9 +19,12 @@ import (
 )
 
 // ExistsCache is a persistent in-memory set of pool paths known to exist in
-// storage. Since pool files are never deleted, a positive hit remains valid
-// indefinitely, so S3/filesystem Exists checks can be skipped on subsequent
-// Cache calls for the same path.
+// storage. Under normal operation pool files are never deleted, so a positive
+// hit remains valid indefinitely and S3/filesystem Exists checks can be
+// skipped on subsequent Cache calls for the same path. That assumption can be
+// violated out-of-band (a GC bug, a manual purge) -- see Remove, which lets a
+// caller that has independently proven a path no longer exists correct a
+// stale positive rather than have Cache trust it forever.
 type ExistsCache struct {
 	m sync.Map
 }
@@ -33,6 +36,12 @@ func (c *ExistsCache) Has(path string) bool {
 
 func (c *ExistsCache) Add(path string) {
 	c.m.Store(path, struct{}{})
+}
+
+// Remove clears any positive entry for path, forcing the next Cache call for
+// it to re-verify against real storage instead of trusting a stale hit.
+func (c *ExistsCache) Remove(path string) {
+	c.m.Delete(path)
 }
 
 // Ingestor caches packages into the pool and records index entries.
