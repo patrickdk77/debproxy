@@ -86,6 +86,26 @@ func (w *compressWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+// Flush forwards to the underlying ResponseWriter if it supports
+// http.Flusher. Without this, wrapping http.ResponseWriter in this struct
+// silently breaks Flush for every caller downstream (e.g. the streaming pool
+// pull-through path) -- Go only promotes the methods declared on an embedded
+// interface's own type (Header/Write/WriteHeader for http.ResponseWriter),
+// never additional optional interfaces the concrete value underneath might
+// separately satisfy.
+func (w *compressWriter) Flush() {
+	if w.compressor != nil {
+		if f, ok := w.compressor.(interface{ Flush() error }); ok {
+			// Best-effort: http.Flusher itself has no error return, and a
+			// flush failure here will surface again (loudly) at Close/Write.
+			_ = f.Flush()
+		}
+	}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func (w *compressWriter) release() {
 	if w.compressor == nil {
 		return
@@ -140,6 +160,15 @@ type statusWriter struct {
 func (sw *statusWriter) WriteHeader(code int) {
 	sw.status = code
 	sw.ResponseWriter.WriteHeader(code)
+}
+
+// Flush forwards to the underlying ResponseWriter if it supports
+// http.Flusher -- see compressWriter.Flush's identical doc comment for why
+// this can't just be inherited from the embedded interface.
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (sw *statusWriter) Write(b []byte) (int, error) {

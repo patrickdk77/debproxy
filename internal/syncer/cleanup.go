@@ -63,6 +63,13 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 	}
 	slog.Info("cleanup: src GC complete", "orphaned_files_deleted", srcDeleted)
 	metrics.GCFilesDeletedTotal.Add(float64(srcDeleted))
+
+	tempRemoved, err := s.store.CleanupTempFiles(ctx, now.Add(-s.gcGracePeriod()))
+	if err != nil {
+		return fmt.Errorf("cleanup temp files: %w", err)
+	}
+	slog.Info("cleanup: temp file cleanup complete", "removed", tempRemoved)
+	metrics.TempFilesCleanedTotal.Add(float64(tempRemoved))
 	return nil
 }
 

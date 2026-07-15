@@ -43,6 +43,9 @@ type mockStorage struct {
 
 	// existsErr, when set, is returned by every Exists call -- see Exists.
 	existsErr error
+
+	// tempFiles: path -> mod time, consulted by CleanupTempFiles.
+	tempFiles map[string]time.Time
 }
 
 func newMockStorage() *mockStorage {
@@ -51,7 +54,22 @@ func newMockStorage() *mockStorage {
 		publishedFiles: map[string]string{},
 		poolMTimes:     map[string]time.Time{},
 		snapshots:      map[string][]storage.SnapshotRef{},
+		tempFiles:      map[string]time.Time{},
 	}
+}
+
+// CleanupTempFiles removes entries from tempFiles older than olderThan,
+// recording them in deleted like Delete/DeletePublished do.
+func (m *mockStorage) CleanupTempFiles(ctx context.Context, olderThan time.Time) (int, error) {
+	removed := 0
+	for p, mtime := range m.tempFiles {
+		if mtime.Before(olderThan) {
+			delete(m.tempFiles, p)
+			m.deleted = append(m.deleted, p)
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 func (m *mockStorage) WalkPool(ctx context.Context, fn func(storage.FileInfo) error) error {

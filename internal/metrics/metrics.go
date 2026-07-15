@@ -97,6 +97,14 @@ var (
 		Help: "Total metadata index entries removed because their pool/src file no longer exists.",
 	})
 
+	// TempFilesCleanedTotal counts orphaned upload temp files removed by
+	// cleanup -- leftovers from a PutFile/WriteFile whose process was killed
+	// mid-write before its own deferred cleanup could run.
+	TempFilesCleanedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "debproxy_temp_files_cleaned_total",
+		Help: "Total orphaned upload temp files removed by cleanup.",
+	})
+
 	// BuildInfo exposes the running binary's VCS revision as a gauge fixed at 1,
 	// labeled with revision info. Unlike the *Vec metrics above, it is set once
 	// here so it is always present in /metrics from process start, letting

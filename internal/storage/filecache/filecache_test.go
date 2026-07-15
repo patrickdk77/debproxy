@@ -94,6 +94,10 @@ func (m *mockStore) WalkPool(context.Context, func(storage.FileInfo) error) erro
 	return storage.ErrNotImplemented
 }
 
+func (m *mockStore) CleanupTempFiles(context.Context, time.Time) (int, error) {
+	return 0, storage.ErrNotImplemented
+}
+
 func (m *mockStore) WriteFile(_ context.Context, path string, r io.Reader, _ int64) error {
 	data, err := io.ReadAll(r)
 	if err != nil {

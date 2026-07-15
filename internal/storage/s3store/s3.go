@@ -204,6 +204,14 @@ func (s *Store) ListPublishedInfo(ctx context.Context, prefix string) ([]storage
 	return infos, nil
 }
 
+// CleanupTempFiles is a no-op: PutFile issues a single atomic PutObject S3
+// API call with no temp key of our own to leak if it's interrupted -- an
+// in-progress or aborted upload simply never creates the object, nothing for
+// us to find and remove.
+func (s *Store) CleanupTempFiles(ctx context.Context, olderThan time.Time) (int, error) {
+	return 0, nil
+}
+
 func (s *Store) WalkPool(ctx context.Context, fn func(info storage.FileInfo) error) error {
 	prefix, err := s.s3Key("pool/")
 	if err != nil {

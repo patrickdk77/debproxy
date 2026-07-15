@@ -53,6 +53,16 @@ type FileStore interface {
 	// S3: the ListObjectsV2 page) so callers that need that metadata don't
 	// have to issue a separate Stat per file.
 	WalkPool(ctx context.Context, fn func(info FileInfo) error) error
+	// CleanupTempFiles removes incomplete upload artifacts older than
+	// olderThan and returns how many were removed. PutFile writes through a
+	// temp file that's renamed into place on success (see the filesystem
+	// backend); if the process is killed mid-write (crash, OOM, forced
+	// restart) rather than failing normally, the deferred cleanup that
+	// removes that temp file never runs, leaking it forever -- this is that
+	// cleanup's backstop. A no-op for backends with no such on-disk artifact
+	// of their own (e.g. S3, whose PutObject is a single atomic call with no
+	// exposed temp state for us to manage).
+	CleanupTempFiles(ctx context.Context, olderThan time.Time) (int, error)
 }
 
 // Publisher manages write-once published dists trees and snapshot aliases.

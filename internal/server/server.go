@@ -695,6 +695,60 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 			http.NotFound(w, r)
 			return
 		}
+		// HEAD needs no body, and we already know the package's size and
+		// name from the resolved upstream availability data without ever
+		// contacting upstream or writing anything to the pool -- answer it
+		// directly rather than triggering (and discarding the body of) a
+		// full fetch just to describe a file nobody asked to download yet.
+		if r.Method == http.MethodHead {
+			_, _, p, err := s.resolvePoolPackage(r.Context(), poolPath)
+			if err != nil {
+				slog.Error("pull-through", "path", poolPath, "err", err)
+				http.Error(w, "pull-through failed", http.StatusBadGateway)
+				metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "error").Inc()
+				return
+			}
+			w.Header().Set("Cache-Control", httpCacheControl(r.URL.Path))
+			w.Header().Set("Content-Type", contentType(poolPath))
+			w.Header().Set("Content-Length", strconv.FormatInt(p.Size, 10))
+			w.WriteHeader(http.StatusOK)
+			metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "success").Inc()
+			return
+		}
+		// A plain GET with no Range header streams the pull-through straight
+		// to the client as bytes arrive from upstream, instead of buffering
+		// the whole file server-side and only then serving it -- see
+		// pullThroughStream's doc comment. A Range request falls back to the
+		// buffered path below: honoring a byte range during a still-in-
+		// progress download would mean teeing only part of the stream to the
+		// client while still fetching and caching the whole file regardless
+		// (storage only ever holds the complete file) -- real added
+		// complexity for a case that's rare in practice, since a client only
+		// sends Range for a file it already has some bytes of, which
+		// normally means it's already fully cached server-side too (served
+		// by the unchanged, Range-capable serveSeekable path below).
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "" {
+			headersSent, err := s.pullThroughStream(w, r, poolPath)
+			if err != nil {
+				if headersSent {
+					// Response headers (and possibly some body bytes) are
+					// already on the wire -- the status code can't change
+					// anymore. The client sees a truncated/incomplete
+					// transfer, which it's already equipped to detect (via
+					// Content-Length or its own checksum verification) and
+					// retry, the same as a real upstream mirror dropping a
+					// connection mid-transfer.
+					slog.Error("pull-through failed mid-stream", "path", poolPath, "err", err)
+				} else {
+					slog.Error("pull-through", "path", poolPath, "err", err)
+					http.Error(w, "pull-through failed", http.StatusBadGateway)
+				}
+				metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "error").Inc()
+				return
+			}
+			metrics.PullThroughsTotal.WithLabelValues(osLabel, cnLabel, upLabel, "success").Inc()
+			return
+		}
 		if err := s.pullThrough(r.Context(), poolPath); err != nil {
 			slog.Error("pull-through", "path", poolPath, "err", err)
 			http.Error(w, "pull-through failed", http.StatusBadGateway)
@@ -882,23 +936,35 @@ func (s *Server) downloadAndCacheSourceFile(ctx context.Context, entry model.Sou
 	return in.CacheSourceFile(ctx, entry, *us, filename)
 }
 
-// pullThrough resolves poolPath to an available upstream package and caches it
-// together with its dependency closure.
-func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
+// resolvePoolPackage parses poolPath's os/codename and looks it up in that
+// layout's current upstream availability data. Shared by pullThrough,
+// pullThroughStream, and servePool's HEAD branch (which needs the package's
+// metadata -- size, name -- without triggering a fetch or caching anything).
+func (s *Server) resolvePoolPackage(ctx context.Context, poolPath string) (osName, codename string, p avail.Pkg, err error) {
 	segs := strings.Split(poolPath, "/")
 	if len(segs) < 4 || segs[0] != "pool" {
-		return errors.New("invalid pool path")
+		return "", "", avail.Pkg{}, errors.New("invalid pool path")
 	}
-	osName, codename := segs[1], segs[2]
+	osName, codename = segs[1], segs[2]
 
 	entry, err := s.getLive(ctx, osName, codename)
 	if err != nil {
-		return err
+		return "", "", avail.Pkg{}, err
 	}
 	p, ok := entry.av.ByPoolPath[poolPath]
 	if !ok {
 		slog.Error("package not in upstream index", "path", poolPath)
-		return errors.New("package not available upstream")
+		return "", "", avail.Pkg{}, errors.New("package not available upstream")
+	}
+	return osName, codename, p, nil
+}
+
+// pullThrough resolves poolPath to an available upstream package and caches it
+// together with its dependency closure.
+func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
+	osName, codename, p, err := s.resolvePoolPackage(ctx, poolPath)
+	if err != nil {
+		return err
 	}
 
 	slog.Debug("pull-through", "path", poolPath, "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
@@ -915,6 +981,55 @@ func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
 	}
 	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
 	return in.Cache(ctx, osName, codename, p, true)
+}
+
+// pullThroughStream is pullThrough's streaming counterpart: instead of fully
+// downloading the package into memory and only then serving it from storage
+// (the old behavior every branch above still uses), it fetches from upstream
+// and tees the response directly into both storage and w as bytes arrive.
+// This fixes two real problems with the buffered approach: large files no
+// longer sit fully resident in memory server-side, and -- the more pressing
+// one -- the client is no longer left holding a connection with zero bytes
+// (not even response headers) for the entire duration of a slow upstream
+// fetch, which is exactly what was causing client-side idle timeouts and
+// spurious 502s under normal, if slow, upstream conditions.
+//
+// headersSent reports whether response headers were written before err
+// occurred, so the caller (servePool) knows whether a clean error status is
+// still possible: nothing is written to w until the upstream fetch has
+// already confirmed a 200 response, so a failure to even reach/resolve
+// upstream still gets a normal 502, while a failure partway through an
+// in-progress stream (network drop, digest mismatch) can only truncate the
+// response -- the status line already went out.
+func (s *Server) pullThroughStream(w http.ResponseWriter, r *http.Request, poolPath string) (headersSent bool, err error) {
+	osName, codename, p, err := s.resolvePoolPackage(r.Context(), poolPath)
+	if err != nil {
+		return false, err
+	}
+
+	if s.exists != nil {
+		// See pullThrough's identical comment: this path is only ever
+		// reached after servePool's own real store.Exists check just found
+		// poolPath missing, so any stale positive ExistsCache entry for it
+		// is proven wrong right now.
+		s.exists.Remove(poolPath)
+	}
+
+	slog.Debug("pull-through", "path", poolPath, "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
+	f := upstream.NewFetcher(p.Upstream, s.client)
+	body, err := f.FetchDebStream(r.Context(), p.Filename)
+	if err != nil {
+		return false, err
+	}
+	defer body.Close()
+
+	w.Header().Set("Cache-Control", httpCacheControl(r.URL.Path))
+	w.Header().Set("Content-Type", contentType(poolPath))
+	w.Header().Set("Content-Length", strconv.FormatInt(p.Size, 10))
+	w.WriteHeader(http.StatusOK)
+
+	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
+	return true, in.CacheStreamingBody(r.Context(), osName, codename, p, body, true, w)
 }
 
 // buildAvail runs avail.Build under s.indexCache's build lock, shared with

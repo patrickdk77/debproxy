@@ -221,6 +221,56 @@ func (s *Store) WalkPool(ctx context.Context, fn func(info storage.FileInfo) err
 	})
 }
 
+// tempFilePrefixes lists every temp-file naming convention this backend's
+// own write paths use: PutFile's ".upload-*" (see its doc comment) and
+// WriteFile's ".pub-*". Both are renamed into place (or removed) on a normal
+// return; only a hard process kill mid-write leaves one behind.
+var tempFilePrefixes = []string{".upload-", ".pub-"}
+
+// CleanupTempFiles walks the whole storage root (pool/ and everything else)
+// removing files matching tempFilePrefixes whose mod time is before
+// olderThan, and returns how many were removed. See the storage.Storage
+// interface doc comment for why this exists.
+func (s *Store) CleanupTempFiles(ctx context.Context, olderThan time.Time) (int, error) {
+	removed := 0
+	err := filepath.WalkDir(s.root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		isTemp := false
+		for _, prefix := range tempFilePrefixes {
+			if strings.HasPrefix(name, prefix) {
+				isTemp = true
+				break
+			}
+		}
+		if !isTemp {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			// Best-effort: the file may have vanished mid-walk (a concurrent
+			// PutFile/WriteFile legitimately finishing and renaming it away).
+			return nil
+		}
+		if !info.ModTime().Before(olderThan) {
+			return nil
+		}
+		if rmErr := os.Remove(p); rmErr == nil {
+			removed++
+		}
+		return nil
+	})
+	return removed, err
+}
+
 func (s *Store) ListPublished(ctx context.Context, prefix string) ([]string, error) {
 	infos, err := s.ListPublishedInfo(ctx, prefix)
 	if err != nil {

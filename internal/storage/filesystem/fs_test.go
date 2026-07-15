@@ -199,3 +199,99 @@ func TestSnapshotResolution(t *testing.T) {
 	}
 
 }
+
+// writeAgedFile creates a file at root/relPath with the given content and
+// backdates its mod time by age, simulating an orphaned temp file left
+// behind by a process killed mid-write (PutFile/WriteFile's own deferred
+// cleanup never gets a chance to run in that case -- see CleanupTempFiles).
+func writeAgedFile(t *testing.T, root, relPath string, age time.Duration) string {
+	t.Helper()
+	abs := filepath.Join(root, relPath)
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte("partial upload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Now().Add(-age)
+	if err := os.Chtimes(abs, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	return abs
+}
+
+func TestCleanupTempFilesRemovesOldOrphans(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	oldUpload := writeAgedFile(t, root, "pool/debian/trixie/main/a/apt/.upload-abc123", 2*time.Hour)
+	oldPub := writeAgedFile(t, root, "2026-04-28/debian/dists/trixie/.pub-xyz789", 2*time.Hour)
+
+	removed, err := store.CleanupTempFiles(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("CleanupTempFiles: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2", removed)
+	}
+	for _, p := range []string{oldUpload, oldPub} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed, stat err = %v", p, err)
+		}
+	}
+}
+
+// TestCleanupTempFilesProtectsRecentUploads is the grace-period safety test:
+// a temp file that's still genuinely mid-write (a large, slow, in-progress
+// streaming pull-through) must survive a cleanup pass, or a legitimate
+// in-flight download would be deleted out from under itself.
+func TestCleanupTempFilesProtectsRecentUploads(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	recent := writeAgedFile(t, root, "pool/debian/trixie/main/a/apt/.upload-inflight", time.Minute)
+
+	removed, err := store.CleanupTempFiles(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("CleanupTempFiles: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0 (recent temp file should be protected)", removed)
+	}
+	if _, err := os.Stat(recent); err != nil {
+		t.Errorf("expected recent temp file to survive, stat err = %v", err)
+	}
+}
+
+// TestCleanupTempFilesIgnoresRealFiles proves the temp-file scan only ever
+// matches its own known prefixes -- a real cached .deb, however old, must
+// never be touched by this pass.
+func TestCleanupTempFilesIgnoresRealFiles(t *testing.T) {
+	root := t.TempDir()
+	store, err := filesystem.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	realDeb := writeAgedFile(t, root, "pool/debian/trixie/main/a/apt/apt_2.6.1_amd64.deb", 48*time.Hour)
+
+	removed, err := store.CleanupTempFiles(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("CleanupTempFiles: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("removed = %d, want 0", removed)
+	}
+	if _, err := os.Stat(realDeb); err != nil {
+		t.Errorf("expected real .deb file to survive, stat err = %v", err)
+	}
+}

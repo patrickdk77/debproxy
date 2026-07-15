@@ -1077,6 +1077,34 @@ func (f *Fetcher) DownloadDeb(ctx context.Context, filename, expectedSHA256 stri
 	return data, nil
 }
 
+// FetchDebStream issues a GET for filename and returns the raw response body
+// stream without reading it into memory, for callers that want to tee it
+// directly into storage (and, when a live client request is waiting on it,
+// the client's own response) as bytes arrive rather than buffering the whole
+// file first. The caller must Close the returned body. Digest verification
+// isn't done here -- it can only be done against the fully-streamed content,
+// so it's the caller's responsibility (see ingest.digestVerifyingReader).
+func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadCloser, error) {
+	url := f.base() + "/" + strings.TrimLeft(filename, "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if f.src.Username != "" {
+		req.SetBasicAuth(f.src.Username, f.src.Password)
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("download %s: status %d", filename, resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
 // getConditional issues a GET with optional ETag/Last-Modified validators.
 // On 304 the body is empty. The response is always non-nil on nil error.
 func (f *Fetcher) getConditional(ctx context.Context, url, etag, lastMod string) ([]byte, *http.Response, error) {

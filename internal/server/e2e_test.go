@@ -25,8 +25,10 @@ import (
 	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/metadata/deb822store"
+	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/server"
 	"github.com/debproxy/debproxy/internal/signing"
+	"github.com/debproxy/debproxy/internal/storage"
 	"github.com/debproxy/debproxy/internal/storagefactory"
 	"github.com/debproxy/debproxy/internal/syncer"
 	"github.com/debproxy/debproxy/internal/webhook"
@@ -724,6 +726,269 @@ signing:
 	}
 	if sha256hex(body) != sha256hex(origTar) {
 		t.Fatalf("live source pull-through returned wrong bytes")
+	}
+}
+
+// setupHelloUpstream builds a signed InRelease/Packages/Packages.gz set for a
+// single "hello" package and returns the .deb bytes plus a config-ready
+// upstream base handler (InRelease/Packages/Packages.gz only -- the .deb path
+// itself is deliberately left to each caller so it can control exactly how
+// that one response behaves). Shared by the streaming pull-through tests
+// below, which each need the same index but a different .deb response.
+func setupHelloUpstream(t *testing.T) (deb []byte, upstreamPath string, baseHandler http.HandlerFunc, upstreamPub string) {
+	t.Helper()
+	dir := t.TempDir()
+	upstreamPriv := filepath.Join(dir, "upstream.priv.asc")
+	upstreamPubPath := filepath.Join(dir, "upstream.pub.asc")
+	writeKeyPair(t, upstreamPriv, upstreamPubPath)
+	upstreamKey, err := signing.Load(upstreamPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	control := "Package: hello\nVersion: 1.0\nArchitecture: amd64\nSection: utils\nMaintainer: T <t@example.com>\nDescription: hello\n"
+	deb = buildDeb(t, control)
+	upstreamPath = "pool/main/h/hello/hello_1.0_amd64.deb"
+	packages := packagesStanza(t, control, upstreamPath, deb)
+	gz := gzipBytes(t, packages)
+	release := buildUpstreamRelease(packages, gz)
+	inRelease, err := upstreamKey.SignInline([]byte(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseHandler = func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/dists/trixie/InRelease":
+			_, _ = w.Write(inRelease)
+		case "/dists/trixie/main/binary-amd64/Packages":
+			_, _ = w.Write(packages)
+		case "/dists/trixie/main/binary-amd64/Packages.gz":
+			_, _ = w.Write(gz)
+		default:
+			http.NotFound(w, r)
+		}
+	}
+	return deb, upstreamPath, baseHandler, upstreamPubPath
+}
+
+// newHelloServer writes the config wiring hello's upstream (at upstreamURL)
+// into a single debian/trixie/main layout and returns a ready server plus
+// its storage backend (for direct store.Exists assertions).
+func newHelloServer(t *testing.T, upstreamURL, upstreamPub string) (*server.Server, storage.Storage) {
+	t.Helper()
+	dir := t.TempDir()
+	repoPriv := filepath.Join(dir, "repo.priv.asc")
+	writeKeyPair(t, repoPriv, "")
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := fmt.Sprintf(`storage:
+  backend: filesystem
+  filesystem:
+    root: %s
+upstreams:
+  debian-main:
+    url: %s
+    keys: [%s]
+layouts:
+  - os: debian
+    architectures: [amd64]
+    codenames:
+      - codename: trixie
+        components:
+          - component: main
+            upstreams: [debian-main]
+signing:
+  private_key: %s
+`, filepath.Join(dir, "store"), upstreamURL, upstreamPub, repoPriv)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storagefactory.New(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := deb822store.New(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoKey, err := signing.Load(repoPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server.New(loaded, store, index, repoKey, nil, nil, nil, nil), store
+}
+
+// TestPoolPullThroughStreamsBeforeUpstreamFinishes is the direct regression
+// test for the streaming pull-through fix: the client must receive bytes as
+// they arrive from upstream, not only after the whole upstream response (and
+// the subsequent write to storage) completes. The upstream handler sends
+// half the .deb, flushes, and blocks -- if the client can read that first
+// half before the handler is ever unblocked, debproxy is genuinely streaming
+// rather than buffering.
+func TestPoolPullThroughStreamsBeforeUpstreamFinishes(t *testing.T) {
+	deb, upstreamPath, baseHandler, upstreamPub := setupHelloUpstream(t)
+	if len(deb) < 20 {
+		t.Fatalf("test .deb too small to split meaningfully: %d bytes", len(deb))
+	}
+	half := len(deb) / 2
+	releaseSecondHalf := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/"+upstreamPath {
+			baseHandler(w, r)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("httptest ResponseWriter does not support Flush")
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write(deb[:half]); err != nil {
+			t.Errorf("write first half: %v", err)
+		}
+		flusher.Flush()
+		<-releaseSecondHalf
+		_, _ = w.Write(deb[half:])
+	}))
+	defer upstream.Close()
+
+	webServer, _ := newHelloServer(t, upstream.URL, upstreamPub)
+	srv := httptest.NewServer(webServer.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/live/debian/pool/debian/trixie/debian-main/utils/h/hello/hello_1.0_amd64.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	firstHalf := make([]byte, half)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(resp.Body, firstHalf)
+		readDone <- err
+	}()
+
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatalf("reading first half: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first half -- response is not actually streaming")
+	}
+	if !bytes.Equal(firstHalf, deb[:half]) {
+		t.Fatal("first half of the streamed response doesn't match what upstream sent")
+	}
+
+	close(releaseSecondHalf)
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rest, deb[half:]) {
+		t.Fatal("second half of the streamed response doesn't match what upstream sent")
+	}
+}
+
+// TestPoolPullThroughDigestMismatchDoesNotCacheCorruptFile proves
+// digestVerifyingReader's safety property end to end: if upstream serves
+// bytes that don't match the Packages index's declared SHA256 (a corrupted
+// or tampered mirror response), the client still receives whatever was
+// streamed (it's responsible for its own checksum verification, same as any
+// real apt client), but the pool file must never be committed to storage --
+// otherwise every future request would be served that same corrupt content
+// from cache instead of getting a chance to re-fetch a good copy.
+func TestPoolPullThroughDigestMismatchDoesNotCacheCorruptFile(t *testing.T) {
+	deb, upstreamPath, baseHandler, upstreamPub := setupHelloUpstream(t)
+	corrupted := append([]byte(nil), deb...)
+	corrupted[0] ^= 0xFF // same length, different content/digest
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/"+upstreamPath {
+			baseHandler(w, r)
+			return
+		}
+		_, _ = w.Write(corrupted)
+	}))
+	defer upstream.Close()
+
+	webServer, store := newHelloServer(t, upstream.URL, upstreamPub)
+	srv := httptest.NewServer(webServer.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/live/debian/pool/debian/trixie/debian-main/utils/h/hello/hello_1.0_amd64.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Equal(body, corrupted) {
+		t.Errorf("expected the client to receive exactly what upstream served (corrupted bytes), got %d bytes matching=%v", len(body), bytes.Equal(body, corrupted))
+	}
+
+	poolPath := model.PoolPath("debian", "trixie", "debian-main", "utils", "hello", "1.0", "amd64")
+	exists, err := store.Exists(context.Background(), poolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("expected no pool file to be cached after a digest mismatch, but one was written")
+	}
+}
+
+// TestPoolPullThroughHeadDoesNotFetchUpstream proves HEAD on a not-yet-
+// cached pool file is answered from already-known package metadata (size,
+// name) without ever contacting upstream for the .deb itself.
+func TestPoolPullThroughHeadDoesNotFetchUpstream(t *testing.T) {
+	deb, upstreamPath, baseHandler, upstreamPub := setupHelloUpstream(t)
+
+	var mu sync.Mutex
+	var debHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/"+upstreamPath {
+			mu.Lock()
+			debHits++
+			mu.Unlock()
+			_, _ = w.Write(deb)
+			return
+		}
+		baseHandler(w, r)
+	}))
+	defer upstream.Close()
+
+	webServer, _ := newHelloServer(t, upstream.URL, upstreamPub)
+	srv := httptest.NewServer(webServer.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodHead, srv.URL+"/live/debian/pool/debian/trixie/debian-main/utils/h/hello/hello_1.0_amd64.deb", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Length"); got != strconv.Itoa(len(deb)) {
+		t.Errorf("Content-Length = %q, want %q", got, strconv.Itoa(len(deb)))
+	}
+
+	mu.Lock()
+	hits := debHits
+	mu.Unlock()
+	if hits != 0 {
+		t.Errorf("expected HEAD to never fetch the .deb from upstream, got %d hits", hits)
 	}
 }
 
