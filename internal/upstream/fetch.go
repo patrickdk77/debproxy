@@ -279,7 +279,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 
 	// 304: upstream says nothing changed  --  return cached index and extend expiry.
 	if resp != nil && resp.StatusCode == http.StatusNotModified {
-		if cachedEntry != nil {
+		if cachedEntry != nil && cachedEntry.archsComplete {
 			updated := *cachedEntry
 			updated.expires = parseExpiry(resp)
 			if f.cache != nil {
@@ -287,7 +287,11 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 			}
 			return &Index{Release: cachedEntry.release, ByArch: cachedEntry.archPkgs}, nil
 		}
-		// Cache miss despite 304 (shouldn't happen)  --  fall through to full fetch.
+		// Cache miss despite 304 (shouldn't happen), or the cached per-arch
+		// data we have is known incomplete (see indexCacheEntry.archsComplete)
+		// -- a 304 only confirms the Release itself is unchanged, not that our
+		// own copy of its Packages data is complete, so this must not
+		// shortcut past a real per-arch fetch below.
 		releaseBody, _, err = f.fetchVerifiedReleaseFull(ctx)
 		if err != nil {
 			return nil, err
@@ -350,8 +354,9 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 
 	if f.cache != nil {
 		entry := &indexCacheEntry{
-			release:  rel,
-			archPkgs: archPkgs,
+			release:       rel,
+			archPkgs:      archPkgs,
+			archsComplete: true,
 		}
 		if resp != nil {
 			entry.etag = resp.Header.Get("ETag")
@@ -379,8 +384,10 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 // replica refreshed this upstream's layout within the last
 // schedule.refresh interval, which is the real staleness bound this system
 // cares about, not the upstream mirror's own HTTP cache hint. Returns
-// ok=false if neither local nor Valkey has anything at all; the caller
-// should fall back to FetchIndex in that case.
+// ok=false if neither local nor Valkey has anything at all, or what's cached
+// is known incomplete (see indexCacheEntry.archsComplete -- e.g. a transient
+// per-arch Valkey read error, not a confirmed "this upstream serves
+// nothing"); the caller should fall back to FetchIndex in that case.
 func (f *Fetcher) AdoptFromValkeyOutright(ctx context.Context) (*Index, bool) {
 	cacheKey := f.cacheKey()
 	archs := append(append([]string{}, f.src.Archs...), "all")
@@ -388,14 +395,7 @@ func (f *Fetcher) AdoptFromValkeyOutright(ctx context.Context) (*Index, bool) {
 	if !ok || cached.release == nil {
 		return nil, false
 	}
-	// An empty archPkgs is only a real miss when the cached Release itself
-	// claims to serve at least one configured architecture but that data
-	// just hasn't been cached (yet). When the Release confirms this
-	// upstream serves none of them at all (see releaseServedArchs), an
-	// empty archPkgs is already the correct, confirmed answer -- not a sign
-	// this hasn't been checked, so there's nothing to gain by re-fetching
-	// over the network to re-derive the same "nothing here" conclusion.
-	if len(cached.archPkgs) == 0 && len(releaseServedArchs(cached.release, f.src.Component, f.src.Archs)) > 0 {
+	if !cached.archsComplete {
 		return nil, false
 	}
 	if f.cache != nil {

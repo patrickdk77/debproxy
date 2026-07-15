@@ -59,6 +59,17 @@ type indexCacheEntry struct {
 	release  *apt.Release
 	archPkgs map[string][]apt.RawPkg // arch -> verified+parsed Packages stanzas
 
+	// archsComplete is false when at least one requested arch's Packages
+	// data is missing from archPkgs because reading it failed (a transient
+	// Valkey error, most commonly -- see fetchArchPkgs), as opposed to that
+	// arch genuinely having nothing to serve. archPkgs alone can't tell
+	// these two cases apart: both leave the arch's key absent. Callers that
+	// treat archPkgs as a complete, trustworthy picture (AdoptFromValkeyOutright,
+	// FetchIndex's Valkey-adopt fast path, and the 304 shortcut) must check
+	// this first; callers that only want a best-effort comparison/fallback
+	// basis (PDiff, stale-on-error) don't need to.
+	archsComplete bool
+
 	// Sources index cache
 	srcsRelease *apt.Release // InRelease from last successful Sources fetch
 	srcs        []apt.RawSrc // parsed Sources stanzas from that fetch

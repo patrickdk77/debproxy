@@ -473,6 +473,107 @@ func TestAdoptFromValkeyOutrightTrustsConfirmedEmptyArchs(t *testing.T) {
 	}
 }
 
+// TestAdoptFromValkeyOutrightRejectsPartiallyUnreadableArchs is the
+// regression test for a real production incident: one arch's Valkey bucket
+// read failing (a transient error, simulated here by corrupting one stored
+// entry so it fails JSON decoding) must not be mistaken for "this upstream
+// confirmedly has nothing for that arch" just because a *different*,
+// unaffected arch still has data (making the overall ByArch non-empty).
+// Before archsComplete existed, AdoptFromValkeyOutright's only guard was
+// "ByArch is empty AND the Release claims to serve something" -- which this
+// scenario slips past entirely (ByArch has amd64 data, so len != 0), so it
+// adopted an index silently missing all of arm64's packages. In production
+// this surfaced as many real, available ubuntu-security packages being
+// reported "not in current live index" long after any restart/rebuild, with
+// no further rebuild ever correcting it.
+func TestAdoptFromValkeyOutrightRejectsPartiallyUnreadableArchs(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL := buildFakeUpstreamTwoArches(t, key)
+
+	src := model.UpstreamSource{
+		Name:       "test-upstream",
+		URL:        srvURL,
+		Suite:      "trixie",
+		Component:  "main",
+		Archs:      []string{"amd64", "arm64"},
+		VerifyKeys: keyring,
+	}
+	rawClient := newRawTestClient(t)
+	keys := valkeycache.Keys{Prefix: "test-adopt-partial-archs:"}
+	ctx := context.Background()
+
+	seedCache := upstream.NewIndexCache()
+	seedCache.EnableValkey(rawClient, keys, time.Minute, 10*time.Second)
+	seedFetcher := upstream.NewFetcherWithCache(src, nil, seedCache)
+	idx, err := seedFetcher.FetchIndex(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.ByArch["amd64"]) != 1 || len(idx.ByArch["arm64"]) != 1 {
+		t.Fatalf("expected one package per arch after seeding, got %+v", idx.ByArch)
+	}
+
+	// Corrupt arm64's only cached entry so a future read of it fails to
+	// decode -- simulating the transient per-arch Valkey read error
+	// fetchArchPkgs warns and swallows, distinct from a genuinely empty
+	// bucket (which fetchOneArchPkgs returns as (nil, nil), no error).
+	entryKey := keys.UpstreamPkgEntry("test-upstream", "trixie", "main", "arm64", "world", "1.0")
+	if err := rawClient.Do(ctx, rawClient.B().Set().Key(entryKey).Value("not valid json").Build()).Error(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh cache with no local state, same Valkey backing -- simulating a
+	// different (or restarted) replica adopting outright.
+	cache := upstream.NewIndexCache()
+	cache.EnableValkey(rawClient, keys, time.Minute, 10*time.Second)
+	fetcher := upstream.NewFetcherWithCache(src, nil, cache)
+	if _, ok := fetcher.AdoptFromValkeyOutright(ctx); ok {
+		t.Fatal("expected AdoptFromValkeyOutright to refuse a partially-unreadable index, not adopt it silently")
+	}
+}
+
+// buildFakeUpstreamTwoArches serves a Release listing two architectures
+// (amd64 with package "hello", arm64 with package "world"), each in its own
+// Packages file -- for tests that need one arch's Valkey-cached data to be
+// independently corruptible from another's.
+func buildFakeUpstreamTwoArches(t *testing.T, key *signing.Key) (srvURL string) {
+	t.Helper()
+
+	amd64Content := []byte("Package: hello\nVersion: 1.0\nArchitecture: amd64\n")
+	arm64Content := []byte("Package: world\nVersion: 1.0\nArchitecture: arm64\n")
+	amd64Sum := sha256.Sum256(amd64Content)
+	arm64Sum := sha256.Sum256(arm64Content)
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64 arm64\nSHA256:\n %s %d main/binary-amd64/Packages\n %s %d main/binary-arm64/Packages\n",
+		hex.EncodeToString(amd64Sum[:]), len(amd64Content),
+		hex.EncodeToString(arm64Sum[:]), len(arm64Content),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(amd64Content)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-arm64/Packages", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(arm64Content)
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
 // TestAdoptSourcesFromValkeyOutrightTrustsConfirmedEmptySources covers a
 // binary-only upstream whose Release lists no Sources file at all --
 // releaseListsSources confirms this from the cached Release alone, so

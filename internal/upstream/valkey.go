@@ -110,15 +110,17 @@ func (c *IndexCache) adoptFromValkey(ctx context.Context, cacheKey, upstream, su
 		return nil, false
 	}
 
+	archPkgs, complete := b.fetchArchPkgs(ctx, upstream, suite, component, archs)
 	entry := &indexCacheEntry{
-		etag:     meta.ETag,
-		lastMod:  meta.LastMod,
-		expires:  meta.Expires,
-		release:  meta.Release,
-		archPkgs: b.fetchArchPkgs(ctx, upstream, suite, component, archs),
+		etag:          meta.ETag,
+		lastMod:       meta.LastMod,
+		expires:       meta.Expires,
+		release:       meta.Release,
+		archPkgs:      archPkgs,
+		archsComplete: complete,
 	}
 	c.store(cacheKey, entry)
-	return entry, true
+	return entry, complete
 }
 
 // adoptFromValkeyForComparison reads Valkey's copy for upstream+suite+
@@ -142,12 +144,14 @@ func (c *IndexCache) adoptFromValkeyForComparison(ctx context.Context, upstream,
 	if !ok {
 		return nil, false
 	}
+	archPkgs, complete := b.fetchArchPkgs(ctx, upstream, suite, component, archs)
 	return &indexCacheEntry{
-		etag:     meta.ETag,
-		lastMod:  meta.LastMod,
-		expires:  meta.Expires,
-		release:  meta.Release,
-		archPkgs: b.fetchArchPkgs(ctx, upstream, suite, component, archs),
+		etag:          meta.ETag,
+		lastMod:       meta.LastMod,
+		expires:       meta.Expires,
+		release:       meta.Release,
+		archPkgs:      archPkgs,
+		archsComplete: complete,
 	}, true
 }
 
@@ -230,28 +234,34 @@ func (b *valkeyBacking) getMeta(ctx context.Context, upstream, suite, component 
 }
 
 // fetchArchPkgs reads archs' Packages data for upstream+suite+component from
-// Valkey. Missing archs are simply absent from the result. Each arch's
-// bucket is walked via SSCAN and its entries read via chunked MGET (see
-// bucket.go), so no single reply is ever unbounded by the arch's total
-// package count -- some buckets (e.g. Ubuntu's "universe" component) run to
-// tens of thousands of packages, which is exactly what used to produce a
-// multi-hundred-MB single MGET reply here.
-func (b *valkeyBacking) fetchArchPkgs(ctx context.Context, upstream, suite, component string, archs []string) map[string][]apt.RawPkg {
+// Valkey. Each arch's bucket is walked via SSCAN and its entries read via
+// chunked MGET (see bucket.go), so no single reply is ever unbounded by the
+// arch's total package count -- some buckets (e.g. Ubuntu's "universe"
+// component) run to tens of thousands of packages, which is exactly what
+// used to produce a multi-hundred-MB single MGET reply here.
+//
+// complete is false if any arch's read failed (as opposed to that arch's
+// bucket being confirmed empty) -- see indexCacheEntry.archsComplete, which
+// callers should set from this so a transient per-arch read error is never
+// mistaken for "this upstream confirmedly has nothing for that arch."
+func (b *valkeyBacking) fetchArchPkgs(ctx context.Context, upstream, suite, component string, archs []string) (archPkgs map[string][]apt.RawPkg, complete bool) {
 	if len(archs) == 0 {
-		return nil
+		return nil, true
 	}
-	archPkgs := make(map[string][]apt.RawPkg, len(archs))
+	archPkgs = make(map[string][]apt.RawPkg, len(archs))
+	complete = true
 	for _, arch := range archs {
 		pkgs, err := b.fetchOneArchPkgs(ctx, upstream, suite, component, arch)
 		if err != nil {
 			slog.Warn("valkey: read upstream pkgs failed", "upstream", upstream, "arch", arch, "err", err)
+			complete = false
 			continue // this arch not cached in valkey; leave it absent
 		}
 		if pkgs != nil {
 			archPkgs[arch] = pkgs
 		}
 	}
-	return archPkgs
+	return archPkgs, complete
 }
 
 // fetchOneArchPkgs reads one arch's bucket in full, via a paginated SSCAN of
