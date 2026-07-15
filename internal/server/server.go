@@ -979,8 +979,16 @@ func (s *Server) pullThrough(ctx context.Context, poolPath string) error {
 		// silently skipping the download.
 		s.exists.Remove(poolPath)
 	}
+	// Detached from the client's own request context: if the client gives up
+	// partway (see fetchCtx's identical comment on pullThroughStream), the
+	// fetch and the write into storage must keep running regardless --
+	// otherwise every retry against a slow upstream restarts from scratch and
+	// loses the same race again, rather than the file ever actually landing
+	// in the cache.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retryTimeout)
+	defer cancel()
 	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
-	return in.Cache(ctx, osName, codename, p, true)
+	return in.Cache(fetchCtx, osName, codename, p, true)
 }
 
 // pullThroughStream is pullThrough's streaming counterpart: instead of fully
@@ -1015,9 +1023,27 @@ func (s *Server) pullThroughStream(w http.ResponseWriter, r *http.Request, poolP
 		s.exists.Remove(poolPath)
 	}
 
+	// Detached from the client's own request context for the fetch and the
+	// write into storage: a client that gives up partway through a slow
+	// upstream fetch (see this session's investigation -- a client sitting
+	// at zero bytes for 30s, or upstream itself taking that long just to
+	// respond) must not also kill the in-flight download. Without this, every
+	// retry against a slow upstream independently restarts and re-loses the
+	// same race, and the file never actually lands in the cache -- exactly
+	// the repeat-failure pattern observed against ports.ubuntu.com. Bounded
+	// by retryTimeout (10m, the same ceiling already used for the mismatch-
+	// retry background process) rather than left unbounded, since nothing
+	// else bounds a stalled upstream body read once headers arrive. Writes to
+	// w itself are unaffected by this -- they still go out over the real
+	// client connection and simply stop mattering (see
+	// digestVerifyingReader's best-effort client write) once that connection
+	// is gone; only the fetch/cache-write side needed to survive it.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), retryTimeout)
+	defer cancel()
+
 	slog.Debug("pull-through", "path", poolPath, "package", p.Name, "version", p.Version, "upstream", p.Upstream.Name)
 	f := upstream.NewFetcher(p.Upstream, s.client)
-	body, err := f.FetchDebStream(r.Context(), p.Filename)
+	body, err := f.FetchDebStream(fetchCtx, p.Filename)
 	if err != nil {
 		return false, err
 	}
@@ -1029,7 +1055,7 @@ func (s *Server) pullThroughStream(w http.ResponseWriter, r *http.Request, poolP
 	w.WriteHeader(http.StatusOK)
 
 	in := ingest.New(s.store, s.index, s.client, s.notifier, s.exists)
-	return true, in.CacheStreamingBody(r.Context(), osName, codename, p, body, true, w)
+	return true, in.CacheStreamingBody(fetchCtx, osName, codename, p, body, true, w)
 }
 
 // buildAvail runs avail.Build under s.indexCache's build lock, shared with

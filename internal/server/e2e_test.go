@@ -897,6 +897,108 @@ func TestPoolPullThroughStreamsBeforeUpstreamFinishes(t *testing.T) {
 	}
 }
 
+// TestPoolPullThroughSurvivesClientDisconnect is the direct regression test
+// for detaching the fetch from the client's own request context: a client
+// that gives up partway through a streaming pull-through (its own idle
+// timeout, a killed apt process, a real network drop) must not abort the
+// underlying fetch -- the file must still land in the cache, so the very
+// next request is a fast cache hit instead of independently restarting and
+// re-losing the same race against a slow upstream from scratch, which is
+// exactly the repeat-failure pattern observed in production against
+// ports.ubuntu.com.
+func TestPoolPullThroughSurvivesClientDisconnect(t *testing.T) {
+	deb, upstreamPath, baseHandler, upstreamPub := setupHelloUpstream(t)
+	if len(deb) < 20 {
+		t.Fatalf("test .deb too small to split meaningfully: %d bytes", len(deb))
+	}
+	half := len(deb) / 2
+	releaseSecondHalf := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/"+upstreamPath {
+			baseHandler(w, r)
+			return
+		}
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("httptest ResponseWriter does not support Flush")
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write(deb[:half]); err != nil {
+			t.Errorf("write first half: %v", err)
+		}
+		flusher.Flush()
+		<-releaseSecondHalf
+		_, _ = w.Write(deb[half:])
+	}))
+	defer upstream.Close()
+
+	webServer, store := newHelloServer(t, upstream.URL, upstreamPub)
+	srv := httptest.NewServer(webServer.Handler())
+	defer srv.Close()
+
+	poolPath := model.PoolPath("debian", "trixie", "debian-main", "utils", "hello", "1.0", "amd64")
+	url := srv.URL + "/live/debian/pool/debian/trixie/debian-main/utils/h/hello/hello_1.0_amd64.deb"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstHalf := make([]byte, half)
+	if _, err := io.ReadFull(resp.Body, firstHalf); err != nil {
+		t.Fatalf("reading first half: %v", err)
+	}
+	if !bytes.Equal(firstHalf, deb[:half]) {
+		t.Fatal("first half of the streamed response doesn't match what upstream sent")
+	}
+
+	// Simulate the client giving up mid-transfer: close the body and cancel
+	// its own request context, same as a real apt client hitting an idle
+	// timeout or being killed.
+	resp.Body.Close()
+	cancel()
+
+	// Give the now-client-less server-side handler a moment to notice the
+	// client is gone, then let the upstream finish sending the rest of the
+	// file -- proving the fetch kept running regardless.
+	time.Sleep(200 * time.Millisecond)
+	close(releaseSecondHalf)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		exists, err := store.Exists(context.Background(), poolPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the pool file to be cached after the client disconnected -- the fetch was aborted along with the client instead of surviving it")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	rc, err := store.Open(context.Background(), poolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, deb) {
+		t.Fatalf("cached file is %d bytes, want the full %d-byte original -- the fetch was truncated when the client disconnected", len(got), len(deb))
+	}
+}
+
 // TestPoolPullThroughDigestMismatchDoesNotCacheCorruptFile proves
 // digestVerifyingReader's safety property end to end: if upstream serves
 // bytes that don't match the Packages index's declared SHA256 (a corrupted
