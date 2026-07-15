@@ -23,7 +23,16 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      # Excludes packages whose tests require a real Docker daemon to start a
+      # Valkey container (see internal/testsupport, which shells out to the
+      # docker CLI directly) -- ubuntu-slim runners don't have Docker
+      # available, and those packages' TestMain fails the whole package's
+      # test binary outright without it, not just the individual tests that
+      # actually touch Valkey.
+      - name: Test (excluding Docker-dependent packages)
+        run: |
+          pkgs=$(go list ./... | grep -v -E '^github\.com/debproxy/debproxy/(cmd/debproxy|internal/avail|internal/metadata/valkeystore|internal/server|internal/upstream|internal/valkeycache)$')
+          go test $pkgs
 
   build:
     needs: test
