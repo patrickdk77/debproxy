@@ -217,12 +217,30 @@ func (s *Server) metricOSCodename(osName, codename string) (string, string) {
 	return "_invalid", "_invalid"
 }
 
-// sweepExpiredLiveCache removes entries whose TTL has elapsed so that inactive
-// os/codename combinations don't hold large index byte slices indefinitely.
+// sweepExpiredLiveCache removes entries for os/codename combinations that are
+// no longer configured at all (removed from cfg since the entry was built)
+// and whose TTL has also elapsed, so a layout dropped from config doesn't
+// hold its last-built index byte slices indefinitely.
+//
+// Deliberately does NOT delete an entry just because it's past its own
+// expiry while still a currently-configured layout (see isKnownOSCodename)
+// -- that's exactly what getLive's own stale-entry branch is designed to
+// handle gracefully (serve the stale entry immediately, refresh in the
+// background). This function used to delete any expired entry outright,
+// for every layout, on every single swapLiveEntry call (i.e. on every
+// successful build for ANY layout) -- so a layout that simply hadn't been
+// requested in the last liveTTLBase+liveTTLJitter window (12-17 minutes)
+// could get swept out from under it by a completely unrelated layout's
+// routine refresh. The next request for that quiet-but-valid layout then
+// found no entry at all instead of a stale one, falling all the way through
+// to getLive's synchronous cold-start path and blocking that client on a
+// full rebuild -- confirmed in production via repeated "building live
+// cache"/"live cache built" pairs for the same os/codename, arbitrarily
+// long after startup, with no cold start actually warranted.
 // Must be called with s.mu held.
 func (s *Server) sweepExpiredLiveCache(now time.Time) {
 	for k, e := range s.liveCache {
-		if now.After(e.expiry) {
+		if !s.validOSCodename[k] && now.After(e.expiry) {
 			delete(s.liveCache, k)
 		}
 	}
