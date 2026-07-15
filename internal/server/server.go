@@ -940,6 +940,16 @@ func (s *Server) downloadAndCacheSourceFile(ctx context.Context, entry model.Sou
 // layout's current upstream availability data. Shared by pullThrough,
 // pullThroughStream, and servePool's HEAD branch (which needs the package's
 // metadata -- size, name -- without triggering a fetch or caching anything).
+//
+// A miss against the live av falls back to avail.ResolvePoolPath, a targeted
+// re-check of just the one upstream poolPath names, before giving up: this
+// is the live path, and the layout's cached av can be incomplete for
+// reasons that have nothing to do with the package actually being
+// unavailable (a slow/degraded rebuild, a transient read failure limited to
+// one upstream -- see this session's ubuntu-security incident, where every
+// affected package resolved fine when checked directly moments later).
+// Rejecting outright just because this replica's last rebuild happened to
+// miss it would turn a self-healing hiccup into a hard, unnecessary 502.
 func (s *Server) resolvePoolPackage(ctx context.Context, poolPath string) (osName, codename string, p avail.Pkg, err error) {
 	segs := strings.Split(poolPath, "/")
 	if len(segs) < 4 || segs[0] != "pool" {
@@ -952,8 +962,14 @@ func (s *Server) resolvePoolPackage(ctx context.Context, poolPath string) (osNam
 		return "", "", avail.Pkg{}, err
 	}
 	p, ok := entry.av.ByPoolPath[poolPath]
-	if !ok {
-		slog.Error("package not in upstream index", "path", poolPath)
+	if ok {
+		return osName, codename, p, nil
+	}
+
+	slog.Warn("package not in current live index, re-resolving directly against its upstream", "path", poolPath)
+	p, ferr := avail.ResolvePoolPath(ctx, s.cfg, s.client, s.indexCache, osName, codename, poolPath)
+	if ferr != nil {
+		slog.Error("package not available upstream", "path", poolPath, "err", ferr)
 		return "", "", avail.Pkg{}, errors.New("package not available upstream")
 	}
 	return osName, codename, p, nil

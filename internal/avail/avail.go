@@ -4,6 +4,7 @@ package avail
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -375,6 +376,90 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 	}
 
 	return av
+}
+
+// ResolvePoolPath re-resolves a single pool path directly against the one
+// upstream it names, without needing the layout's whole merged Available
+// view to already have it. poolPath itself already encodes enough to
+// identify exactly which upstream to check (see model.PoolPath) -- os,
+// codename, and upstream name are all path segments -- so a package this
+// replica's last layout-wide rebuild happened to miss (a slow/degraded
+// rebuild, a transient read failure for one upstream) shouldn't be rejected
+// outright when the real, current data is one upstream-scoped check away.
+// Used as servePool's fallback when the live path's own av doesn't have
+// poolPath: this is a live request path, so this only ever checks the one
+// named upstream (via the same Valkey-outright-adopt/real-fetch path Build
+// itself uses for that upstream), never the whole layout.
+//
+// Returns an error if poolPath doesn't parse, no configured upstream in
+// osName/codename has this name, or that upstream's current data doesn't
+// contain a package at exactly this pool path.
+func ResolvePoolPath(ctx context.Context, cfg *config.Config, client *http.Client, cache *upstream.IndexCache, osName, codename, poolPath string) (Pkg, error) {
+	upstreamName, ok := upstreamNameFromPoolPath(poolPath)
+	if !ok {
+		return Pkg{}, fmt.Errorf("invalid pool path %q", poolPath)
+	}
+
+	// Never trust cache's own local entries here: this fallback only runs
+	// after the live av already missed, and cache is typically the very
+	// same IndexCache that produced that av -- reusing its local state as-is
+	// would just hand back the same stale-or-incomplete answer. See
+	// WithoutLocalState's doc comment.
+	fresh := cache.WithoutLocalState()
+
+	for _, layout := range cfg.ResolvedLayouts {
+		if layout.OS != osName || layout.Codename != codename {
+			continue
+		}
+		for _, src := range layout.Upstreams {
+			if src.Name != upstreamName {
+				continue
+			}
+			if p, ok := resolveFromUpstream(ctx, client, fresh, osName, codename, layout.Component, src, poolPath); ok {
+				return p, nil
+			}
+		}
+	}
+	return Pkg{}, fmt.Errorf("package not available upstream")
+}
+
+// upstreamNameFromPoolPath extracts the upstream name segment from a pool
+// path of the form pool/{os}/{codename}/{upstream}/... (see model.PoolPath).
+func upstreamNameFromPoolPath(poolPath string) (string, bool) {
+	segs := strings.SplitN(poolPath, "/", 5)
+	if len(segs) < 4 || segs[0] != "pool" {
+		return "", false
+	}
+	return segs[3], true
+}
+
+// resolveFromUpstream fetches src's current index (Valkey-outright-adopt
+// first, falling through to a real fetch, exactly like Build's own per-
+// upstream job) and looks for a package whose derived pool path matches
+// poolPath exactly. A large upstream (e.g. universe) means this is a linear
+// scan over everything currently known for it, but this path only runs on a
+// live-index cache miss -- rare by construction -- so that cost is
+// acceptable against the alternative of rejecting a real, available package.
+func resolveFromUpstream(ctx context.Context, client *http.Client, cache *upstream.IndexCache, osName, codename, component string, src model.UpstreamSource, poolPath string) (Pkg, bool) {
+	f := upstream.NewFetcherWithCache(src, client, cache)
+	idx, ok := f.AdoptFromValkeyOutright(ctx)
+	if !ok {
+		var err error
+		idx, err = f.FetchIndex(ctx)
+		if err != nil {
+			slog.Warn("resolvePoolPath: upstream index unavailable", "upstream", src.Name, "err", err)
+			return Pkg{}, false
+		}
+	}
+	for arch, stanzas := range idx.ByArch {
+		for _, st := range stanzas {
+			p := buildPkg(osName, codename, component, arch, src, st)
+			if p.PoolPath == poolPath {
+				return p, true
+			}
+		}
+	}
+	return Pkg{}, false
 }
 
 func buildPkg(osName, codename, component, arch string, src model.UpstreamSource, st apt.RawPkg) Pkg {

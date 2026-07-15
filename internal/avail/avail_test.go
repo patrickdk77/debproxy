@@ -19,6 +19,7 @@ import (
 	"github.com/klauspost/compress/gzip"
 	"github.com/valkey-io/valkey-go"
 
+	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/avail"
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/model"
@@ -375,5 +376,102 @@ func TestBuildDoesNotMarkFreshWhenSourcesFetchFails(t *testing.T) {
 	}
 	if len(av2.Srcs["main"]) == 0 {
 		t.Fatal("expected Sources entries now that Sources is fixed")
+	}
+}
+
+// TestResolvePoolPathFindsPackageDirectlyFromUpstream is the direct
+// regression test for the live-path fallback this session's ubuntu-security
+// incident motivated: ResolvePoolPath must find a real, available package by
+// checking just the one upstream its pool path names, entirely independent
+// of whether any layout-wide Available view (av.ByPoolPath) has ever been
+// built at all -- it's called only after that lookup already missed.
+func TestResolvePoolPathFindsPackageDirectlyFromUpstream(t *testing.T) {
+	key, keyring := testKey(t)
+
+	control, err := apt.ParseStanza("Package: hello\nVersion: 1.0\nArchitecture: amd64\nSection: utils\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deb := []byte("fake deb content")
+	sum := sha256.Sum256(deb)
+	const upstreamFilename = "pool/main/h/hello/hello_1.0_amd64.deb"
+	stanza := apt.BuildPackagesStanza(control, upstreamFilename, int64(len(deb)), hex.EncodeToString(sum[:]), "")
+	stanzaStr, err := apt.StanzaString(stanza)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagesContent := []byte(stanzaStr)
+
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if _, err := gz.Write(packagesContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	gzSum := sha256.Sum256(gzBuf.Bytes())
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages.gz\n",
+		hex.EncodeToString(gzSum[:]), gzBuf.Len(),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages.gz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gzBuf.Bytes())
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := testConfig(srv.URL, keyring) // upstream Name: "test-upstream"
+	poolPath := model.PoolPath("debian", "trixie", "test-upstream", "utils", "hello", "1.0", "amd64")
+
+	p, err := avail.ResolvePoolPath(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie", poolPath)
+	if err != nil {
+		t.Fatalf("ResolvePoolPath: %v", err)
+	}
+	if p.Name != "hello" || p.Version != "1.0" {
+		t.Fatalf("resolved wrong package: %+v", p)
+	}
+	if p.PoolPath != poolPath {
+		t.Fatalf("resolved PoolPath = %q, want %q", p.PoolPath, poolPath)
+	}
+}
+
+// TestResolvePoolPathUnknownUpstreamFails is the bad-data counterpart: a pool
+// path naming an upstream not configured for this os/codename at all must
+// fail cleanly, not panic or silently match something else.
+func TestResolvePoolPathUnknownUpstreamFails(t *testing.T) {
+	_, keyring := testKey(t)
+	cfg := testConfig("http://127.0.0.1:1", keyring) // upstream Name: "test-upstream"
+
+	poolPath := model.PoolPath("debian", "trixie", "no-such-upstream", "utils", "hello", "1.0", "amd64")
+	if _, err := avail.ResolvePoolPath(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie", poolPath); err == nil {
+		t.Fatal("expected an error for a pool path naming an unconfigured upstream")
+	}
+}
+
+// TestResolvePoolPathWrongVersionFails proves ResolvePoolPath doesn't just
+// match on package name -- a pool path for a version the upstream doesn't
+// currently have (even though the same-named package does exist) must fail.
+func TestResolvePoolPathWrongVersionFails(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL, _ := buildFakeUpstream(t, key) // serves hello 1.0 only
+	cfg := testConfig(srvURL, keyring)
+
+	poolPath := model.PoolPath("debian", "trixie", "test-upstream", "", "hello", "9.9", "amd64")
+	if _, err := avail.ResolvePoolPath(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie", poolPath); err == nil {
+		t.Fatal("expected an error for a pool path naming a version the upstream doesn't have")
 	}
 }

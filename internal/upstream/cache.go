@@ -69,6 +69,26 @@ func NewIndexCache() *IndexCache {
 	return &IndexCache{entries: map[string]*indexCacheEntry{}}
 }
 
+// WithoutLocalState returns a new IndexCache that shares c's Valkey backing
+// (if any) but starts with no local entries. Every fast path in FetchIndex/
+// AdoptFromValkeyOutright/cachedForComparison checks this cache's local
+// entries map before ever consulting Valkey, so a caller sharing c directly
+// would silently keep re-serving c's own possibly-stale-or-incomplete local
+// copy (e.g. from a degraded build) forever, even though Valkey -- or the
+// real upstream -- already has the correct answer. Handing out a fresh local
+// map (while reusing the same underlying Valkey client/connection, so this
+// is cheap) forces a real check. Used by avail.ResolvePoolPath's live-path
+// fallback, which exists specifically to answer "does this actually exist
+// right now" independent of whatever this process's own cache believes.
+func (c *IndexCache) WithoutLocalState() *IndexCache {
+	c.mu.Lock()
+	v := c.valkey
+	c.mu.Unlock()
+	fresh := NewIndexCache()
+	fresh.valkey = v
+	return fresh
+}
+
 // get returns (entry, ok). The entry must not be mutated by callers.
 func (c *IndexCache) get(inReleaseURL string) (*indexCacheEntry, bool) {
 	c.mu.Lock()

@@ -824,6 +824,148 @@ signing:
 	return server.New(loaded, store, index, repoKey, nil, nil, nil, nil), store
 }
 
+// TestPoolPullThroughFallsBackToUpstreamWhenLiveIndexMisses is the direct
+// end-to-end regression test for the live-path fallback this session's
+// ubuntu-security incident motivated: a package added upstream *after*
+// debproxy already built and cached its live index for this layout (so the
+// cached av genuinely doesn't have it yet -- no rebuild has happened since)
+// must still be servable via pull-through, by checking the one upstream its
+// pool path names directly (avail.ResolvePoolPath), rather than being
+// rejected purely because this replica's last rebuild predates it.
+func TestPoolPullThroughFallsBackToUpstreamWhenLiveIndexMisses(t *testing.T) {
+	dir := t.TempDir()
+
+	upstreamPriv := filepath.Join(dir, "upstream.priv.asc")
+	upstreamPub := filepath.Join(dir, "upstream.pub.asc")
+	writeKeyPair(t, upstreamPriv, upstreamPub)
+	repoPriv := filepath.Join(dir, "repo.priv.asc")
+	writeKeyPair(t, repoPriv, "")
+	upstreamKey, err := signing.Load(upstreamPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	files := map[string][]byte{}
+
+	helloControl := "Package: hello\nVersion: 1.0\nArchitecture: amd64\nSection: utils\nMaintainer: T <t@example.com>\nDescription: hello\n"
+	helloDeb := buildDeb(t, helloControl)
+	const helloPath = "pool/main/h/hello/hello_1.0_amd64.deb"
+
+	worldControl := "Package: world\nVersion: 1.0\nArchitecture: amd64\nSection: utils\nMaintainer: T <t@example.com>\nDescription: world\n"
+	worldDeb := buildDeb(t, worldControl)
+	const worldPath = "pool/main/w/world/world_1.0_amd64.deb"
+
+	// publish sets the upstream's current Packages listing to exactly the
+	// given set of (control, path, deb) tuples -- called once with only
+	// hello, then again after adding world, without debproxy ever being told
+	// to refresh in between.
+	publish := func(entries ...[3]any) {
+		var packages bytes.Buffer
+		mu.Lock()
+		for _, e := range entries {
+			control, path, deb := e[0].(string), e[1].(string), e[2].([]byte)
+			packages.Write(packagesStanza(t, control, path, deb))
+			files["/"+path] = deb
+		}
+		gz := gzipBytes(t, packages.Bytes())
+		release := buildUpstreamRelease(packages.Bytes(), gz)
+		inRelease, err := upstreamKey.SignInline([]byte(release))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["/dists/trixie/main/binary-amd64/Packages"] = packages.Bytes()
+		files["/dists/trixie/main/binary-amd64/Packages.gz"] = gz
+		files["/dists/trixie/InRelease"] = inRelease
+		mu.Unlock()
+	}
+	publish([3]any{helloControl, helloPath, helloDeb}) // world doesn't exist yet
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		data, ok := files[r.URL.Path]
+		mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(data)
+	}))
+	defer upstream.Close()
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := fmt.Sprintf(`storage:
+  backend: filesystem
+  filesystem:
+    root: %s
+upstreams:
+  debian-main:
+    url: %s
+    keys: [%s]
+layouts:
+  - os: debian
+    architectures: [amd64]
+    codenames:
+      - codename: trixie
+        components:
+          - component: main
+            upstreams: [debian-main]
+signing:
+  private_key: %s
+`, filepath.Join(dir, "store"), upstream.URL, upstreamPub, repoPriv)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := storagefactory.New(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := deb822store.New(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoKey, err := signing.Load(repoPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(server.New(loaded, store, index, repoKey, nil, nil, nil, nil).Handler())
+	defer srv.Close()
+
+	// Build and cache the live index while only hello exists upstream.
+	helloResp, err := http.Get(srv.URL + "/live/debian/pool/debian/trixie/debian-main/utils/h/hello/hello_1.0_amd64.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helloResp.Body.Close()
+	if helloResp.StatusCode != http.StatusOK {
+		t.Fatalf("hello pull-through: status=%d", helloResp.StatusCode)
+	}
+
+	// Now world appears upstream -- debproxy is never told to refresh.
+	publish([3]any{helloControl, helloPath, helloDeb}, [3]any{worldControl, worldPath, worldDeb})
+
+	// world isn't in the live index debproxy already cached above, but the
+	// pool path alone should be enough to resolve and fetch it directly.
+	worldResp, err := http.Get(srv.URL + "/live/debian/pool/debian/trixie/debian-main/utils/w/world/world_1.0_amd64.deb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worldResp.Body.Close()
+	body, _ := io.ReadAll(worldResp.Body)
+	if worldResp.StatusCode != http.StatusOK {
+		t.Fatalf("world pull-through: status=%d body=%q -- a package added upstream after the live index was built should still resolve via the direct-upstream fallback, not 502", worldResp.StatusCode, body)
+	}
+	if !bytes.Equal(body, worldDeb) {
+		t.Fatal("world pull-through returned wrong bytes")
+	}
+}
+
 // TestPoolPullThroughStreamsBeforeUpstreamFinishes is the direct regression
 // test for the streaming pull-through fix: the client must receive bytes as
 // they arrive from upstream, not only after the whole upstream response (and
