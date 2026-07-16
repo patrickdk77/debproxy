@@ -797,6 +797,106 @@ func TestGCPoolSnapshotPackagesIndexProtects(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Tests: gcByHash
+// ---------------------------------------------------------------------------
+
+// currentReleaseContent builds a minimal plain Release file body declaring
+// one SHA256 entry for relPath, matching internal/publish's own format
+// closely enough for apt.ParseRelease.
+func currentReleaseContent(hash, relPath string) string {
+	return "Origin: Test\nCodename: jammy\nSuite: jammy\nSHA256:\n " + hash + " 100 " + relPath + "\n"
+}
+
+// TestGCByHashRemovesStaleSibling proves a by-hash sibling whose hash no
+// longer appears in current/'s own (freshly regenerated) Release gets
+// cleaned up -- the actual gap the user reported: GenerateSuite writes a
+// new by-hash sibling on every republish but never deletes the previous
+// generation's, and nothing else in the codebase ever has.
+func TestGCByHashRemovesStaleSibling(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	releasePath := "current/ubuntu/dists/jammy/Release"
+	store.publishedFiles[releasePath] = currentReleaseContent("newhash", "main/binary-amd64/Packages.gz")
+
+	current := "current/ubuntu/dists/jammy/main/binary-amd64/by-hash/SHA256/newhash"
+	stale := "current/ubuntu/dists/jammy/main/binary-amd64/by-hash/SHA256/oldhash"
+	store.publishedFiles[current] = "new content"
+	store.publishedFiles[stale] = "old content"
+	now := time.Now()
+	store.poolMTimes[current] = now.Add(-2 * time.Hour)
+	store.poolMTimes[stale] = now.Add(-2 * time.Hour) // past the GC grace period
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if !contains(store.deleted, stale) {
+		t.Errorf("stale by-hash sibling (not in current Release) should be deleted, deleted=%v", store.deleted)
+	}
+	if contains(store.deleted, current) {
+		t.Errorf("by-hash sibling referenced by current Release must not be deleted, deleted=%v", store.deleted)
+	}
+}
+
+// TestGCByHashRecentlyWrittenProtectedByGracePeriod proves a just-published
+// stale-looking sibling is still protected by gc_grace, same as gcPool/gcSrc.
+func TestGCByHashRecentlyWrittenProtectedByGracePeriod(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	releasePath := "current/ubuntu/dists/jammy/Release"
+	store.publishedFiles[releasePath] = currentReleaseContent("newhash", "main/binary-amd64/Packages.gz")
+
+	stale := "current/ubuntu/dists/jammy/main/binary-amd64/by-hash/SHA256/oldhash"
+	store.publishedFiles[stale] = "old content"
+	now := time.Now()
+	store.poolMTimes[stale] = now.Add(-10 * time.Minute) // within the 1h default grace period
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if contains(store.deleted, stale) {
+		t.Errorf("recently-written by-hash sibling should be protected by gc_grace, deleted=%v", store.deleted)
+	}
+}
+
+// TestGCByHashDoesNotTouchSnapshots proves gcByHash never scans or deletes
+// anything under a snapshot ID prefix, only current/: a snapshot's dists/
+// tree is written once (via the same GenerateSuite call) and never
+// republished in place, so it can never accumulate more than the one
+// generation of by-hash siblings it was created with in the first place.
+func TestGCByHashDoesNotTouchSnapshots(t *testing.T) {
+	store := newMockStorage()
+	idx := &mockIndex{}
+	s := newTestSyncer(store, idx, "ubuntu", "jammy")
+
+	snapID := "2024-01-01T00-00-00"
+	store.snapshots["ubuntu"] = []storage.SnapshotRef{
+		{ID: snapID, OS: "ubuntu", CreatedAt: time.Now().Add(-10 * 24 * time.Hour)},
+	}
+	// No current/ Release at all -- if gcByHash mistakenly folded snapshots
+	// into its scan the same way buildPoolRefSet does for pool files, this
+	// snapshot-only by-hash sibling (referenced by nothing in current/)
+	// would look orphaned and get deleted.
+	snapByHash := snapID + "/ubuntu/dists/jammy/main/binary-amd64/by-hash/SHA256/somehash"
+	store.publishedFiles[snapByHash] = "snapshot content"
+	now := time.Now()
+	store.poolMTimes[snapByHash] = now.Add(-2 * time.Hour)
+
+	if err := s.Cleanup(context.Background(), 0, 0, now); err != nil {
+		t.Fatalf("Cleanup error: %v", err)
+	}
+
+	if contains(store.deleted, snapByHash) {
+		t.Errorf("gcByHash must never touch snapshot by-hash files, deleted=%v", store.deleted)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Tests: gcSrc
 // ---------------------------------------------------------------------------
 

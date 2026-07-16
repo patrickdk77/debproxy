@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/metrics"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/storage"
@@ -63,6 +65,13 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 	}
 	slog.Info("cleanup: src GC complete", "orphaned_files_deleted", srcDeleted)
 	metrics.GCFilesDeletedTotal.Add(float64(srcDeleted))
+
+	byHashDeleted, err := s.gcByHash(ctx, now)
+	if err != nil {
+		return err
+	}
+	slog.Info("cleanup: by-hash GC complete", "orphaned_files_deleted", byHashDeleted)
+	metrics.GCFilesDeletedTotal.Add(float64(byHashDeleted))
 
 	tempRemoved, err := s.store.CleanupTempFiles(ctx, now.Add(-s.gcGracePeriod()))
 	if err != nil {
@@ -168,13 +177,15 @@ func (s *Syncer) gcGracePeriod() time.Duration {
 	return d
 }
 
-// deleteOrphans deletes each candidate, skipping any candidate written within
-// the configured GC grace period (see gcGracePeriod) since it may be
-// mid-flight for a concurrent cache write. candidates carry the ModTime the
-// caller already has on hand from listing (WalkPool/ListPublishedInfo), so
-// this doesn't issue a separate Stat per file. kind labels log lines (e.g.
-// "pool file", "src file"). Returns the number of files actually deleted.
-func (s *Syncer) deleteOrphans(ctx context.Context, kind string, candidates []storage.FileInfo, now time.Time) int {
+// deleteOrphans deletes each candidate via deleteFn (s.store.Delete for pool/
+// src files, s.store.DeletePublished for published dists/ files such as
+// by-hash siblings), skipping any candidate written within the configured GC
+// grace period (see gcGracePeriod) since it may be mid-flight for a
+// concurrent cache write. candidates carry the ModTime the caller already
+// has on hand from listing (WalkPool/ListPublishedInfo), so this doesn't
+// issue a separate Stat per file. kind labels log lines (e.g. "pool file",
+// "src file", "by-hash file"). Returns the number of files actually deleted.
+func (s *Syncer) deleteOrphans(ctx context.Context, kind string, candidates []storage.FileInfo, now time.Time, deleteFn func(context.Context, string) error) int {
 	grace := s.gcGracePeriod()
 	deleted := 0
 	for _, fi := range candidates {
@@ -182,7 +193,7 @@ func (s *Syncer) deleteOrphans(ctx context.Context, kind string, candidates []st
 			slog.Debug("cleanup: skipping recently-written "+kind+" this run", "path", fi.Path)
 			continue
 		}
-		if err := s.store.Delete(ctx, fi.Path); err != nil {
+		if err := deleteFn(ctx, fi.Path); err != nil {
 			slog.Warn("cleanup: delete orphaned "+kind+" failed", "path", fi.Path, "err", err)
 			continue
 		}
@@ -380,7 +391,7 @@ func (s *Syncer) gcPool(ctx context.Context, now time.Time) (int, error) {
 		return 0, nil
 	}
 
-	return s.deleteOrphans(ctx, "pool file", candidates, now), nil
+	return s.deleteOrphans(ctx, "pool file", candidates, now, s.store.Delete), nil
 }
 
 // buildPoolRefSet returns the set of all pool Filename: paths that must be kept.
@@ -509,7 +520,7 @@ func (s *Syncer) gcSrc(ctx context.Context, now time.Time) (int, error) {
 		return 0, nil
 	}
 
-	return s.deleteOrphans(ctx, "src file", candidates, now), nil
+	return s.deleteOrphans(ctx, "src file", candidates, now, s.store.Delete), nil
 }
 
 // buildSrcRefSet returns the set of src/ paths that must be kept.
@@ -631,6 +642,110 @@ func (s *Syncer) scanSourcesRefs(ctx context.Context, relPath string, ref map[st
 	}
 	flush() // handle final stanza with no trailing blank line
 	return sc.Err()
+}
+
+// gcByHash removes stale by-hash sibling files under current/ -- e.g.
+// current/debian/dists/trixie/main/binary-amd64/by-hash/SHA256/<hash>.
+// GenerateSuite (internal/publish) writes a fresh by-hash sibling every time
+// a suite is republished but never deletes the previous generation's, and
+// nothing else in the codebase ever has -- so these accumulate on disk
+// forever, one generation's worth of Packages/Sources per republish cycle,
+// until this runs.
+//
+// Deliberately scoped to current/ only, unlike gcPool/gcSrc: a snapshot's
+// dists/ tree is written once at snapshot time via the exact same
+// GenerateSuite call and never republished in place afterward, so it can
+// never accumulate more than the one generation of by-hash siblings it was
+// created with -- there is nothing to GC there. /live never writes by-hash
+// files to storage at all (SkipByHash is always true for it -- see
+// SuiteInput.SkipByHash's doc comment; by-hash requests are resolved
+// virtually from the in-memory Release listing instead). current/ is the
+// only tree GenerateSuite rewrites in place, so it's the only one where old
+// siblings go stale.
+func (s *Syncer) gcByHash(ctx context.Context, now time.Time) (int, error) {
+	ref, err := s.buildByHashRefSet(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	files, err := s.store.ListPublishedInfo(ctx, "current")
+	if err != nil {
+		return 0, fmt.Errorf("list current for by-hash gc: %w", err)
+	}
+
+	var candidates []storage.FileInfo
+	var total int
+	for _, fi := range files {
+		if !isByHashPath(fi.Path) {
+			continue
+		}
+		total++
+		if !ref[fi.Path] {
+			candidates = append(candidates, fi)
+		}
+	}
+
+	if checkOrphanRatio("by-hash file", total, len(candidates)) {
+		return 0, nil
+	}
+
+	return s.deleteOrphans(ctx, "by-hash file", candidates, now, s.store.DeletePublished), nil
+}
+
+// isByHashPath reports whether relPath is a by-hash sibling (as opposed to
+// the plain-named index file it's a copy of).
+func isByHashPath(relPath string) bool {
+	return strings.Contains(relPath, "/by-hash/SHA256/")
+}
+
+// buildByHashRefSet returns every by-hash path that current/'s own,
+// currently-published Release files declare -- built fresh from whatever
+// republish most recently ran, so a by-hash sibling that's still referenced
+// by the Release a client might have just fetched is always protected: the
+// ref set is only ever stale in a client's favor (it reflects what's
+// current right now), never in a way that could delete something still
+// live. Scoped to current/ only -- see gcByHash's doc comment for why
+// snapshots and /live don't need this.
+func (s *Syncer) buildByHashRefSet(ctx context.Context) (map[string]bool, error) {
+	ref := map[string]bool{}
+	files, err := s.store.ListPublished(ctx, "current")
+	if err != nil {
+		return nil, fmt.Errorf("list current for by-hash ref set: %w", err)
+	}
+	for _, f := range files {
+		if path.Base(f) != "Release" {
+			continue
+		}
+		if err := s.addByHashRefsFromRelease(ctx, f, ref); err != nil {
+			slog.Warn("cleanup: parse Release for by-hash refs", "path", f, "err", err)
+		}
+	}
+	return ref, nil
+}
+
+// addByHashRefsFromRelease parses the plain Release file at relPath (e.g.
+// "current/debian/dists/trixie/Release") and records the by-hash path for
+// every file it lists with a SHA256 digest, matching byHashPath's naming in
+// internal/publish exactly (one by-hash/SHA256/ directory per index file's
+// own directory).
+func (s *Syncer) addByHashRefsFromRelease(ctx context.Context, relPath string, ref map[string]bool) error {
+	rc, err := s.store.OpenPublished(ctx, relPath)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	rel, err := apt.ParseRelease(rc)
+	if err != nil {
+		return err
+	}
+	dir := path.Dir(relPath)
+	for _, f := range rel.Files {
+		if f.SHA256 == "" {
+			continue
+		}
+		ref[path.Join(dir, path.Dir(f.Path), "by-hash", "SHA256", f.SHA256)] = true
+	}
+	return nil
 }
 
 // osNames returns the sorted distinct OS names from the resolved layouts.
