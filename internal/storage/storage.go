@@ -14,6 +14,14 @@ import (
 
 var ErrNotImplemented = errors.New("storage backend not implemented")
 
+// ErrAccessDenied indicates a backend refused an operation for permission
+// reasons (e.g. an S3 403 on a write, list, or bucket operation). Callers can
+// match it with errors.Is to distinguish a permissions failure from a missing
+// object (fs.ErrNotExist) or a transient error. Not-found is deliberately kept
+// separate: backends report a missing object as fs.ErrNotExist so os.IsNotExist
+// works uniformly.
+var ErrAccessDenied = errors.New("access denied")
+
 // CleanRelPath cleans a caller-supplied relative path and rejects any attempt
 // to escape upward (a leading ".." remaining after cleaning) via ".."
 // segments. A leading "/" is stripped rather than rejected, so callers get a

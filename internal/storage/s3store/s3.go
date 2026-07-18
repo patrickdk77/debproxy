@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path"
 	"sort"
 	"strings"
@@ -23,9 +24,24 @@ import (
 	"github.com/debproxy/debproxy/internal/storage"
 )
 
+// s3API is the subset of the S3 client the Store uses. Depending on a narrow
+// interface (which *s3.Client satisfies) rather than the concrete client is
+// what makes every Store method unit-testable with a fake -- the concrete
+// client cannot be faked, which is why the backend's error handling previously
+// had no test coverage at all. It also satisfies s3.ListObjectsV2APIClient, so
+// the paginators accept it directly.
+type s3API interface {
+	HeadBucket(ctx context.Context, in *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
+	PutObject(ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(ctx context.Context, in *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	HeadObject(ctx context.Context, in *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
 // Store implements S3-backed pool and published trees.
 type Store struct {
-	client *s3.Client
+	client s3API
 	bucket string
 	prefix string
 }
@@ -44,8 +60,20 @@ func New(cfg config.S3Config) (*Store, error) {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
 
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		// Custom endpoint + path-style support for S3-compatible providers
+		// (R2/MinIO/B2/Spaces/Ceph). Both are no-ops when unset, preserving
+		// standard AWS behavior.
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+		}
+		if cfg.ForcePathStyle {
+			o.UsePathStyle = true
+		}
+	})
+
 	return &Store{
-		client: s3.NewFromConfig(awsCfg),
+		client: client,
 		bucket: cfg.Bucket,
 		prefix: strings.Trim(cfg.Prefix, "/"),
 	}, nil
@@ -53,7 +81,7 @@ func New(cfg config.S3Config) (*Store, error) {
 
 func (s *Store) Ping(ctx context.Context) error {
 	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)})
-	return err
+	return wrapS3("headbucket", s.bucket, err)
 }
 
 func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size int64) error {
@@ -80,10 +108,12 @@ func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size 
 	}
 	_, err = s.client.PutObject(ctx, input)
 	if err != nil {
+		// IfNoneMatch=* makes this write-once: a PreconditionFailed means the
+		// object already exists, which is success for our purposes.
 		if isPreconditionFailed(err) {
 			return nil
 		}
-		return err
+		return wrapS3("put", poolPath, err)
 	}
 	return nil
 }
@@ -95,7 +125,7 @@ func (s *Store) Open(ctx context.Context, poolPath string) (io.ReadCloser, error
 	}
 	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
-		return nil, err
+		return nil, wrapObjectRead("open", poolPath, err)
 	}
 	return output.Body, nil
 }
@@ -107,7 +137,7 @@ func (s *Store) Stat(ctx context.Context, poolPath string) (storage.FileInfo, er
 	}
 	meta, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
 	if err != nil {
-		return storage.FileInfo{}, err
+		return storage.FileInfo{}, wrapObjectRead("stat", poolPath, err)
 	}
 	return storage.FileInfo{Path: poolPath, Size: aws.ToInt64(meta.ContentLength), ModTime: aws.ToTime(meta.LastModified)}, nil
 }
@@ -121,10 +151,12 @@ func (s *Store) Exists(ctx context.Context, poolPath string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if isNotFound(err) {
+	// A missing object (404, or 403 without ListBucket) means "does not exist";
+	// a credential failure or other error is surfaced.
+	if isMissingOnRead(err) {
 		return false, nil
 	}
-	return false, err
+	return false, wrapS3("stat", poolPath, err)
 }
 
 func (s *Store) Delete(ctx context.Context, poolPath string) error {
@@ -132,8 +164,10 @@ func (s *Store) Delete(ctx context.Context, poolPath string) error {
 	if err != nil {
 		return err
 	}
+	// S3 DeleteObject is idempotent: deleting an absent key returns success, so
+	// there is no not-found case to handle here.
 	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
-	return err
+	return wrapS3("delete", poolPath, err)
 }
 
 func (s *Store) ComputeChecksums(ctx context.Context, poolPath string) (model.Checksums, error) {
@@ -185,7 +219,7 @@ func (s *Store) ListPublishedInfo(ctx context.Context, prefix string) ([]storage
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return nil, wrapS3("list", prefix, err)
 		}
 		for _, obj := range page.Contents {
 			if obj.Key == nil {
@@ -224,7 +258,7 @@ func (s *Store) WalkPool(ctx context.Context, fn func(info storage.FileInfo) err
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return err
+			return wrapS3("list", "pool/", err)
 		}
 		for _, obj := range page.Contents {
 			if obj.Key == nil {
@@ -276,7 +310,7 @@ func (s *Store) WriteFile(ctx context.Context, relPath string, r io.Reader, size
 		input.CacheControl = aws.String(cacheControl)
 	}
 	_, err = s.client.PutObject(ctx, input)
-	return err
+	return wrapS3("put", relPath, err)
 }
 
 func (s *Store) DeletePublished(ctx context.Context, relPath string) error {
@@ -285,7 +319,7 @@ func (s *Store) DeletePublished(ctx context.Context, relPath string) error {
 		return err
 	}
 	_, err = s.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
-	return err
+	return wrapS3("delete", relPath, err)
 }
 
 func (s *Store) OpenPublished(ctx context.Context, relPath string) (io.ReadCloser, error) {
@@ -309,7 +343,7 @@ func (s *Store) ListSnapshots(ctx context.Context, osName string) ([]storage.Sna
 	for paginator := s3.NewListObjectsV2Paginator(s.client, input); paginator.HasMorePages(); {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return nil, err
+			return nil, wrapS3("list", rootPrefix, err)
 		}
 		for _, cp := range page.CommonPrefixes {
 			if cp.Prefix == nil {
@@ -422,7 +456,7 @@ func (s *Store) snapshotHasOS(ctx context.Context, snapshotID, osName string) (b
 	input := &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), MaxKeys: aws.Int32(1)}
 	page, err := s.client.ListObjectsV2(ctx, input)
 	if err != nil {
-		return false, err
+		return false, wrapS3("list", prefix, err)
 	}
 	return len(page.Contents) > 0, nil
 }
@@ -437,15 +471,97 @@ func parseSnapshotID(name string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func isNotFound(err error) bool {
+// s3ErrorCode returns the S3/smithy API error code, or "" if err is not an
+// API error (network error, context cancellation, etc.).
+func s3ErrorCode(err error) string {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.ErrorCode() == "NotFound" || apiErr.ErrorCode() == "NoSuchKey"
+		return apiErr.ErrorCode()
+	}
+	return ""
+}
+
+// isNotFound reports a definitive "object/bucket does not exist" response.
+func isNotFound(err error) bool {
+	switch s3ErrorCode(err) {
+	case "NotFound", "NoSuchKey", "NoSuchBucket":
+		return true
 	}
 	return false
 }
 
+// isForbidden reports a 403 caused by object/prefix-scoped permissions. On a
+// bucket whose IAM policy omits s3:ListBucket, S3 answers a GET/HEAD of a
+// MISSING key with 403 AccessDenied instead of 404 -- so for object reads this
+// is indistinguishable from, and treated as, not-found (see isMissingOnRead).
+func isForbidden(err error) bool {
+	switch s3ErrorCode(err) {
+	case "AccessDenied", "Forbidden":
+		return true
+	}
+	return false
+}
+
+// isCredentialFailure reports a total-auth failure (bad/expired/mismatched
+// credentials or a disabled account). These are NOT per-key permission answers
+// and must never be masked as not-found: every request would fail, so surfacing
+// them loudly is the only way to diagnose the misconfiguration.
+func isCredentialFailure(err error) bool {
+	switch s3ErrorCode(err) {
+	case "InvalidAccessKeyId", "SignatureDoesNotMatch", "ExpiredToken",
+		"InvalidToken", "TokenRefreshRequired", "AllAccessDisabled", "AccountProblem":
+		return true
+	}
+	return false
+}
+
+// isMissingOnRead reports whether a GET/HEAD object error should be treated as
+// "object not present". It covers both a genuine 404 and the 403 that S3
+// returns for a missing key when the caller lacks s3:ListBucket -- but never a
+// credential failure, which would otherwise make every read look like a miss.
+func isMissingOnRead(err error) bool {
+	if isCredentialFailure(err) {
+		return false
+	}
+	return isNotFound(err) || isForbidden(err)
+}
+
 func isPreconditionFailed(err error) bool {
-	var apiErr smithy.APIError
-	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed"
+	return s3ErrorCode(err) == "PreconditionFailed"
+}
+
+// wrapObjectRead normalizes a GetObject/HeadObject error: a missing object
+// (404, or 403 when ListBucket is absent) becomes an fs.PathError wrapping
+// fs.ErrNotExist so os.IsNotExist / errors.Is(err, fs.ErrNotExist) behave
+// exactly as with the filesystem backend. Everything else is wrapped with
+// context via wrapS3 (credential failures included).
+func wrapObjectRead(op, key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isMissingOnRead(err) {
+		return &fs.PathError{Op: op, Path: key, Err: fs.ErrNotExist}
+	}
+	return wrapS3(op, key, err)
+}
+
+// wrapS3 normalizes a non-object-read S3 error (writes, deletes, lists, bucket
+// ops): definitive not-found becomes fs.ErrNotExist; a 403/credential failure
+// is annotated with storage.ErrAccessDenied so a permissions misconfiguration
+// is diagnosable (and matchable with errors.Is); anything else is annotated
+// with the operation and key. The original error is preserved in the chain
+// (%w) so smithy code/precondition inspection upstream keeps working. Unlike
+// object reads, a 403 here is a real denial (you cannot list/write), not a
+// disguised not-found.
+func wrapS3(op, key string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isNotFound(err) {
+		return &fs.PathError{Op: op, Path: key, Err: fs.ErrNotExist}
+	}
+	if isForbidden(err) || isCredentialFailure(err) {
+		return fmt.Errorf("s3 %s %q: %w: %w", op, key, storage.ErrAccessDenied, err)
+	}
+	return fmt.Errorf("s3 %s %q: %w", op, key, err)
 }

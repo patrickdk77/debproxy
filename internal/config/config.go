@@ -376,6 +376,17 @@ type S3Config struct {
 	Bucket string `yaml:"bucket"`
 	Region string `yaml:"region"`
 	Prefix string `yaml:"prefix"`
+	// Endpoint overrides the S3 service endpoint for S3-compatible providers
+	// (Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces, Ceph RGW, ...).
+	// Empty uses AWS's regional endpoint. Credentials come from the standard
+	// AWS chain (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env vars, shared
+	// config, or instance role), so no secrets live in this file.
+	Endpoint string `yaml:"endpoint"`
+	// ForcePathStyle uses path-style addressing (endpoint/bucket/key) instead of
+	// virtual-hosted (bucket.endpoint/key). Required by most non-AWS S3
+	// implementations (e.g. MinIO) and by AWS endpoints when the bucket name is
+	// not DNS-compatible.
+	ForcePathStyle bool `yaml:"force_path_style"`
 }
 
 type SigningConfig struct {

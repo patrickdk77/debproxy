@@ -97,7 +97,12 @@ storage:
   #   bucket: my-debproxy-bucket
   #   region: us-east-1
   #   prefix: ""          # optional path prefix inside the bucket
-  
+  #   # S3-compatible providers (Cloudflare R2, MinIO, Backblaze B2, DO Spaces):
+  #   endpoint: ""          # e.g. https://<accountid>.r2.cloudflarestorage.com
+  #   force_path_style: false  # true for MinIO and most non-AWS endpoints
+  #   # Credentials come from the standard AWS chain (AWS_ACCESS_KEY_ID /
+  #   # AWS_SECRET_ACCESS_KEY env vars, shared config, or instance role).
+
   # compression controls what formats are used for Release/Packages files.
   # Set to false to disable a format, true to use the built-in default, or an
   # integer to select an explicit level.
