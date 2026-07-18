@@ -100,6 +100,10 @@ storage:
   #   # S3-compatible providers (Cloudflare R2, MinIO, Backblaze B2, DO Spaces):
   #   endpoint: ""          # e.g. https://<accountid>.r2.cloudflarestorage.com
   #   force_path_style: false  # true for MinIO and most non-AWS endpoints
+  #   disable_acl: false    # true if the bucket has ACLs disabled (Object
+  #                         # Ownership = Bucket owner enforced). When false,
+  #                         # ACLs are attempted and disabled automatically on
+  #                         # the first AccessControlListNotSupported error.
   #   # Credentials come from the standard AWS chain (AWS_ACCESS_KEY_ID /
   #   # AWS_SECRET_ACCESS_KEY env vars, shared config, or instance role).
 

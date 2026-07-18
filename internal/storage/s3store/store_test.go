@@ -1,6 +1,7 @@
 package s3store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -21,7 +22,7 @@ import (
 type fakeS3 struct {
 	headObject   func() (*s3.HeadObjectOutput, error)
 	getObject    func() (*s3.GetObjectOutput, error)
-	putObject    func() (*s3.PutObjectOutput, error)
+	putObject    func(*s3.PutObjectInput) (*s3.PutObjectOutput, error)
 	deleteObject func() (*s3.DeleteObjectOutput, error)
 	headBucket   func() (*s3.HeadBucketOutput, error)
 	listObjects  func() (*s3.ListObjectsV2Output, error)
@@ -33,8 +34,8 @@ func (f *fakeS3) HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Op
 func (f *fakeS3) GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	return f.getObject()
 }
-func (f *fakeS3) PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
-	return f.putObject()
+func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	return f.putObject(in)
 }
 func (f *fakeS3) DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
 	return f.deleteObject()
@@ -128,19 +129,76 @@ func TestPutFile_ErrorMapping(t *testing.T) {
 	ctx := context.Background()
 
 	// Write-once: a PreconditionFailed (object already exists) is success.
-	exists := storeWith(&fakeS3{putObject: func() (*s3.PutObjectOutput, error) { return nil, apiErr("PreconditionFailed") }})
+	exists := storeWith(&fakeS3{putObject: func(*s3.PutObjectInput) (*s3.PutObjectOutput, error) { return nil, apiErr("PreconditionFailed") }})
 	if err := exists.PutFile(ctx, "pool/x.deb", strings.NewReader("x"), 1); err != nil {
 		t.Errorf("PutFile(PreconditionFailed) = %v, want nil (already exists)", err)
 	}
 
-	denied := storeWith(&fakeS3{putObject: func() (*s3.PutObjectOutput, error) { return nil, apiErr("AccessDenied") }})
+	denied := storeWith(&fakeS3{putObject: func(*s3.PutObjectInput) (*s3.PutObjectOutput, error) { return nil, apiErr("AccessDenied") }})
 	if err := denied.PutFile(ctx, "pool/x.deb", strings.NewReader("x"), 1); !errors.Is(err, storage.ErrAccessDenied) {
 		t.Errorf("PutFile(AccessDenied) = %v, want storage.ErrAccessDenied", err)
 	}
 
-	ok := storeWith(&fakeS3{putObject: func() (*s3.PutObjectOutput, error) { return &s3.PutObjectOutput{}, nil }})
+	ok := storeWith(&fakeS3{putObject: func(*s3.PutObjectInput) (*s3.PutObjectOutput, error) { return &s3.PutObjectOutput{}, nil }})
 	if err := ok.PutFile(ctx, "pool/x.deb", strings.NewReader("x"), 1); err != nil {
 		t.Errorf("PutFile(success) = %v", err)
+	}
+}
+
+// TestPutFile_ACLFallback verifies the bucket-owner-enforced recovery: the
+// first upload attempts an ACL, the bucket rejects it, and the store retries
+// the same upload without an ACL, then never sends an ACL again.
+func TestPutFile_ACLFallback(t *testing.T) {
+	ctx := context.Background()
+
+	var acls []string // ACL value seen on each PutObject attempt
+	firstAttempt := true
+	fake := &fakeS3{putObject: func(in *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+		acls = append(acls, string(in.ACL))
+		if firstAttempt {
+			firstAttempt = false
+			return nil, apiErr("AccessControlListNotSupported")
+		}
+		return &s3.PutObjectOutput{}, nil
+	}}
+	s := storeWith(fake)
+
+	// A seekable body so the retry can rewind (bytes.Reader is an io.Seeker).
+	if err := s.PutFile(ctx, "pool/x.deb", bytes.NewReader([]byte("data")), 4); err != nil {
+		t.Fatalf("PutFile with ACL fallback = %v, want success", err)
+	}
+	if len(acls) != 2 {
+		t.Fatalf("PutObject attempts = %d, want 2 (with-ACL then retry-without)", len(acls))
+	}
+	if acls[0] == "" {
+		t.Error("first attempt sent no ACL, want the public-read ACL")
+	}
+	if acls[1] != "" {
+		t.Errorf("retry attempt sent ACL %q, want none", acls[1])
+	}
+
+	// A subsequent upload must skip the ACL entirely -- no wasted round trip.
+	if err := s.PutFile(ctx, "pool/y.deb", bytes.NewReader([]byte("more")), 4); err != nil {
+		t.Fatalf("second PutFile = %v", err)
+	}
+	if len(acls) != 3 || acls[2] != "" {
+		t.Errorf("after ACL disabled, attempts=%d last ACL=%q; want 1 more attempt with no ACL", len(acls), acls[len(acls)-1])
+	}
+}
+
+// TestPutFile_ACLFallbackNonSeekable documents that a non-seekable body cannot
+// be retried: the recovery needs to rewind, so such a body yields a clear error
+// rather than a silent truncated re-upload.
+func TestPutFile_ACLFallbackNonSeekable(t *testing.T) {
+	ctx := context.Background()
+	fake := &fakeS3{putObject: func(*s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+		return nil, apiErr("AccessControlListNotSupported")
+	}}
+	s := storeWith(fake)
+	// A bare Reader (no Seek) wrapping a reader.
+	body := struct{ io.Reader }{strings.NewReader("data")}
+	if err := s.PutFile(ctx, "pool/x.deb", body, 4); err == nil {
+		t.Error("PutFile(non-seekable body, ACL rejected) = nil, want a clear retry error")
 	}
 }
 

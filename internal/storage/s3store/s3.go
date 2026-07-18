@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"path"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -44,6 +46,10 @@ type Store struct {
 	client s3API
 	bucket string
 	prefix string
+	// aclDisabled is set once the bucket rejects object ACLs (Object Ownership
+	// = Bucket owner enforced). After that, no upload sends an ACL again for
+	// the life of the process. See putObject.
+	aclDisabled atomic.Bool
 }
 
 // New returns an S3 storage backend.
@@ -72,11 +78,18 @@ func New(cfg config.S3Config) (*Store, error) {
 		}
 	})
 
-	return &Store{
+	st := &Store{
 		client: client,
 		bucket: cfg.Bucket,
 		prefix: strings.Trim(cfg.Prefix, "/"),
-	}, nil
+	}
+	// Operators who know their bucket has ACLs disabled can set disable_acl to
+	// skip even the one-time attempt-and-fall-back; otherwise it is discovered
+	// automatically on the first upload (see putObject).
+	if cfg.DisableACL {
+		st.aclDisabled.Store(true)
+	}
+	return st, nil
 }
 
 func (s *Store) Ping(ctx context.Context) error {
@@ -106,7 +119,7 @@ func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size 
 	if cacheControl != "" {
 		input.CacheControl = aws.String(cacheControl)
 	}
-	_, err = s.client.PutObject(ctx, input)
+	_, err = s.putObject(ctx, input)
 	if err != nil {
 		// IfNoneMatch=* makes this write-once: a PreconditionFailed means the
 		// object already exists, which is success for our purposes.
@@ -116,6 +129,47 @@ func (s *Store) PutFile(ctx context.Context, poolPath string, r io.Reader, size 
 		return wrapS3("put", poolPath, err)
 	}
 	return nil
+}
+
+// putObject issues a PutObject, transparently recovering from a bucket that has
+// ACLs disabled (Object Ownership = Bucket owner enforced). It sends the
+// configured ACL on the first attempt; if the bucket rejects ACLs
+// (AccessControlListNotSupported), it flags the bucket so no future upload ever
+// sends an ACL again (process-wide), then retries this one upload without it.
+// Such buckets grant public access via bucket policy, so dropping the object
+// ACL is the correct behavior. The retry rewinds the body, which requires it to
+// be seekable -- every caller passes a seekable reader (bytes/strings reader or
+// a file), and the AWS SDK likewise requires seekable bodies to retry.
+func (s *Store) putObject(ctx context.Context, input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
+	if s.aclDisabled.Load() {
+		input.ACL = ""
+	}
+	out, err := s.client.PutObject(ctx, input)
+	if err == nil || input.ACL == "" || !isACLNotSupported(err) {
+		return out, err
+	}
+	if s.aclDisabled.CompareAndSwap(false, true) {
+		slog.Warn("s3 bucket does not allow ACLs; disabling object ACLs for all future uploads",
+			"bucket", s.bucket, "key", aws.ToString(input.Key))
+	}
+	input.ACL = ""
+	if rerr := rewindBody(input.Body); rerr != nil {
+		return nil, fmt.Errorf("retry without ACL after AccessControlListNotSupported: %w", rerr)
+	}
+	return s.client.PutObject(ctx, input)
+}
+
+// rewindBody seeks an upload body back to the start so it can be re-sent.
+func rewindBody(body io.Reader) error {
+	if body == nil {
+		return nil
+	}
+	seeker, ok := body.(io.Seeker)
+	if !ok {
+		return errors.New("upload body is not seekable")
+	}
+	_, err := seeker.Seek(0, io.SeekStart)
+	return err
 }
 
 func (s *Store) Open(ctx context.Context, poolPath string) (io.ReadCloser, error) {
@@ -309,7 +363,7 @@ func (s *Store) WriteFile(ctx context.Context, relPath string, r io.Reader, size
 	if cacheControl != "" {
 		input.CacheControl = aws.String(cacheControl)
 	}
-	_, err = s.client.PutObject(ctx, input)
+	_, err = s.putObject(ctx, input)
 	return wrapS3("put", relPath, err)
 }
 
@@ -528,6 +582,12 @@ func isMissingOnRead(err error) bool {
 
 func isPreconditionFailed(err error) bool {
 	return s3ErrorCode(err) == "PreconditionFailed"
+}
+
+// isACLNotSupported reports the bucket rejecting an object ACL because ACLs are
+// disabled on it (Object Ownership = Bucket owner enforced).
+func isACLNotSupported(err error) bool {
+	return s3ErrorCode(err) == "AccessControlListNotSupported"
 }
 
 // wrapObjectRead normalizes a GetObject/HeadObject error: a missing object

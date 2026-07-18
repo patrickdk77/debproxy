@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/debproxy/debproxy/internal/config"
 	"github.com/debproxy/debproxy/internal/storage/s3store"
@@ -156,5 +157,36 @@ func TestS3Integration_RealServer(t *testing.T) {
 	}
 	if ok, _ := store.Exists(ctx, relPath); ok {
 		t.Error("Exists after DeletePublished = true, want false")
+	}
+
+	// --- ACLs-disabled bucket (Object Ownership = Bucket owner enforced) ---
+	// A store's default upload sends a public-read ACL; on such a bucket the
+	// upload must still succeed via the automatic no-ACL fallback.
+	const enforcedBucket = "debproxy-it-noacl"
+	_, err = admin.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket:          aws.String(enforcedBucket),
+		ObjectOwnership: types.ObjectOwnershipBucketOwnerEnforced,
+	})
+	if err != nil {
+		t.Logf("skip ACL-disabled sub-test: MinIO did not accept BucketOwnerEnforced: %v", err)
+		return
+	}
+	noACL, err := s3store.New(config.S3Config{
+		Bucket: enforcedBucket, Region: "us-east-1", Endpoint: endpoint, ForcePathStyle: true,
+	})
+	if err != nil {
+		t.Fatalf("s3store.New(enforced): %v", err)
+	}
+	if err := noACL.PutFile(ctx, poolPath, bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Errorf("PutFile on ACLs-disabled bucket = %v, want success (no-ACL fallback)", err)
+	}
+	rc, err = noACL.Open(ctx, poolPath)
+	if err != nil {
+		t.Fatalf("Open on ACLs-disabled bucket: %v", err)
+	}
+	got, _ = io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, payload) {
+		t.Errorf("readback on ACLs-disabled bucket = %q, want %q", got, payload)
 	}
 }

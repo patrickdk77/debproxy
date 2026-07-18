@@ -387,6 +387,11 @@ type S3Config struct {
 	// implementations (e.g. MinIO) and by AWS endpoints when the bucket name is
 	// not DNS-compatible.
 	ForcePathStyle bool `yaml:"force_path_style"`
+	// DisableACL skips sending object ACLs entirely. Set it for buckets with
+	// ACLs disabled (Object Ownership = Bucket owner enforced), where public
+	// access is granted by bucket policy. When false, ACL use is attempted and,
+	// if the bucket rejects ACLs, disabled automatically after the first upload.
+	DisableACL bool `yaml:"disable_acl"`
 }
 
 type SigningConfig struct {
