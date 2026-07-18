@@ -15,6 +15,7 @@ import (
 
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/publish"
+	"github.com/debproxy/debproxy/internal/signing"
 	"github.com/debproxy/debproxy/internal/webhook"
 )
 
@@ -711,6 +712,15 @@ func loadKeyring(paths []string) (openpgp.EntityList, error) {
 		if err != nil {
 			return nil, fmt.Errorf("key %q: %w", p, err)
 		}
+		// A file that parsed cleanly but carries no keys (an empty file, or
+		// an empty keyring like Debian/Ubuntu's shipped *-removed-keys.gpg
+		// placeholders) is tolerated: it simply contributes nothing. The
+		// at-least-one-key invariant below still guards against an upstream
+		// left with no verification key at all.
+		if len(keys) == 0 {
+			slog.Warn("key file contains no OpenPGP keys, skipping", "path", p)
+			continue
+		}
 		entities = append(entities, keys...)
 	}
 	if len(entities) == 0 {
@@ -719,28 +729,27 @@ func loadKeyring(paths []string) (openpgp.EntityList, error) {
 	return entities, nil
 }
 
-// readKeyFile reads an OpenPGP public keyring from path, accepting both
-// ASCII-armored (.asc) and binary (.gpg) formats. It tries armored first and
-// falls back to binary if the armored parse fails.
+// readKeyFile reads an OpenPGP keyring from path, accepting both ASCII-armored
+// (.asc) and binary (.gpg) formats and both public and secret keyrings. An
+// empty file or a valid keyring that happens to hold no keys returns an empty
+// list without error, so callers can tolerate empty placeholder keyrings; only
+// genuinely unreadable or malformed data is an error.
 func readKeyFile(path string) (openpgp.EntityList, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
-	// Try ASCII-armored first (covers .asc and armored .gpg files).
-	keys, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(data))
-	if err == nil && len(keys) > 0 {
-		return keys, nil
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, nil // empty file: no keys, not an error
 	}
 
-	// Fall back to binary packet format.
-	keys, err = openpgp.ReadKeyRing(bytes.NewReader(data))
+	// signing.ReadKeyring accepts armored or binary, public or secret keyrings,
+	// and tolerates keys whose User ID self-signatures do not verify (common in
+	// real repository keys). Repository trust is enforced later when a Release
+	// signature is checked against these keys, not at load time.
+	keys, err := signing.ReadKeyring(data)
 	if err != nil {
 		return nil, fmt.Errorf("not a valid armored or binary OpenPGP keyring: %w", err)
-	}
-	if len(keys) == 0 {
-		return nil, fmt.Errorf("file contains no OpenPGP keys")
 	}
 	return keys, nil
 }

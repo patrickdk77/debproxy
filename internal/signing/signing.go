@@ -29,15 +29,16 @@ type FileWriter interface {
 	WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error
 }
 
-// Load reads an armored OpenPGP private key from path.
+// Load reads an OpenPGP private key from path, accepting armored (.asc) or
+// binary (.gpg) input and tolerating keys whose User ID self-signatures do not
+// verify (see ReadKeyring): only the private key material is needed to sign.
 func Load(path string) (*Key, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open signing key: %w", err)
 	}
-	defer f.Close()
 
-	list, err := openpgp.ReadArmoredKeyRing(f)
+	list, err := ReadKeyring(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse signing key: %w", err)
 	}
