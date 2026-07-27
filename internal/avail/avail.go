@@ -240,7 +240,12 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 
 	// Phase 1: run buildPkg for each (result, arch) pair in parallel.
 	// Each goroutine builds its own private map  -- no concurrent writes to shared state.
+	// order is the producing upstream's index in jobs, i.e. its position
+	// in the layout's configured upstream list. Carried purely so the
+	// merge below can run in a fixed order -- see the sort after
+	// wg2.Wait().
 	type archEntry struct {
+		order     int
 		component string
 		arch      string
 		pkgs      map[string]Pkg
@@ -255,13 +260,13 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 	entries := make([]archEntry, 0, nPairs)
 	var entMu sync.Mutex
 	var wg2 sync.WaitGroup
-	for _, r := range results {
+	for i, r := range results {
 		if r.idx == nil {
 			continue
 		}
 		for arch, stanzas := range r.idx.ByArch {
 			wg2.Add(1)
-			r2, arch2, stanzas2 := r, arch, stanzas
+			i2, r2, arch2, stanzas2 := i, r, arch, stanzas
 			go func() {
 				defer wg2.Done()
 				dest := make(map[string]Pkg, len(stanzas2))
@@ -276,12 +281,40 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 					dest[p.Name] = p
 				}
 				entMu.Lock()
-				entries = append(entries, archEntry{r2.component, arch2, dest, r2.idx.HasStaleMismatch})
+				entries = append(entries, archEntry{i2, r2.component, arch2, dest, r2.idx.HasStaleMismatch})
 				entMu.Unlock()
 			}()
 		}
 	}
 	wg2.Wait()
+
+	// Merge in a fixed order: configured-upstream position, then arch.
+	// entries is appended to from the concurrent goroutines above, so its
+	// natural order is goroutine-completion order, which differs run to
+	// run on identical input. That matters because both merge loops below
+	// keep the FIRST entry seen for a package name whenever two upstreams
+	// carry the identical version (Compare returns 0, which falls into
+	// the <= 0 skip branch). Ubuntu routinely publishes the same version
+	// to both -security and -updates, and those two upstreams give the
+	// package different pool paths -- so the winner decides the rewritten
+	// Filename: in StanzaStr, and with it the exact bytes of the
+	// generated Packages file.
+	//
+	// Unsorted, that made generateLiveFiles nondeterministic: two
+	// replicas (or one replica across a restart) produced byte-different,
+	// different-length Packages for byte-identical upstream data. A
+	// client that read one replica's Release then fetched by hash from
+	// another got a 404, fell back to the plain-named path, and hit apt's
+	// "File has unexpected size (X != Y). Mirror sync in progress?" --
+	// the exact failure Acquire-By-Hash exists to prevent. Sorting here
+	// makes the tie-break "first configured upstream wins", identical on
+	// every replica and across every rebuild.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].order != entries[j].order {
+			return entries[i].order < entries[j].order
+		}
+		return entries[i].arch < entries[j].arch
+	})
 
 	// Phase 2a: merge binary-arch results. Must run before Phase 2b so the
 	// per-arch maps are initialized before arch=all packages are fanned into them.
@@ -291,18 +324,19 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 	// generate the served Packages listing, which must show exactly one
 	// canonical entry per name). Two upstreams commonly carry the exact
 	// same package version at once (e.g. Ubuntu routinely publishes a
-	// security fix to both -security and -updates) -- when they do, dest's
-	// winner is whichever of entries' goroutines happened to finish first,
-	// which is not deterministic between rebuilds. Before this, the loser
-	// vanished from ByPoolPath entirely, even though its pool path is just
-	// as real and fetchable as the winner's -- a client whose own
-	// previously-served Packages listing named that exact (now-losing)
-	// upstream's path then found nothing at that path in this rebuild,
-	// needing the live-path fallback (avail.ResolvePoolPath) on every
-	// request until goroutine scheduling happened to flip the tie back, a
-	// genuinely nondeterministic recurrence rather than a fetch failure of
-	// any kind (see this session's HasFetchFailure/archsComplete fixes,
-	// which cover a different class of cause entirely).
+	// security fix to both -security and -updates) -- when they do, only
+	// one of them can win dest, but the loser's pool path is just as real
+	// and fetchable as the winner's. Before this, the loser vanished from
+	// ByPoolPath entirely -- a client whose own previously-served
+	// Packages listing named that exact (now-losing) upstream's path then
+	// found nothing at that path in this rebuild, needing the live-path
+	// fallback (avail.ResolvePoolPath) on every request until the tie
+	// flipped back (see this session's HasFetchFailure/archsComplete
+	// fixes, which cover a different class of cause entirely).
+	//
+	// Which one wins dest is settled by the sort above, not by goroutine
+	// scheduling -- see its comment for why that determinism is load-
+	// bearing for Acquire-By-Hash across replicas.
 	for _, e := range entries {
 		if e.arch == "all" {
 			continue

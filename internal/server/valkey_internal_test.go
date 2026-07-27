@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -36,56 +38,228 @@ func newValkeyEnabledServer(t *testing.T, listenAddr string) *Server {
 	return s
 }
 
-// TestHandleLiveUpdatedMessageProactivelyRebuildsMatchingEntry proves the
-// actual current behavior: receiving a live-updated notice doesn't just mark
-// the matching entry stale and wait for a client request to notice (see
-// getLive) -- after the jitter delay, it proactively rebuilds/adopts right
-// away on its own, replacing the entry outright. Detected via pointer
-// identity (swapLiveEntry always installs a new *liveEntry), since the
-// invalidated state is only transient now -- a real rebuild follows
-// immediately, so polling for a zero expiry is racy against that replacement.
-func TestHandleLiveUpdatedMessageProactivelyRebuildsMatchingEntry(t *testing.T) {
-	// The proactive adopt is jittered (see liveUpdateInvalidateJitter) --
-	// shrink it so this test doesn't have to wait out the full production
-	// window.
-	orig := liveUpdateInvalidateJitter
+// TestHandleLiveUpdatedMessageStagesThenPromotes is the end-to-end test for
+// the switchover mechanism, and the direct regression test for the
+// production failure it exists to fix: with several replicas behind a load
+// balancer, apt read InRelease from one replica and fetched the
+// Packages.zst it named from another, which had never heard of that
+// generation. The by-hash fetch 404'd, apt fell back to the plain-named
+// path, and the user saw "File has unexpected size (X != Y). Mirror sync in
+// progress?".
+//
+// The fix is that a peer's new generation becomes fetchable BY HASH on this
+// replica as soon as the notice is handled, while the generation this
+// replica advertises -- its plain-named paths, and the InRelease naming
+// them -- keeps pointing at the old one until the shared deadline. So there
+// is no instant at which any replica advertises a generation its peers
+// cannot already serve.
+func TestHandleLiveUpdatedMessageStagesThenPromotes(t *testing.T) {
+	origJitter := liveUpdateInvalidateJitter
 	liveUpdateInvalidateJitter = time.Millisecond
-	t.Cleanup(func() { liveUpdateInvalidateJitter = orig })
+	t.Cleanup(func() { liveUpdateInvalidateJitter = origJitter })
+	origDelay := liveSwitchoverDelay
+	liveSwitchoverDelay = 750 * time.Millisecond
+	t.Cleanup(func() { liveSwitchoverDelay = origDelay })
 
-	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
+	const (
+		pkgKey = "dists/trixie/main/binary-amd64/Packages.gz"
+		relKey = "dists/trixie/InRelease"
+	)
+	newPkgs := []byte("new generation packages")
+	sum := sha256.Sum256(newPkgs)
+	newHash := hex.EncodeToString(sum[:])
 
-	future := time.Now().Add(time.Hour)
-	originalTrixie := &liveEntry{expiry: future}
-	originalNoble := &liveEntry{expiry: future}
-	s.liveCache["debian/trixie"] = originalTrixie
-	s.liveCache["ubuntu/noble"] = originalNoble
+	// The publisher holds the new generation and, crucially, serves it by
+	// hash -- which is the only way a peer can name these bytes while the
+	// publisher's own plain-named paths still serve its previous ones.
+	publisher := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
+	publisher.liveCache["debian/trixie"] = &liveEntry{
+		files:  map[string][]byte{pkgKey: newPkgs},
+		hashes: map[string]string{pkgKey: newHash},
+		built:  time.Now(),
+		expiry: time.Now().Add(time.Hour),
+	}
+	pubSrv := httptest.NewServer(publisher.Handler())
+	defer pubSrv.Close()
 
-	msg, err := json.Marshal(liveUpdatedMsg{OS: "debian", Codename: "trixie"})
+	consumer := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
+	consumer.valkey = &serverValkeyBacking{
+		instanceID: "consumer-id",
+		notices:    map[string]liveUpdatedMsg{},
+		peerHTTP:   &http.Client{Timeout: 2 * time.Second},
+	}
+	oldPkgs := []byte("old generation packages")
+	oldSum := sha256.Sum256(oldPkgs)
+	oldHash := hex.EncodeToString(oldSum[:])
+	original := &liveEntry{
+		files:  map[string][]byte{pkgKey: oldPkgs, relKey: []byte("old InRelease")},
+		hashes: map[string]string{pkgKey: oldHash},
+		built:  time.Now(),
+		expiry: time.Now().Add(time.Hour),
+	}
+	consumer.liveCache["debian/trixie"] = original
+
+	msg, err := json.Marshal(liveUpdatedMsg{
+		OS: "debian", Codename: "trixie",
+		Addrs:    []string{pubSrv.Listener.Addr().String()},
+		BuiltAt:  time.Now(),
+		Expiry:   time.Now().Add(time.Hour),
+		Hashes:   map[string]string{pkgKey: newHash},
+		Files:    []string{pkgKey, relKey},
+		Unhashed: map[string][]byte{relKey: []byte("new InRelease")},
+		SourceID: "publisher-id",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(msg)})
+	consumer.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(msg)})
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		s.mu.Lock()
-		replaced := s.liveCache["debian/trixie"] != originalTrixie
-		s.mu.Unlock()
-		if replaced {
+	// Phase 1: staged. The new generation answers by hash, but the served
+	// generation has not moved.
+	staged := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		consumer.mu.Lock()
+		_, staged = consumer.stagedLive["debian/trixie"]
+		consumer.mu.Unlock()
+		if staged {
 			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for debian/trixie entry to be proactively rebuilt")
 		}
 		time.Sleep(time.Millisecond)
 	}
-
-	s.mu.Lock()
-	untouched := s.liveCache["ubuntu/noble"]
-	s.mu.Unlock()
-	if untouched != originalNoble {
-		t.Fatal("expected unrelated ubuntu/noble entry to be left untouched")
+	if !staged {
+		t.Fatal("timed out waiting for the peer's generation to be staged")
 	}
+
+	consumer.mu.Lock()
+	current := consumer.liveCache["debian/trixie"]
+	consumer.mu.Unlock()
+	if current != original {
+		t.Fatal("the peer's generation was promoted immediately; it must stay staged until the shared deadline, or this replica starts advertising bytes its peers may not have yet")
+	}
+	data, _, ok := consumer.resolveByHash("debian", "trixie", current, newHash)
+	if !ok {
+		t.Fatal("the staged generation's hash must resolve before promotion -- this is the whole point of staging")
+	}
+	if string(data) != string(newPkgs) {
+		t.Fatalf("staged by-hash lookup = %q, want %q", data, newPkgs)
+	}
+	// The outgoing generation stays resolvable by hash throughout.
+	if _, _, ok := consumer.resolveByHash("debian", "trixie", current, oldHash); !ok {
+		t.Error("the current generation's hash stopped resolving while a newer one was staged")
+	}
+
+	// Phase 2: promoted at the deadline.
+	promoted := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		consumer.mu.Lock()
+		promoted = consumer.liveCache["debian/trixie"] != original
+		consumer.mu.Unlock()
+		if promoted {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !promoted {
+		t.Fatal("timed out waiting for the staged generation to be promoted at the switchover deadline")
+	}
+
+	consumer.mu.Lock()
+	now := consumer.liveCache["debian/trixie"]
+	_, stillStaged := consumer.stagedLive["debian/trixie"]
+	consumer.mu.Unlock()
+	if stillStaged {
+		t.Error("staging slot was not cleared on promotion")
+	}
+	if string(now.files[pkgKey]) != string(newPkgs) {
+		t.Errorf("promoted files[%q] = %q, want the peer's bytes %q", pkgKey, now.files[pkgKey], newPkgs)
+	}
+	// Release/InRelease have no by-hash url, so they ride inside the
+	// notice; the promoted generation must carry the peer's copy, not the
+	// one this replica had before.
+	if string(now.files[relKey]) != "new InRelease" {
+		t.Errorf("promoted files[%q] = %q, want the peer's inline copy", relKey, now.files[relKey])
+	}
+	// And the generation it replaced stays fetchable by hash for clients
+	// still holding its Release.
+	if _, _, ok := consumer.resolveByHash("debian", "trixie", now, oldHash); !ok {
+		t.Error("the superseded generation must remain resolvable by hash after promotion")
+	}
+}
+
+// TestHandleLiveUpdatedMessageAdoptsDespiteUnchangedUpstream is the
+// regression test for why adoption must not route through rebuildLive.
+// rebuildLive opens with a QuickFingerprint check and, when upstream
+// Release digests are unchanged, returns early with nothing but an expiry
+// extension. Adoption used to go through it, so a replica whose own
+// generation came from the same upstream data as the publisher's declined
+// to adopt, kept serving its own byte-divergent generation, and extended
+// its expiry -- which meant it never reconsidered either. Replicas drifted
+// apart permanently, and the drift got worse the longer the process ran.
+func TestHandleLiveUpdatedMessageAdoptsDespiteUnchangedUpstream(t *testing.T) {
+	origJitter := liveUpdateInvalidateJitter
+	liveUpdateInvalidateJitter = time.Millisecond
+	t.Cleanup(func() { liveUpdateInvalidateJitter = origJitter })
+	origDelay := liveSwitchoverDelay
+	liveSwitchoverDelay = time.Millisecond
+	t.Cleanup(func() { liveSwitchoverDelay = origDelay })
+
+	const pkgKey = "dists/trixie/main/binary-amd64/Packages.gz"
+	peerPkgs := []byte("the publisher's bytes")
+	sum := sha256.Sum256(peerPkgs)
+	peerHash := hex.EncodeToString(sum[:])
+
+	publisher := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
+	publisher.liveCache["debian/trixie"] = &liveEntry{
+		files:  map[string][]byte{pkgKey: peerPkgs},
+		hashes: map[string]string{pkgKey: peerHash},
+		built:  time.Now(),
+		expiry: time.Now().Add(time.Hour),
+	}
+	pubSrv := httptest.NewServer(publisher.Handler())
+	defer pubSrv.Close()
+
+	consumer := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
+	consumer.valkey = &serverValkeyBacking{
+		instanceID: "consumer-id",
+		notices:    map[string]liveUpdatedMsg{},
+		peerHTTP:   &http.Client{Timeout: 2 * time.Second},
+	}
+	// Same fingerprint the publisher would compute: upstream has not moved
+	// at all. Under the old code path this is exactly what made the replica
+	// skip the adopt.
+	original := &liveEntry{
+		files:       map[string][]byte{pkgKey: []byte("this replica's own divergent bytes")},
+		hashes:      map[string]string{pkgKey: "localhash"},
+		built:       time.Now(),
+		expiry:      time.Now().Add(time.Hour),
+		fingerprint: "identical-upstream-fingerprint",
+	}
+	consumer.liveCache["debian/trixie"] = original
+
+	msg, err := json.Marshal(liveUpdatedMsg{
+		OS: "debian", Codename: "trixie",
+		Addrs:    []string{pubSrv.Listener.Addr().String()},
+		BuiltAt:  time.Now(),
+		Expiry:   time.Now().Add(time.Hour),
+		Hashes:   map[string]string{pkgKey: peerHash},
+		Files:    []string{pkgKey},
+		SourceID: "publisher-id",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(msg)})
+
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		consumer.mu.Lock()
+		got := consumer.liveCache["debian/trixie"]
+		consumer.mu.Unlock()
+		if string(got.files[pkgKey]) == string(peerPkgs) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("replica did not adopt the peer's generation when upstream was unchanged -- it will keep serving byte-divergent indexes, and by-hash fetches load-balanced across replicas will 404")
 }
 
 // TestHandleLiveUpdatedMessageIgnoresOwnNotice is the direct regression test
@@ -151,47 +325,55 @@ func TestHandleLiveUpdatedMessageNoLocalEntryIsNoop(t *testing.T) {
 	}
 }
 
-// TestGetLiveCancelsPendingPeerAdoptOnClientRequest proves the other half of
-// the design: a client request for a stale entry must cancel any still-
-// pending notice-driven proactive adopt for the same cacheKey (see
-// handleLiveUpdatedMessage) rather than let both fire and duplicate the same
-// rebuild -- the client's own request already triggers it immediately.
-func TestGetLiveCancelsPendingPeerAdoptOnClientRequest(t *testing.T) {
+// TestGetLiveDefersToPendingPeerAdopt is the inverse of what this used to
+// assert, and the inversion is the fix. A client request for a stale entry
+// used to cancel any pending notice-driven adopt and start its own local
+// rebuild instead, on the reasoning that the two were duplicate work.
+//
+// They are not interchangeable. The adopt installs the exact bytes the rest
+// of the cluster is serving; a local rebuild produces this replica's own
+// generation. Cancelling the adopt in favour of the rebuild is what let
+// replicas drift apart under steady request traffic -- precisely the
+// traffic pattern where it matters, since a busy layout gets a client
+// request inside the adopt's jitter window nearly every time.
+//
+// So a request must serve the stale entry, leave the adopt alone, and start
+// no rebuild of its own.
+func TestGetLiveDefersToPendingPeerAdopt(t *testing.T) {
 	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
 	cacheKey := "debian/trixie"
-	s.liveCache[cacheKey] = &liveEntry{expiry: time.Now().Add(-time.Minute)} // stale
+	stale := &liveEntry{expiry: time.Now().Add(-time.Minute)}
+	s.liveCache[cacheKey] = stale
 
 	// Simulate a live-updated notice having just arrived with its jitter
-	// delay still pending (long enough that it won't fire during this test).
+	// delay still pending.
 	_, realCancel := context.WithCancel(context.Background())
-	called := false
-	wrappedCancel := func() { called = true; realCancel() }
+	cancelled := false
 	s.mu.Lock()
-	s.pendingPeerAdopt[cacheKey] = wrappedCancel
+	s.pendingPeerAdopt[cacheKey] = func() { cancelled = true; realCancel() }
 	s.mu.Unlock()
 
 	entry, err := s.getLive(context.Background(), "debian", "trixie")
 	if err != nil {
 		t.Fatalf("getLive: %v", err)
 	}
-	if entry == nil {
-		t.Fatal("expected the stale entry to still be returned immediately")
+	if entry != stale {
+		t.Fatal("expected the stale entry to be returned immediately while the adopt completes in the background")
 	}
 
-	if !called {
-		t.Error("expected the pending peer-adopt timer's cancel func to be called")
-	}
 	s.mu.Lock()
 	_, stillPending := s.pendingPeerAdopt[cacheKey]
 	wait, building := s.liveBuilding[cacheKey]
 	s.mu.Unlock()
-	if stillPending {
-		t.Error("expected the pending peer-adopt entry to be removed once a client request took over")
-	}
 
-	// Let the background rebuild this request triggered finish so it
-	// doesn't leak past the test.
+	if cancelled {
+		t.Error("client request cancelled the pending peer adopt; it must defer to it instead, or this replica rebuilds its own divergent generation")
+	}
+	if !stillPending {
+		t.Error("pending peer adopt was dropped by a client request")
+	}
 	if building {
+		t.Error("client request started a local rebuild alongside an in-flight peer adopt")
 		<-wait
 	}
 }
@@ -313,20 +495,25 @@ func TestAdoptLiveFromPeer_UnreachablePeerFallsBackToLocal(t *testing.T) {
 func TestFetchLiveFiles_TriesEachAddrInTurn(t *testing.T) {
 	const fileKey = "dists/trixie/main/binary-amd64/Packages.gz"
 	content := []byte("real content")
+	sum := sha256.Sum256(content)
+	hash := hex.EncodeToString(sum[:])
 
 	publisher := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
 	publisher.liveCache["debian/trixie"] = &liveEntry{
-		files: map[string][]byte{fileKey: content}, hashes: map[string]string{}, expiry: time.Now().Add(time.Hour),
+		files:  map[string][]byte{fileKey: content},
+		hashes: map[string]string{fileKey: hash},
+		expiry: time.Now().Add(time.Hour),
 	}
 	pubSrv := httptest.NewServer(publisher.Handler())
 	defer pubSrv.Close()
 
 	b := &serverValkeyBacking{peerHTTP: &http.Client{Timeout: 2 * time.Second}}
 	notice := liveUpdatedMsg{
-		Addrs: []string{"127.0.0.1:1", pubSrv.Listener.Addr().String()}, // first is dead
-		Files: []string{fileKey},
+		Addrs:  []string{"127.0.0.1:1", pubSrv.Listener.Addr().String()}, // first is dead
+		Files:  []string{fileKey},
+		Hashes: map[string]string{fileKey: hash},
 	}
-	files, err := b.fetchLiveFiles(context.Background(), "debian", notice)
+	files, err := b.fetchLiveFiles(context.Background(), "debian", notice, nil)
 	if err != nil {
 		t.Fatalf("fetchLiveFiles: %v", err)
 	}
@@ -349,7 +536,11 @@ func TestPublishLiveUpdate_SkipsWhenNoPeerAddrs(t *testing.T) {
 	}()
 	time.Sleep(200 * time.Millisecond) // let the subscription establish
 
-	s.publishLiveUpdate("debian", "trixie", map[string][]byte{"k": []byte("v")}, nil, time.Now(), time.Now().Add(time.Hour))
+	s.publishLiveUpdate("debian", "trixie", &liveEntry{
+		files:  map[string][]byte{"k": []byte("v")},
+		built:  time.Now(),
+		expiry: time.Now().Add(time.Hour),
+	})
 
 	select {
 	case <-received:

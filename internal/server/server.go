@@ -54,6 +54,7 @@ type Server struct {
 
 	mu               sync.Mutex
 	liveCache        map[string]*liveEntry          // key: os/codename
+	stagedLive       map[string]*stagedLiveEntry    // key: os/codename; see stageLiveEntry
 	liveBuilding     map[string]chan struct{}       // in-flight builds
 	retryCancel      map[string]context.CancelFunc  // background mismatch retries
 	retiredLive      map[string][]*retiredLiveEntry // key: os/codename; see retireLiveEntryLocked
@@ -74,9 +75,53 @@ type Server struct {
 }
 
 const (
-	liveTTLBase   = 12 * time.Minute
-	liveTTLJitter = 5 * time.Minute
+	// liveMaxAge is how long a client -- or an intermediate cache/CDN --
+	// may reuse a /live or /current response without revalidating; it is
+	// what httpCacheControl advertises.
+	//
+	// Deliberately its own value rather than derived from the rebuild
+	// schedule. schedule.refresh governs how often this replica goes
+	// looking for new upstream data, a question about upstreams; this
+	// governs how long a client may hold an InRelease whose referenced
+	// files all have to stay fetchable, a question about memory (see
+	// liveRetiredRetention, which is pinned to it). Deriving one from the
+	// other at a multi-hour refresh interval would keep every superseded
+	// generation -- hundreds of MB for a large layout -- resident for
+	// that entire interval.
+	liveMaxAge = 5 * time.Minute
+
+	// liveExpiryJitter is the maximum random spread added on top of
+	// schedule.refresh when dating a live entry's expiry. Replicas that
+	// adopted the same generation share its builtAt exactly, so without
+	// this they would all go stale on the same instant and rebuild in one
+	// synchronized burst.
+	liveExpiryJitter = 5 * time.Minute
 )
+
+// liveSwitchoverDelay is how long a newly-built generation is held staged
+// -- resolvable by hash on every replica, but not yet served on any
+// plain-named path and not yet named by any InRelease -- before every
+// replica promotes it at once. See stageLiveEntry.
+//
+// It has to comfortably exceed the time a peer needs to fetch a whole
+// layout's compressed indexes from the publisher (tens of MB over the
+// local network, against serverValkeyBacking.peerHTTP's 30s per-request
+// timeout), because a peer that has not finished staging when the deadline
+// passes promotes late, which is the split this whole mechanism exists to
+// close. The budget a peer actually gets is this minus its own
+// liveUpdateInvalidateJitter draw, so 30s leaves at least 20s to pull a
+// full layout. A peer that overruns anyway still promotes as soon as its
+// own fetch completes, so the cost of being wrong here is a brief window
+// on one replica, not a stuck generation.
+//
+// Note this bounds only when the new generation starts being ADVERTISED.
+// Its files answer by-hash from the moment each one lands (see
+// stagePartialLiveEntry), so a slow fetch delays the switchover, never
+// by-hash availability of what has already arrived.
+//
+// A var, not a const, so tests can shrink it to keep runtime fast without
+// touching production behavior -- same as liveUpdateInvalidateJitter.
+var liveSwitchoverDelay = 30 * time.Second
 
 // liveRetiredRetention bounds how long a superseded live generation's files
 // remain fetchable after being retired (see retireLiveEntryLocked). This is
@@ -90,7 +135,7 @@ const (
 // exists to prevent in the first place.
 //
 // Must be at least as long as /live's own HTTP Cache-Control max-age (see
-// httpCacheControl, which derives its value from liveTTLBase so the two can
+// httpCacheControl, which derives its value from liveMaxAge so the two can
 // never drift apart): a client -- or an intermediate cache/CDN -- is
 // entitled to keep using a Release it fetched for that *entire* window
 // before revalidating, and the worst case is a rebuild retiring that exact
@@ -99,10 +144,14 @@ const (
 // happen in production: a client held a ~3-minute-old Release, its by-hash
 // fetch 404'd against the too-short window, and it fell back to the
 // plain-named path -- straight back into the race Acquire-By-Hash exists to
-// prevent. The 5-minute margin on top of liveTTLBase covers network/
+// prevent. The 5-minute margin on top of liveMaxAge covers network/
 // processing delay and more than one rebuild landing inside the window
 // under heavier-than-normal churn.
-const liveRetiredRetention = liveTTLBase + 5*time.Minute
+//
+// This bounds only the window AFTER a generation stops being current.
+// The mirror-image window, before it becomes current, is covered by
+// staging instead -- see stageLiveEntry/liveSwitchoverDelay.
+const liveRetiredRetention = liveMaxAge + 5*time.Minute
 
 var errUnknownSelector = errors.New("unknown snapshot selector")
 
@@ -111,6 +160,20 @@ type liveEntry struct {
 	files  map[string][]byte
 	hashes map[string]string // plain file key -> sha256 from Release; O(1) ETag lookup
 	built  time.Time
+	// expiry is when this entry stops being considered fresh, at which
+	// point the next request for it serves it anyway and kicks off a
+	// background rebuild (see getLive). Derived from schedule.refresh --
+	// see Server.liveExpiry -- so the live view re-checks upstream on the
+	// same cadence the background refresher does, rather than on a second
+	// independent timer of its own.
+	//
+	// The zero value means "no timer at all", which is what
+	// schedule.refresh being disabled resolves to: nothing then rebuilds
+	// this layout except a peer's live-updated notice or a cold start.
+	// Always test it with stale(), never with a bare Before/After -- a
+	// zero expiry is infinitely far in the past to time.After and would
+	// otherwise read as permanently stale, the exact inverse of what it
+	// means.
 	expiry time.Time
 	// fingerprint is avail.QuickFingerprint's result as of this entry's
 	// build. Lets the next rebuild (see rebuildLive) tell "upstreams
@@ -119,6 +182,25 @@ type liveEntry struct {
 	// upstream, before ever paying for a full avail.Build -- see
 	// QuickFingerprint's own doc comment.
 	fingerprint string
+}
+
+// stale reports whether this entry is past its expiry and a background
+// rebuild should be started for it. A zero expiry is never stale -- see
+// the field's own doc comment.
+func (e *liveEntry) stale(now time.Time) bool {
+	return !e.expiry.IsZero() && now.After(e.expiry)
+}
+
+// liveExpiry dates a live entry built at builtAt, from schedule.refresh
+// plus up to liveExpiryJitter of spread. Returns the zero time when
+// schedule.refresh is disabled, meaning the entry never expires on a timer
+// -- see liveEntry.expiry.
+func (s *Server) liveExpiry(builtAt time.Time) time.Time {
+	refresh := s.cfg.Schedule.RefreshInterval()
+	if refresh <= 0 {
+		return time.Time{}
+	}
+	return builtAt.Add(refresh + valkeycache.RandDuration(liveExpiryJitter))
 }
 
 // lookupByHash finds the plain-named file whose hash (from Release, see
@@ -154,6 +236,43 @@ type retiredLiveEntry struct {
 	retiredAt time.Time
 }
 
+// stagedLiveEntry is a fully-assembled generation that is not yet the one
+// this replica serves. Its files answer by-hash requests from the moment
+// it is staged (see resolveByHash), but nothing reaches it by a plain
+// name, and the InRelease clients get still belongs to the current
+// generation.
+//
+// This is the mirror image of retiredLiveEntry, and exists for the same
+// reason. Retirement keeps a generation fetchable for a while after it
+// stops being advertised; staging makes the next one fetchable for a
+// while before it starts being advertised. Together they mean that at
+// every instant, on every replica, both the outgoing and incoming
+// generations answer by-hash -- so it no longer matters whether the
+// replica that served a client its InRelease is the same one that serves
+// the Packages files that InRelease names. Without staging, a replica
+// that published a new generation started advertising hashes its peers
+// had never heard of, and an apt client load-balanced onto a peer got a
+// 404 on its by-hash fetch, fell back to the plain-named path, and hit
+// "File has unexpected size (X != Y). Mirror sync in progress?".
+type stagedLiveEntry struct {
+	entry *liveEntry
+	// promoteAt is when this replica installs entry as current. Every
+	// replica derives it from the same event (the publisher's own
+	// build, or its receipt of the notice announcing one) plus the same
+	// liveSwitchoverDelay, so they all flip within a pub/sub fanout of
+	// each other rather than whenever each happens to finish fetching.
+	promoteAt time.Time
+	// complete is false while entry still only holds part of the
+	// generation, which is the normal state during a peer fetch: each
+	// file is published into the staging slot the moment it arrives (see
+	// stagePartialLiveEntry) rather than the whole set being withheld
+	// until the last one lands. A partial entry answers by-hash for
+	// exactly the files it already has, and must never be promoted --
+	// promoting it would serve a Release naming files this replica has
+	// not fetched yet.
+	complete bool
+}
+
 // New creates a Server. notifier and exists may be nil.
 // exists should be the same ExistsCache used by the Syncer so that pull-through
 // re-indexing and update operations share a consistent view of indexed files.
@@ -183,6 +302,7 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 		notifier:         notifier,
 		exists:           exists,
 		liveCache:        map[string]*liveEntry{},
+		stagedLive:       map[string]*stagedLiveEntry{},
 		liveBuilding:     map[string]chan struct{}{},
 		retryCancel:      map[string]context.CancelFunc{},
 		retiredLive:      map[string][]*retiredLiveEntry{},
@@ -227,29 +347,41 @@ func (s *Server) metricOSCodename(osName, codename string) (string, string) {
 
 // sweepExpiredLiveCache removes entries for os/codename combinations that are
 // no longer configured at all (removed from cfg since the entry was built)
-// and whose TTL has also elapsed, so a layout dropped from config doesn't
-// hold its last-built index byte slices indefinitely.
+// and that have also aged past liveRetiredRetention, so a layout dropped
+// from config doesn't hold its last-built index byte slices indefinitely.
 //
 // Deliberately does NOT delete an entry just because it's past its own
 // expiry while still a currently-configured layout (see isKnownOSCodename)
 // -- that's exactly what getLive's own stale-entry branch is designed to
 // handle gracefully (serve the stale entry immediately, refresh in the
 // background). This function used to delete any expired entry outright,
-// for every layout, on every single swapLiveEntry call (i.e. on every
+// for every layout, on every single generation swap (i.e. on every
 // successful build for ANY layout) -- so a layout that simply hadn't been
-// requested in the last liveTTLBase+liveTTLJitter window (12-17 minutes)
-// could get swept out from under it by a completely unrelated layout's
-// routine refresh. The next request for that quiet-but-valid layout then
-// found no entry at all instead of a stale one, falling all the way through
-// to getLive's synchronous cold-start path and blocking that client on a
-// full rebuild -- confirmed in production via repeated "building live
-// cache"/"live cache built" pairs for the same os/codename, arbitrarily
-// long after startup, with no cold start actually warranted.
+// requested inside its own TTL window could get swept out from under it by
+// a completely unrelated layout's routine refresh. The next request for
+// that quiet-but-valid layout then found no entry at all instead of a
+// stale one, falling all the way through to getLive's synchronous
+// cold-start path and blocking that client on a full rebuild -- confirmed
+// in production via repeated "building live cache"/"live cache built"
+// pairs for the same os/codename, arbitrarily long after startup, with no
+// cold start actually warranted.
+//
+// Ages off built rather than expiry because expiry is now schedule.refresh
+// -derived and is the zero value outright when refreshing is disabled (see
+// liveEntry.expiry). A dropped layout has to be reclaimable on a bounded
+// timeline either way, and it must not depend on a refresh interval that
+// may be hours long or absent.
 // Must be called with s.mu held.
 func (s *Server) sweepExpiredLiveCache(now time.Time) {
+	cutoff := now.Add(-liveRetiredRetention)
 	for k, e := range s.liveCache {
-		if !s.validOSCodename[k] && now.After(e.expiry) {
+		if !s.validOSCodename[k] && e.built.Before(cutoff) {
 			delete(s.liveCache, k)
+		}
+	}
+	for k, st := range s.stagedLive {
+		if !s.validOSCodename[k] && st.entry.built.Before(cutoff) {
+			delete(s.stagedLive, k)
 		}
 	}
 }
@@ -272,17 +404,22 @@ func (s *Server) retireLiveEntryLocked(cacheKey string, old *liveEntry) {
 	s.retiredLive[cacheKey] = append(kept, &retiredLiveEntry{entry: old, retiredAt: now})
 }
 
-// resolveByHash finds the bytes matching hash for osName/codename, checking
-// current first, then recently retired generations (newest first, see
-// retireLiveEntryLocked) still within liveRetiredRetention. This is what
-// makes Acquire-By-Hash (see internal/publish) actually safe for the
-// dynamically-regenerated /live view: a client that already fetched Release
-// (or a by-hash path) from a generation about to be retired must still be
-// able to fetch everything that Release referenced, even though /live keeps
-// rebuilding out from under it -- otherwise every rebuild would 404 any
-// client mid-flight between its Release fetch and its Packages/Sources
-// fetch, which is the exact "File has unexpected size" race Acquire-By-Hash
-// exists to prevent in the first place.
+// resolveByHash finds the bytes matching hash for osName/codename across
+// every generation this replica can still answer for: the current one, the
+// staged one not yet promoted (see stagedLiveEntry), and recently retired
+// ones (newest first, see retireLiveEntryLocked) still within
+// liveRetiredRetention.
+//
+// Those three together are what make Acquire-By-Hash (see internal/publish)
+// actually safe for the dynamically-regenerated /live view. A client that
+// already fetched Release from a generation about to be retired must still
+// be able to fetch everything that Release referenced, even though /live
+// keeps rebuilding out from under it. A client that fetched Release from a
+// generation some *other* replica has already promoted, but this one has
+// not, must be served just the same. Otherwise a rebuild 404s any client
+// mid-flight between its Release fetch and its Packages/Sources fetch, and
+// apt falls back to the plain-named path -- the exact "File has unexpected
+// size" race Acquire-By-Hash exists to prevent in the first place.
 func (s *Server) resolveByHash(osName, codename string, current *liveEntry, hash string) (data []byte, builtAt time.Time, ok bool) {
 	if data, _, ok := current.lookupByHash(hash); ok {
 		return data, current.built, true
@@ -292,6 +429,11 @@ func (s *Server) resolveByHash(osName, codename string, current *liveEntry, hash
 	cutoff := time.Now().Add(-liveRetiredRetention)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if st, ok := s.stagedLive[cacheKey]; ok {
+		if data, _, ok := st.entry.lookupByHash(hash); ok {
+			return data, st.entry.built, true
+		}
+	}
 	retained := s.retiredLive[cacheKey]
 	for i := len(retained) - 1; i >= 0; i-- {
 		r := retained[i]
@@ -305,35 +447,123 @@ func (s *Server) resolveByHash(osName, codename string, current *liveEntry, hash
 	return nil, time.Time{}, false
 }
 
-// swapLiveEntry retires whatever was previously cached for osName/codename
-// (see retireLiveEntryLocked), installs newEntry as the current one, and --
-// only when fresh is true, meaning newEntry was just generated locally
-// rather than adopted from a peer that already published its own notice
-// (see buildOrAdoptLiveFiles) -- announces it to other replicas.
+// swapLiveEntry installs newEntry for osName/codename and -- only when
+// fresh is true, meaning newEntry was just generated locally rather than
+// adopted from a peer that already published its own notice (see
+// buildOrAdoptLiveFiles) -- announces it to other replicas.
 //
-// The swap and the announcement are deliberately sequenced in that order,
-// swap first: other replicas (and, once they receive the notice and adopt,
-// their own local liveCache) should never be told about a generation this
-// replica itself can't yet serve. The announcement itself is fired via
-// safego.Go rather than awaited, so a slow or unreachable Valkey never adds
-// latency to a request that's just trying to install a build it already
-// has in hand.
+// Installation is not immediate. newEntry is staged first, answering
+// by-hash requests but reaching no plain-named path, and only becomes the
+// generation this replica actually advertises liveSwitchoverDelay later
+// (see stageLiveEntry and stagedLiveEntry's own doc comment for why).
+// Announcing before promoting is the point rather than an accident: peers
+// need that window to fetch the new files and stage them too, so that when
+// the deadline arrives every replica flips to a generation all of them can
+// already serve.
+//
+// The one exception is a cold start, where there is no current generation
+// to keep serving in the meantime; stageLiveEntry promotes immediately in
+// that case rather than leave the layout unservable.
+//
+// The announcement is fired via safego.Go rather than awaited, so a slow
+// or unreachable Valkey never adds latency to a request that's just trying
+// to install a build it already has in hand.
 func (s *Server) swapLiveEntry(osName, codename string, newEntry *liveEntry, fresh bool) {
+	if fresh && s.valkey != nil {
+		safego.Go("publish live update", func() {
+			s.publishLiveUpdate(osName, codename, newEntry)
+		})
+	}
+	s.stageLiveEntry(osName, codename, newEntry, time.Now().Add(liveSwitchoverDelay))
+}
+
+// stageLiveEntry makes newEntry resolvable by hash right away and schedules
+// it to become the served generation at promoteAt. A promoteAt that has
+// already passed, or a layout with nothing currently cached at all (a cold
+// start, where staging would leave the client with nothing to read),
+// promotes synchronously instead.
+//
+// A newer staged generation replaces an older one that has not been
+// promoted yet: the older one never became current, so nothing is
+// advertising its hashes and it has no claim on being retired. Its
+// promotion timer finds it gone and does nothing (see promoteStagedEntry's
+// identity check).
+func (s *Server) stageLiveEntry(osName, codename string, newEntry *liveEntry, promoteAt time.Time) {
 	cacheKey := osName + "/" + codename
 
 	s.mu.Lock()
+	_, hasCurrent := s.liveCache[cacheKey]
+	if !hasCurrent || !time.Now().Before(promoteAt) {
+		s.mu.Unlock()
+		s.promoteLiveEntry(cacheKey, newEntry)
+		return
+	}
+	s.stagedLive[cacheKey] = &stagedLiveEntry{entry: newEntry, promoteAt: promoteAt, complete: true}
+	s.mu.Unlock()
+
+	slog.Debug("live generation staged, serving by hash until switchover",
+		"os", osName, "codename", codename, "promote_in", time.Until(promoteAt))
+
+	safego.Go("promote staged live entry", func() {
+		time.Sleep(time.Until(promoteAt))
+		s.promoteStagedEntry(cacheKey, newEntry)
+	})
+}
+
+// stagePartialLiveEntry publishes a generation that is still being fetched,
+// so every file already in hand answers by-hash immediately instead of
+// waiting behind the ones that haven't arrived yet.
+//
+// This is what makes by-hash availability independent of the switchover
+// clock. A peer pulling a large layout can take most of the window; if its
+// files only became resolvable at the end of that, a client whose Release
+// came from the publisher would 404 here for the entire fetch and fall back
+// to the plain-named path -- the failure staging exists to prevent, merely
+// moved earlier. Publishing incrementally means each file is servable the
+// moment it exists locally, and the deadline governs only when this replica
+// starts ADVERTISING the new generation.
+//
+// entry must be a fresh snapshot each call, never a mutation of one already
+// staged: a promoted entry is read outside s.mu, and liveEntry values are
+// treated as immutable throughout (see extendExpiry). The byte slices are
+// shared between snapshots, so a snapshot costs one small map copy, not a
+// copy of the data.
+func (s *Server) stagePartialLiveEntry(cacheKey string, entry *liveEntry, promoteAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stagedLive[cacheKey] = &stagedLiveEntry{entry: entry, promoteAt: promoteAt}
+}
+
+// promoteStagedEntry promotes want only if it is still the entry staged for
+// cacheKey, and only if that staging slot is complete. A newer generation
+// staged in the meantime has already replaced it, and promoting want then
+// would install an older generation over a newer one.
+func (s *Server) promoteStagedEntry(cacheKey string, want *liveEntry) {
+	s.mu.Lock()
+	st, ok := s.stagedLive[cacheKey]
+	if !ok || st.entry != want || !st.complete {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	s.promoteLiveEntry(cacheKey, want)
+}
+
+// promoteLiveEntry retires whatever was current for cacheKey (see
+// retireLiveEntryLocked, which keeps its files fetchable by hash for
+// liveRetiredRetention) and installs newEntry in its place, clearing the
+// staging slot if newEntry was what was staged there.
+func (s *Server) promoteLiveEntry(cacheKey string, newEntry *liveEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if old, ok := s.liveCache[cacheKey]; ok {
 		s.retireLiveEntryLocked(cacheKey, old)
 	}
+	if st, ok := s.stagedLive[cacheKey]; ok && st.entry == newEntry {
+		delete(s.stagedLive, cacheKey)
+	}
 	s.sweepExpiredLiveCache(time.Now())
 	s.liveCache[cacheKey] = newEntry
-	s.mu.Unlock()
-
-	if fresh && s.valkey != nil {
-		safego.Go("publish live update", func() {
-			s.publishLiveUpdate(osName, codename, newEntry.files, newEntry.hashes, newEntry.built, newEntry.expiry)
-		})
-	}
 }
 
 // hashFromByHashKey extracts the sha256 hex digest from a by-hash key of the
@@ -526,20 +756,27 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 		key := path.Join(remainder...)
 		if hash := hashFromByHashKey(key); hash != "" {
 			// by-hash paths are resolved virtually, not by a literal key
-			// lookup (see liveEntry.lookupByHash for why), checking the
-			// current generation and then recently retired ones (see
-			// resolveByHash/liveRetiredRetention): a client that fetched
-			// Release just before this replica's most recent rebuild may
-			// still be fetching Packages/Sources by a hash that generation
-			// announced, and that generation's files must stay servable
-			// for a little while after being superseded. There's no
+			// lookup (see liveEntry.lookupByHash for why), across the
+			// current generation, the staged one, and recently retired
+			// ones (see resolveByHash): a client that fetched Release
+			// just before -- or just after -- a generation change may be
+			// fetching Packages/Sources by a hash from either side of it,
+			// possibly one this replica never published itself.
+			//
+			// A local miss falls through to the publishing peer before
+			// giving up (see resolveByHashWithPeer). There's no
 			// decompression-fallback equivalent for a by-hash request (it
-			// always names one exact stored variant), so a miss here is a
-			// straight 404.
-			if data, builtAt, ok := s.resolveByHash(osName, codename, entry, hash); ok {
+			// always names one exact stored variant), and a 404 here is
+			// worse than it looks: apt responds by retrying the
+			// plain-named path, which is precisely the unsynchronized
+			// fetch that Acquire-By-Hash exists to avoid and that
+			// surfaces to the user as "File has unexpected size".
+			if data, builtAt, ok := s.resolveByHashWithPeer(r.Context(), osName, codename, entry, hash); ok {
 				serveBytes(w, r, key, data, builtAt, hash)
 				return
 			}
+			slog.Warn("live by-hash miss, client will fall back to the plain path",
+				"os", osName, "codename", codename, "path", key)
 			http.NotFound(w, r)
 			return
 		}
@@ -1166,22 +1403,26 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	_, building := s.liveBuilding[cacheKey]
 
 	// Fast path: fresh cache entry.
-	if ok && time.Now().Before(entry.expiry) {
+	if ok && !entry.stale(time.Now()) {
 		s.mu.Unlock()
 		return entry, nil
 	}
 
 	// Stale entry exists: return it immediately and refresh in the background.
+	//
+	// A peer adopt already in flight for this layout counts as that
+	// refresh, and this request defers to it rather than starting a local
+	// rebuild alongside. Adoption is both the cheaper path (fetching
+	// already-compressed bytes instead of recompressing them) and the one
+	// that keeps this replica byte-identical to the rest of the cluster,
+	// which is the whole reason Acquire-By-Hash survives a load balancer
+	// here. Earlier this branch cancelled the pending adopt in favour of
+	// its own rebuild, on the grounds that they were duplicate work; they
+	// are not interchangeable, and doing so is what let replicas drift
+	// onto their own generations under steady request traffic.
 	if ok {
-		if !building {
-			// This request is about to trigger the same rebuild a pending
-			// notice-driven proactive adopt (see handleLiveUpdatedMessage)
-			// would otherwise fire after its own jitter delay -- cancel it
-			// so it doesn't duplicate the rebuild this request is starting.
-			if cancel, pending := s.pendingPeerAdopt[cacheKey]; pending {
-				cancel()
-				delete(s.pendingPeerAdopt, cacheKey)
-			}
+		_, adopting := s.pendingPeerAdopt[cacheKey]
+		if !building && !adopting {
 			wait := make(chan struct{})
 			s.liveBuilding[cacheKey] = wait
 			safego.Go("rebuild live cache", func() { s.rebuildLive(osName, codename, cacheKey, wait) })
@@ -1273,10 +1514,10 @@ const liveBuildLockTTL = 5 * time.Minute
 // generation. Never mutates existing itself: getLive's fast path hands out
 // *liveEntry pointers to callers outside s.mu, so another goroutine may
 // already be reading this exact one concurrently.
-func extendExpiry(existing *liveEntry) *liveEntry {
+func (s *Server) extendExpiry(existing *liveEntry) *liveEntry {
 	extended := *existing
 	extended.built = time.Now()
-	extended.expiry = extended.built.Add(liveTTLBase + valkeycache.RandDuration(liveTTLJitter))
+	extended.expiry = s.liveExpiry(extended.built)
 	return &extended
 }
 
@@ -1300,7 +1541,7 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 		if hasExisting && existing.fingerprint == quickFP {
 			s.mu.Lock()
 			delete(s.liveBuilding, cacheKey)
-			s.liveCache[cacheKey] = extendExpiry(existing)
+			s.liveCache[cacheKey] = s.extendExpiry(existing)
 			s.mu.Unlock()
 			slog.Debug("live cache content unchanged, extending expiry without rebuilding", "os", osName, "codename", codename)
 			return
@@ -1357,7 +1598,7 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 		if hasExisting {
 			s.mu.Lock()
 			delete(s.liveBuilding, cacheKey)
-			s.liveCache[cacheKey] = extendExpiry(existing)
+			s.liveCache[cacheKey] = s.extendExpiry(existing)
 			s.mu.Unlock()
 			slog.Warn("upstream fetch failed this cycle, keeping previous live cache instead of publishing an incomplete one", "os", osName, "codename", codename)
 			return
@@ -1727,15 +1968,15 @@ func stanzaString(p avail.Pkg) string {
 }
 
 // liveHTTPCacheControl is /live's and /current's own Cache-Control value,
-// derived from liveTTLBase rather than a second, independent literal -- see
+// derived from liveMaxAge rather than a second, independent literal -- see
 // liveRetiredRetention's own doc comment for why these two must never be
 // allowed to drift apart (retention must always cover at least this much
 // client-side caching allowance).
-var liveHTTPCacheControl = fmt.Sprintf("public, max-age=%d", int(liveTTLBase.Seconds()))
+var liveHTTPCacheControl = fmt.Sprintf("public, max-age=%d", int(liveMaxAge.Seconds()))
 
 // httpCacheControl returns the Cache-Control header value for a request URL
 // path. It is keyed on the first path segment (the "selector"):
-//   - live/**          -> public cache for liveTTLBase (matches server-side live TTL)
+//   - live/**          -> public cache for liveMaxAge
 //   - current/**       -> same as live/** (current alias changes on snapshot)
 //   - keys/debproxy.*  -> 1-day cache (rotates on key change)
 //   - everything else  -> 1-year immutable (pool files and pinned snapshot files)

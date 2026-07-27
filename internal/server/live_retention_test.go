@@ -19,23 +19,25 @@ import (
 func TestResolveByHash_FindsCurrentAndRetiredGenerations(t *testing.T) {
 	s := New(&config.Config{}, nil, nil, nil, nil, nil, nil, nil)
 
-	oldKey := "dists/trixie/main/binary-amd64/Packages.gz"
+	key := "dists/trixie/main/binary-amd64/Packages.gz"
 	old := &liveEntry{
-		files:  map[string][]byte{oldKey: []byte("old-bytes")},
-		hashes: map[string]string{oldKey: "oldhash"},
+		files:  map[string][]byte{key: []byte("old-bytes")},
+		hashes: map[string]string{key: "oldhash"},
 		built:  time.Now(),
 		expiry: time.Now().Add(time.Hour),
 	}
+	// Nothing cached yet, so this promotes immediately rather than staging.
 	s.swapLiveEntry("debian", "trixie", old, false)
 
-	newKey := "dists/trixie/main/binary-amd64/Packages.gz"
 	newer := &liveEntry{
-		files:  map[string][]byte{newKey: []byte("new-bytes")},
-		hashes: map[string]string{newKey: "newhash"},
+		files:  map[string][]byte{key: []byte("new-bytes")},
+		hashes: map[string]string{key: "newhash"},
 		built:  time.Now(),
 		expiry: time.Now().Add(time.Hour),
 	}
-	s.swapLiveEntry("debian", "trixie", newer, false)
+	// An already-elapsed deadline promotes synchronously, so the retirement
+	// path below is exercised without waiting out liveSwitchoverDelay.
+	s.stageLiveEntry("debian", "trixie", newer, time.Now())
 
 	// The old generation's hash must still resolve, even though it's no
 	// longer current -- this is what lets a client that already read the

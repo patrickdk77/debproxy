@@ -759,9 +759,9 @@ func TestBuildKeepsBothPoolPathsWhenTwoUpstreamsShareAVersion(t *testing.T) {
 	poolPathA := model.PoolPath("debian", "trixie", "upstream-a", "utils", "hello", "1.0", "amd64")
 	poolPathB := model.PoolPath("debian", "trixie", "upstream-b", "utils", "hello", "1.0", "amd64")
 
-	// Run several times: the "winner" of the canonical Pkgs slot is decided
-	// by goroutine completion order, which varies run to run. Both pool
-	// paths must survive every single time regardless of which one wins.
+	// Run several times: only one upstream can win the canonical Pkgs slot
+	// for a shared name+version. Both pool paths must survive every single
+	// time regardless of which one does.
 	for i := 0; i < 10; i++ {
 		av := avail.Build(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie")
 		if _, ok := av.ByPoolPath[poolPathA]; !ok {
@@ -774,6 +774,72 @@ func TestBuildKeepsBothPoolPathsWhenTwoUpstreamsShareAVersion(t *testing.T) {
 		// entry per name -- this fix must not cause duplicates there.
 		if _, ok := av.Pkgs["main"]["amd64"]["hello"]; !ok {
 			t.Fatalf("run %d: expected exactly one canonical entry in Pkgs", i)
+		}
+	}
+}
+
+// TestBuildPicksSameWinnerEveryTimeWhenUpstreamsShareAVersion is the root
+// -cause regression test for a production failure that surfaced to users as
+// apt refusing an index:
+//
+//	Err:2 http://debproxy/live/ubuntu noble/main amd64 Packages
+//	  File has unexpected size (2685639 != 2683991). Mirror sync in progress?
+//
+// When two upstreams carry a package at the identical version, only one wins
+// the canonical Pkgs slot, and the winner decides the Filename: rewritten
+// into the served stanza -- pool paths embed the upstream name, so the two
+// candidates produce different bytes and a different total length. The
+// winner used to be whichever goroutine finished first, so generating the
+// live index twice from byte-identical upstream data produced
+// byte-different Packages files.
+//
+// Across replicas that is fatal rather than untidy. apt reads Release from
+// one replica and fetches by hash from another; if that replica generated a
+// different winner it has never heard of the hash, returns 404, and apt
+// falls back to the plain-named path -- straight into the size mismatch
+// above. Ubuntu makes this the common case, not a corner one: it routinely
+// publishes the same version to both -security and -updates, and both feed
+// the same component.
+//
+// So the tie-break has to be a pure function of configuration: first
+// configured upstream wins, on every replica, on every rebuild, forever.
+func TestBuildPicksSameWinnerEveryTimeWhenUpstreamsShareAVersion(t *testing.T) {
+	key, keyring := testKey(t)
+	srvA := buildFakeUpstreamWithSection(t, key)
+	srvB := buildFakeUpstreamWithSection(t, key)
+
+	// upstream-b is listed FIRST here while sorting lexicographically
+	// second, so a test that passed merely because the names happened to
+	// sort into configuration order would fail this one.
+	cfg := &config.Config{
+		ResolvedLayouts: []model.Layout{{
+			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
+			Upstreams: []model.UpstreamSource{
+				{Name: "upstream-b", URL: srvB, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
+				{Name: "upstream-a", URL: srvA, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
+			},
+		}},
+	}
+	wantPoolPath := model.PoolPath("debian", "trixie", "upstream-b", "utils", "hello", "1.0", "amd64")
+
+	var firstStanza string
+	for i := 0; i < 25; i++ {
+		av := avail.Build(context.Background(), cfg, http.DefaultClient, upstream.NewIndexCache(), "debian", "trixie")
+		got, ok := av.Pkgs["main"]["amd64"]["hello"]
+		if !ok {
+			t.Fatalf("run %d: no canonical entry for hello", i)
+		}
+		if got.PoolPath != wantPoolPath {
+			t.Fatalf("run %d: winner = %q, want the first configured upstream's %q", i, got.PoolPath, wantPoolPath)
+		}
+		// The stanza is what actually lands in the generated Packages file,
+		// so compare it directly rather than trusting PoolPath as a proxy.
+		if i == 0 {
+			firstStanza = got.StanzaStr
+			continue
+		}
+		if got.StanzaStr != firstStanza {
+			t.Fatalf("run %d: stanza differs from run 0 on identical upstream data\n got: %q\nwant: %q", i, got.StanzaStr, firstStanza)
 		}
 	}
 }

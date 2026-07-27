@@ -185,6 +185,10 @@ func TestRebuildLiveSkipsExpensiveWorkWhenUpstreamUnchanged(t *testing.T) {
 // have no packages in it at all.
 func TestRebuildLiveKeepsExistingEntryOnUpstreamFetchFailure(t *testing.T) {
 	cfg := &config.Config{
+		// A real refresh interval, so the expiry extension below is the
+		// one a configured deployment actually gets rather than the
+		// no-timer zero value refresh: "" resolves to.
+		Schedule: config.ScheduleConfig{Refresh: "6h"},
 		ResolvedLayouts: []model.Layout{{
 			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
 			Upstreams: []model.UpstreamSource{{
@@ -229,5 +233,8 @@ func TestRebuildLiveKeepsExistingEntryOnUpstreamFetchFailure(t *testing.T) {
 	}
 	if !after.expiry.After(time.Now()) {
 		t.Fatal("expected expiry to be extended into the future, not left in the past")
+	}
+	if after.stale(time.Now()) {
+		t.Fatal("expected the kept entry to read as fresh, so the very next request doesn't immediately retrigger the rebuild that just failed")
 	}
 }
