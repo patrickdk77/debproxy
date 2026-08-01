@@ -201,7 +201,7 @@ func testConfigWithSources(srvURL string, keyring openpgp.EntityList) *config.Co
 		Name:         "test-upstream",
 		URL:          srvURL,
 		Suite:        "trixie",
-		Component:    "main",
+		Component:    []string{"main"},
 		Archs:        []string{"amd64"},
 		VerifyKeys:   keyring,
 		FetchSources: true,
@@ -219,7 +219,7 @@ func testConfig(srvURL string, keyring openpgp.EntityList) *config.Config {
 		Name:       "test-upstream",
 		URL:        srvURL,
 		Suite:      "trixie",
-		Component:  "main",
+		Component:  []string{"main"},
 		Archs:      []string{"amd64"},
 		VerifyKeys: keyring,
 	}
@@ -709,8 +709,8 @@ func TestBuildPicksHigherSourceVersionByDebianOrderingNotLexicographic(t *testin
 		ResolvedLayouts: []model.Layout{{
 			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
 			Upstreams: []model.UpstreamSource{
-				{Name: "upstream-old", URL: srvOld, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring, FetchSources: true},
-				{Name: "upstream-new", URL: srvNew, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring, FetchSources: true},
+				{Name: "upstream-old", URL: srvOld, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}, VerifyKeys: keyring, FetchSources: true},
+				{Name: "upstream-new", URL: srvNew, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}, VerifyKeys: keyring, FetchSources: true},
 			},
 		}},
 	}
@@ -750,8 +750,8 @@ func TestBuildKeepsBothPoolPathsWhenTwoUpstreamsShareAVersion(t *testing.T) {
 		ResolvedLayouts: []model.Layout{{
 			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
 			Upstreams: []model.UpstreamSource{
-				{Name: "upstream-a", URL: srvA, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
-				{Name: "upstream-b", URL: srvB, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
+				{Name: "upstream-a", URL: srvA, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}, VerifyKeys: keyring},
+				{Name: "upstream-b", URL: srvB, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}, VerifyKeys: keyring},
 			},
 		}},
 	}
@@ -815,8 +815,8 @@ func TestBuildPicksSameWinnerEveryTimeWhenUpstreamsShareAVersion(t *testing.T) {
 		ResolvedLayouts: []model.Layout{{
 			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
 			Upstreams: []model.UpstreamSource{
-				{Name: "upstream-b", URL: srvB, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
-				{Name: "upstream-a", URL: srvA, Suite: "trixie", Component: "main", Archs: []string{"amd64"}, VerifyKeys: keyring},
+				{Name: "upstream-b", URL: srvB, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}, VerifyKeys: keyring},
+				{Name: "upstream-a", URL: srvA, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}, VerifyKeys: keyring},
 			},
 		}},
 	}

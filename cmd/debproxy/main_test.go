@@ -106,9 +106,9 @@ func TestLayoutSeedOffsetZeroWhenIntervalNonPositive(t *testing.T) {
 }
 
 func TestLayoutUpstreamGroupsByOSCodenameInFirstSeenOrder(t *testing.T) {
-	debianMain := model.UpstreamSource{Name: "debian-main", URL: "https://deb.debian.org/debian", Suite: "trixie", Component: "main"}
-	debianSecurity := model.UpstreamSource{Name: "debian-security", URL: "https://deb.debian.org/debian-security", Suite: "trixie-security", Component: "main"}
-	ubuntuMain := model.UpstreamSource{Name: "ubuntu-main", URL: "https://archive.ubuntu.com/ubuntu", Suite: "noble", Component: "main"}
+	debianMain := model.UpstreamSource{Name: "debian-main", URL: "https://deb.debian.org/debian", Suite: "trixie", Component: []string{"main"}}
+	debianSecurity := model.UpstreamSource{Name: "debian-security", URL: "https://deb.debian.org/debian-security", Suite: "trixie-security", Component: []string{"main"}}
+	ubuntuMain := model.UpstreamSource{Name: "ubuntu-main", URL: "https://archive.ubuntu.com/ubuntu", Suite: "noble", Component: []string{"main"}}
 
 	cfg := &config.Config{
 		ResolvedLayouts: []model.Layout{

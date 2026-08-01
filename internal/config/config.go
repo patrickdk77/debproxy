@@ -400,8 +400,21 @@ type SigningConfig struct {
 
 // UpstreamDef is a global upstream definition referenced by name from layouts.
 type UpstreamDef struct {
-	URL           string   `yaml:"url"`
-	Suite         string   `yaml:"suite"`
+	URL   string `yaml:"url"`
+	Suite string `yaml:"suite"`
+	// Component overrides which of the upstream's own real component
+	// division(s) to fetch from -- this is the upstream mirror's own
+	// directory name(s) (e.g. "main"), not the name you gave the layout
+	// component that groups its output (e.g. a layout component you called
+	// "mongodb80" upstream might actually publish everything under "main").
+	// Omit to default to the layout component's own name, which is only
+	// correct when the two happen to match (true for "main"/"contrib" on a
+	// real Debian/Ubuntu mirror, not for an arbitrary label you chose
+	// yourself). Space-separated for more than one, matching apt's own
+	// Components: field, which has always accepted more than one (e.g.
+	// "main contrib"): each is tried independently at fetch time, and one
+	// not actually being listed there is not an error, just nothing to
+	// merge in from it.
 	Component     string   `yaml:"component"`
 	Architectures []string `yaml:"architectures"`
 	AutoUpdate    bool     `yaml:"auto_update"`
@@ -594,6 +607,12 @@ func (c *Config) resolveLayouts() error {
 						component = comp.Component
 					}
 					component = expandPlaceholders(component, osLayout.OS, cn.Codename, comp.Component)
+					// Matching apt's own Components: field, an upstream may list more
+					// than one real component division to fetch from (e.g. "main
+					// multiverse") -- each tried independently at fetch time (see
+					// releaseServedArchs/releaseListsSources), not fatal if one of
+					// them isn't actually served by this particular upstream.
+					components := strings.Fields(component)
 
 					upArchs := filterAll(def.Architectures)
 					if len(upArchs) == 0 {
@@ -609,7 +628,7 @@ func (c *Config) resolveLayouts() error {
 						Name:         upName,
 						URL:          url,
 						Suite:        suite,
-						Component:    component,
+						Component:    components,
 						Archs:        upArchs,
 						AutoUpdate:   def.AutoUpdate,
 						FetchSources: comp.Sources,

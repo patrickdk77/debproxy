@@ -121,7 +121,7 @@ func TestRebuildLiveSkipsExpensiveWorkWhenUpstreamUnchanged(t *testing.T) {
 		ResolvedLayouts: []model.Layout{{
 			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
 			Upstreams: []model.UpstreamSource{{
-				Name: "test-upstream", URL: srvURL, Suite: "trixie", Component: "main",
+				Name: "test-upstream", URL: srvURL, Suite: "trixie", Component: []string{"main"},
 				Archs: []string{"amd64"}, VerifyKeys: keyring,
 			}},
 		}},
@@ -193,7 +193,7 @@ func TestRebuildLiveKeepsExistingEntryOnUpstreamFetchFailure(t *testing.T) {
 			OS: "debian", Codename: "trixie", Component: "main", Archs: []string{"amd64"},
 			Upstreams: []model.UpstreamSource{{
 				// Nothing listens here -- guaranteed connection failure.
-				Name: "test-upstream", URL: "http://127.0.0.1:1", Suite: "trixie", Component: "main",
+				Name: "test-upstream", URL: "http://127.0.0.1:1", Suite: "trixie", Component: []string{"main"},
 				Archs: []string{"amd64"},
 			}},
 		}},

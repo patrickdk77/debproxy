@@ -22,10 +22,18 @@ type Checksums struct {
 
 // UpstreamSource is a fully resolved upstream for a specific layout context.
 type UpstreamSource struct {
-	Name       string
-	URL        string
-	Suite      string
-	Component  string
+	Name    string
+	URL     string
+	Suite   string
+	// Component lists the upstream's own real component division(s) to fetch
+	// from, e.g. ["main"] or ["main", "contrib"] -- matching apt's own
+	// Components: field, which has always accepted more than one. Each is
+	// tried independently against the upstream's Release; one not being
+	// listed there is not an error, just nothing to merge in from it (see
+	// releaseServedArchs/releaseListsSources). This is independent of the
+	// layout's own Component (see Layout), which is just the name packages
+	// from every configured upstream get merged and published under.
+	Component  []string
 	Archs      []string
 	AutoUpdate bool
 	// FetchSources enables pull-through of deb-src (source package) requests for
@@ -45,6 +53,14 @@ type UpstreamSource struct {
 	Network string
 }
 
+// ComponentKey joins Component into the single opaque string used wherever
+// a component needs to identify a cache entry, Valkey key namespace, or map
+// key -- "," is a safe, stable, order-preserving separator since apt
+// component names never contain it.
+func (u UpstreamSource) ComponentKey() string {
+	return strings.Join(u.Component, ",")
+}
+
 // DedupKey returns a key identifying which upstream mirror u fetches from --
 // URL, Suite, and Component together, since the same mirror can be resolved
 // into more than one UpstreamSource (e.g. shared across components or
@@ -52,7 +68,7 @@ type UpstreamSource struct {
 // excluded: they vary per resolved UpstreamSource without changing what's
 // actually fetched from upstream.
 func (u UpstreamSource) DedupKey() string {
-	return u.URL + "\x00" + u.Suite + "\x00" + u.Component
+	return u.URL + "\x00" + u.Suite + "\x00" + u.ComponentKey()
 }
 
 // Layout identifies a merged repository view: os / codename / component.

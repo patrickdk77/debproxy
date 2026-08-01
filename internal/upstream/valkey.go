@@ -156,7 +156,10 @@ func (c *IndexCache) adoptFromValkeyForComparison(ctx context.Context, upstream,
 }
 
 // adoptSrcsFromValkey is the Sources-index counterpart of adoptFromValkey.
-func (c *IndexCache) adoptSrcsFromValkey(ctx context.Context, cacheKey, upstream, suite, component string) ([]apt.RawSrc, bool) {
+// component is the joined Valkey-key-namespace form (see Fetcher.
+// componentKey); components is the real, unjoined list, needed only to
+// check releaseListsSources against the actual upstream Release.
+func (c *IndexCache) adoptSrcsFromValkey(ctx context.Context, cacheKey, upstream, suite, component string, components []string) ([]apt.RawSrc, bool) {
 	if c.valkey == nil {
 		return nil, false
 	}
@@ -169,11 +172,11 @@ func (c *IndexCache) adoptSrcsFromValkey(ctx context.Context, cacheKey, upstream
 
 	srcs, ok := b.fetchSrcs(ctx, upstream, suite, component)
 	if !ok {
-		// No srcs cached yet -- but if meta.Release itself confirms this
-		// upstream/component lists no Sources index at all (see
+		// No srcs cached yet -- but if meta.Release itself confirms none of
+		// these upstream components lists a Sources index at all (see
 		// releaseListsSources), that's already the fully confirmed answer,
 		// not a sign nobody's checked yet.
-		if meta.Release != nil && !releaseListsSources(meta.Release, component) {
+		if meta.Release != nil && !releaseListsSources(meta.Release, components) {
 			c.updateSrcs(cacheKey, meta.Release, nil)
 			return nil, true
 		}
@@ -184,8 +187,9 @@ func (c *IndexCache) adoptSrcsFromValkey(ctx context.Context, cacheKey, upstream
 }
 
 // adoptSrcsFromValkeyForComparison is adoptFromValkeyForComparison's Sources
-// counterpart -- see its doc comment. Not written back into the local cache.
-func (c *IndexCache) adoptSrcsFromValkeyForComparison(ctx context.Context, upstream, suite, component string) (*indexCacheEntry, bool) {
+// counterpart -- see its doc comment. Not written back into the local
+// cache. component/components: see adoptSrcsFromValkey.
+func (c *IndexCache) adoptSrcsFromValkeyForComparison(ctx context.Context, upstream, suite, component string, components []string) (*indexCacheEntry, bool) {
 	if c.valkey == nil {
 		return nil, false
 	}
@@ -199,7 +203,7 @@ func (c *IndexCache) adoptSrcsFromValkeyForComparison(ctx context.Context, upstr
 	if !ok {
 		// Same reasoning as adoptSrcsFromValkey: a confirmed-empty Release
 		// is a resolved answer, not a miss.
-		if meta.Release != nil && !releaseListsSources(meta.Release, component) {
+		if meta.Release != nil && !releaseListsSources(meta.Release, components) {
 			return &indexCacheEntry{srcsRelease: meta.Release, srcs: nil}, true
 		}
 		return nil, false

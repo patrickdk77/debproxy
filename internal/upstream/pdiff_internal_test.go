@@ -29,7 +29,7 @@ func TestTryPDiffRejectsForgedIndexDigest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src := model.UpstreamSource{Name: "test", URL: srv.URL, Suite: "trixie", Component: "main", Archs: []string{"amd64"}}
+	src := model.UpstreamSource{Name: "test", URL: srv.URL, Suite: "trixie", Component: []string{"main"}, Archs: []string{"amd64"}}
 	f := NewFetcher(src, nil)
 
 	rel := &apt.Release{

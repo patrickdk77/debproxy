@@ -141,7 +141,7 @@ func TestFetchIndexLockContentionServesLocalStaleInsteadOfDuplicateFetch(t *test
 	time.Sleep(1200 * time.Millisecond)
 
 	// Simulate another replica holding the fetch lock right now.
-	lockKey := keys.FetchLock(src.Name, src.Suite, src.Component)
+	lockKey := keys.FetchLock(src.Name, src.Suite, src.ComponentKey())
 	lock, ok, err := valkeycache.AcquireLock(ctx, rawClient, lockKey, time.Minute)
 	if err != nil || !ok {
 		t.Fatalf("pre-acquire lock: ok=%v err=%v", ok, err)
@@ -180,7 +180,7 @@ func TestFetchIndexReleasesLockAfterFetch(t *testing.T) {
 
 	// The lock must be released once the fetch completes -- a fresh
 	// acquisition attempt right after must succeed.
-	lockKey := keys.FetchLock(src.Name, src.Suite, src.Component)
+	lockKey := keys.FetchLock(src.Name, src.Suite, src.ComponentKey())
 	lock, ok, err := valkeycache.AcquireLock(ctx, rawClient, lockKey, time.Minute)
 	if err != nil {
 		t.Fatalf("acquire after fetch: %v", err)
@@ -438,7 +438,7 @@ func TestAdoptFromValkeyOutrightTrustsConfirmedEmptyArchs(t *testing.T) {
 		Name:       "test-upstream",
 		URL:        proxyURL,
 		Suite:      "trixie",
-		Component:  "main",
+		Component:  []string{"main"},
 		Archs:      []string{"arm64"}, // Release has no arm64 Packages at all
 		VerifyKeys: keyring,
 	}
@@ -494,7 +494,7 @@ func TestAdoptFromValkeyOutrightRejectsPartiallyUnreadableArchs(t *testing.T) {
 		Name:       "test-upstream",
 		URL:        srvURL,
 		Suite:      "trixie",
-		Component:  "main",
+		Component:  []string{"main"},
 		Archs:      []string{"amd64", "arm64"},
 		VerifyKeys: keyring,
 	}

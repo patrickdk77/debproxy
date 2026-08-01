@@ -134,7 +134,7 @@ func makeSource(t *testing.T, srvURL string, keyring openpgp.EntityList) model.U
 		Name:       "test-upstream",
 		URL:        srvURL,
 		Suite:      "trixie",
-		Component:  "main",
+		Component:  []string{"main"},
 		Archs:      []string{"amd64"},
 		VerifyKeys: keyring,
 	}
@@ -599,5 +599,96 @@ func TestFetchSourcesStaleFallbackOnDownloadError(t *testing.T) {
 	}
 	if len(srcs2) == 0 || srcs2[0].Version != "1.0" {
 		t.Fatalf("expected stale version 1.0 fallback, got %+v", srcs2)
+	}
+}
+
+// buildFakeUpstreamOneOfTwoComponents publishes a Release listing Packages
+// and Sources under "main" only -- no "multiverse" entries at all -- the
+// same shape as a real upstream (e.g. MongoDB's Debian repo) that simply
+// doesn't have a second component, used to test that a configured component
+// the Release doesn't list is skipped gracefully rather than erroring.
+func buildFakeUpstreamOneOfTwoComponents(t *testing.T, key *signing.Key) (srvURL string) {
+	t.Helper()
+
+	packagesContent := []byte("Package: hello\nVersion: 1.0\nArchitecture: amd64\n")
+	packagesSum := sha256.Sum256(packagesContent)
+
+	sourcesContent := []byte("Package: hello\nVersion: 1.0\nDirectory: pool/main/h/hello\n")
+	sourcesSum := sha256.Sum256(sourcesContent)
+
+	releaseBytes := []byte(fmt.Sprintf(
+		"Origin: Test\nCodename: trixie\nSuite: trixie\nComponents: main\nArchitectures: amd64\nSHA256:\n %s %d main/binary-amd64/Packages\n %s %d main/source/Sources\n",
+		hex.EncodeToString(packagesSum[:]), len(packagesContent),
+		hex.EncodeToString(sourcesSum[:]), len(sourcesContent),
+	))
+	inRelease, err := key.SignInline(releaseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dists/trixie/InRelease", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(inRelease)
+	})
+	mux.HandleFunc("/dists/trixie/main/binary-amd64/Packages", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(packagesContent)
+	})
+	mux.HandleFunc("/dists/trixie/main/source/Sources", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(sourcesContent)
+	})
+	// Deliberately no handler under multiverse/ -- the Release lists nothing
+	// there, so a request would be a test bug, not an expected fallback.
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestFetchIndexMultiComponentMergesAndSkipsMissing is the direct regression
+// for the reported config bug: component: "main multiverse" on an upstream
+// whose Release only lists "main" must still return main's packages, not
+// zero -- the missing component is skipped, not fatal, matching apt's own
+// Components: field semantics (more than one has always been valid there).
+func TestFetchIndexMultiComponentMergesAndSkipsMissing(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL := buildFakeUpstreamOneOfTwoComponents(t, key)
+
+	src := makeSource(t, srvURL, keyring)
+	src.Component = []string{"main", "multiverse"}
+	f := upstream.NewFetcher(src, nil)
+
+	idx, err := f.FetchIndex(context.Background())
+	if err != nil {
+		t.Fatalf("expected the missing multiverse component to be skipped, not fatal: %v", err)
+	}
+	paras := idx.ByArch["amd64"]
+	if len(paras) != 1 || paras[0].Package != "hello" {
+		t.Fatalf("expected exactly the hello package merged in from main, got %+v", paras)
+	}
+}
+
+// TestFetchSourcesMultiComponentMergesAndSkipsMissing is FetchIndex's Sources
+// counterpart above.
+func TestFetchSourcesMultiComponentMergesAndSkipsMissing(t *testing.T) {
+	key, keyring := testKey(t)
+	srvURL := buildFakeUpstreamOneOfTwoComponents(t, key)
+
+	src := makeSource(t, srvURL, keyring)
+	src.Component = []string{"main", "multiverse"}
+	f := upstream.NewFetcher(src, nil)
+	ctx := context.Background()
+
+	if _, err := f.FetchIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	srcs, err := f.FetchSources(ctx)
+	if err != nil {
+		t.Fatalf("expected the missing multiverse component to be skipped, not fatal: %v", err)
+	}
+	if len(srcs) != 1 || srcs[0].Package != "hello" {
+		t.Fatalf("expected exactly the hello source merged in from main, got %+v", srcs)
 	}
 }

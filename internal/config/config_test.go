@@ -66,6 +66,83 @@ layouts:
 	}
 }
 
+// TestLoadSplitsUpstreamComponentOnWhitespace confirms an upstream's
+// component: field accepts more than one value, space-separated -- matching
+// apt's own Components: field, which has always accepted more than one
+// (e.g. "main contrib"). Each is tried independently at fetch time (see
+// internal/upstream's releaseServedArchs/releaseListsSources); this only
+// covers that the config layer splits it correctly into
+// model.UpstreamSource.Component.
+func TestLoadSplitsUpstreamComponentOnWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "test.asc")
+	writeTestKey(t, keyPath)
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	err := os.WriteFile(cfgPath, []byte(`
+storage:
+  backend: filesystem
+  filesystem:
+    root: /tmp/debproxy
+upstreams:
+  debian-main:
+    url: http://deb.debian.org/debian
+    keys:
+      - `+strconv.Quote(keyPath)+`
+  mongo-80:
+    url: "http://repo.mongodb.org/apt/{os}"
+    suite: "{codename}/mongodb-org/8.0"
+    component: main multiverse
+    keys:
+      - `+strconv.Quote(keyPath)+`
+layouts:
+  - os: debian
+    architectures: [amd64]
+    codenames:
+      - codename: trixie
+        components:
+          - component: main
+            upstreams: [debian-main]
+          - component: mongodb80
+            upstreams: [mongo-80]
+`), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	foundMongo, foundMain := false, false
+	for _, layout := range cfg.ResolvedLayouts {
+		switch layout.Component {
+		case "mongodb80":
+			foundMongo = true
+			if len(layout.Upstreams) != 1 {
+				t.Fatalf("expected 1 upstream for mongodb80, got %d", len(layout.Upstreams))
+			}
+			got := layout.Upstreams[0].Component
+			if len(got) != 2 || got[0] != "main" || got[1] != "multiverse" {
+				t.Fatalf("expected Component [main multiverse], got %v", got)
+			}
+		case "main":
+			foundMain = true
+			got := layout.Upstreams[0].Component
+			if len(got) != 1 || got[0] != "main" {
+				t.Fatalf("expected single-value Component [main] for debian-main, got %v", got)
+			}
+		}
+	}
+	if !foundMongo {
+		t.Fatal("mongodb80 layout not found in resolved layouts")
+	}
+	if !foundMain {
+		t.Fatal("main layout not found in resolved layouts")
+	}
+}
+
 func minimalConfigYAML(keyPath, extra string) string {
 	return `
 storage:

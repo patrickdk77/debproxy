@@ -172,17 +172,18 @@ func (lf *lazyFetcher) ensureFetched(ctx context.Context, osName, codename, upst
 			if src.Name != upstreamName {
 				continue
 			}
-			fk := lazyFetchKey{src.URL, src.Suite, src.Component}
+			componentKey := src.ComponentKey()
+			fk := lazyFetchKey{src.URL, src.Suite, componentKey}
 			if lf.fetched[fk] {
 				continue
 			}
 			lf.fetched[fk] = true
 
-			slog.Info("fetching upstream packages", "upstream", src.Name, "component", src.Component)
+			slog.Info("fetching upstream packages", "upstream", src.Name, "component", componentKey)
 			f := upstream.NewFetcher(src, lf.client)
 			idx, err := f.FetchIndex(ctx)
 			if err != nil {
-				slog.Warn("fetch upstream index", "upstream", src.Name, "component", src.Component, "err", err)
+				slog.Warn("fetch upstream index", "upstream", src.Name, "component", componentKey, "err", err)
 				continue
 			}
 			comp := componentRef{component: layout.Component, autoUpdate: src.AutoUpdate}

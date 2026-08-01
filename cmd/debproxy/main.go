@@ -1482,16 +1482,17 @@ func saveLayoutMetadata(ctx context.Context, key layoutKey, upstreams []model.Up
 	namesByComponent := map[string][]string{}
 	seenName := map[string]map[string]bool{}
 	for _, u := range upstreams {
-		if !seenComponent[u.Component] {
-			seenComponent[u.Component] = true
-			components = append(components, u.Component)
+		key := u.ComponentKey()
+		if !seenComponent[key] {
+			seenComponent[key] = true
+			components = append(components, key)
 		}
-		if seenName[u.Component] == nil {
-			seenName[u.Component] = map[string]bool{}
+		if seenName[key] == nil {
+			seenName[key] = map[string]bool{}
 		}
-		if !seenName[u.Component][u.Name] {
-			seenName[u.Component][u.Name] = true
-			namesByComponent[u.Component] = append(namesByComponent[u.Component], u.Name)
+		if !seenName[key][u.Name] {
+			seenName[key][u.Name] = true
+			namesByComponent[key] = append(namesByComponent[key], u.Name)
 		}
 	}
 

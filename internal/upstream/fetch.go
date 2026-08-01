@@ -61,7 +61,7 @@ func (f *Fetcher) distsURL(rel string) string {
 }
 
 // InReleaseURL returns the InRelease URL this fetcher's cache entry is keyed
-// by (paired with f.src.Component) -- exported so a caller holding the
+// by (paired with f.componentKey()) -- exported so a caller holding the
 // *Fetcher, rather than the raw model.UpstreamSource, can evict this entry
 // once done with it (see IndexCache.EvictUpstream) without duplicating this
 // URL construction itself.
@@ -69,18 +69,25 @@ func (f *Fetcher) InReleaseURL() string {
 	return f.distsURL("InRelease")
 }
 
+// componentKey joins f.src.Component into the single opaque string used
+// everywhere a component identifies a cache entry or Valkey key namespace --
+// see model.UpstreamSource.ComponentKey.
+func (f *Fetcher) componentKey() string {
+	return f.src.ComponentKey()
+}
+
 // cacheKey is the IndexCache key for this fetcher's upstream+suite+
 // component -- the single source of this formula so FetchIndex,
 // FetchSources, and the AdoptFromValkeyOutright family never drift apart.
 func (f *Fetcher) cacheKey() string {
-	return f.InReleaseURL() + "\x00" + f.src.Component
+	return f.InReleaseURL() + "\x00" + f.componentKey()
 }
 
-// Component returns the configured component this fetcher's upstream source
-// belongs to (paired with InReleaseURL to form a cache key -- see
-// IndexCache.EvictUpstream).
+// Component returns the configured component(s) this fetcher's upstream
+// source belongs to, joined into IndexCache.EvictUpstream's single-string
+// key form (paired with InReleaseURL) -- see componentKey.
 func (f *Fetcher) Component() string {
-	return f.src.Component
+	return f.componentKey()
 }
 
 // acquireByHash reports whether the upstream release advertises by-hash index
@@ -100,53 +107,70 @@ func (f *Fetcher) indexURL(relPath, sha256 string, byHash bool) string {
 	return f.distsURL(relPath)
 }
 
-// releaseServedArchs returns the subset of srcArchs (plus "all", if served)
-// that rel actually lists a Packages file for under component -- the
-// authoritative way to know which architectures an upstream serves, used by
-// both FetchIndex (to decide what to fetch) and AdoptFromValkeyOutright (to
-// tell "not yet confirmed" apart from "confirmed to serve nothing"). The
-// Architectures field itself is not used: upstreams like archive.ubuntu.com
-// list every architecture there even though arm64 Packages are only served
-// from ports.ubuntu.com. Checking rel.Files is authoritative: if no Packages
-// variant is listed for a given arch, the upstream does not serve it -- and
-// that fact never changes for a given (immutable, digest-addressed) Release,
-// so it's safe to trust from a cached copy without re-fetching to confirm.
-func releaseServedArchs(rel *apt.Release, component string, srcArchs []string) []string {
-	archs := make([]string, 0, len(srcArchs)+1)
-	for _, arch := range srcArchs {
-		prefix := component + "/binary-" + arch + "/Packages"
-		for path := range rel.Files {
-			if strings.HasPrefix(path, prefix) {
-				archs = append(archs, arch)
-				break
-			}
+// releaseServedArchs returns the union, across every component in
+// components, of the subset of srcArchs (plus "all", if served) that rel
+// actually lists a Packages file for -- the authoritative way to know which
+// architectures an upstream serves, used by both FetchIndex (to decide what
+// to fetch) and AdoptFromValkeyOutright (to tell "not yet confirmed" apart
+// from "confirmed to serve nothing"). components mirrors apt's own
+// Components: field, which has always accepted more than one (e.g. "main
+// contrib"): each is checked independently, and one not being listed for a
+// given arch is not an error, just nothing to contribute from it -- matching
+// how a real "Components: main contrib" upstream can serve some
+// architectures from only one of the two. The Architectures field itself is
+// not used: upstreams like archive.ubuntu.com list every architecture there
+// even though arm64 Packages are only served from ports.ubuntu.com. Checking
+// rel.Files is authoritative: if no Packages variant is listed for a given
+// (component, arch), that component does not serve it there -- and that
+// fact never changes for a given (immutable, digest-addressed) Release, so
+// it's safe to trust from a cached copy without re-fetching to confirm.
+func releaseServedArchs(rel *apt.Release, components []string, srcArchs []string) []string {
+	seen := map[string]bool{}
+	var archs []string
+	add := func(arch string) {
+		if !seen[arch] {
+			seen[arch] = true
+			archs = append(archs, arch)
 		}
 	}
-	// Always include binary-all/Packages when the upstream serves it,
-	// regardless of configured architectures. avail.Build fans these
-	// packages into every binary arch index, capturing packages that only
-	// appear in the dedicated all-packages file (e.g. some Debian packages
-	// absent from per-arch Packages files).
-	allPrefix := component + "/binary-all/Packages"
-	for path := range rel.Files {
-		if strings.HasPrefix(path, allPrefix) {
-			archs = append(archs, "all")
-			break
+	for _, component := range components {
+		for _, arch := range srcArchs {
+			prefix := component + "/binary-" + arch + "/Packages"
+			for path := range rel.Files {
+				if strings.HasPrefix(path, prefix) {
+					add(arch)
+					break
+				}
+			}
+		}
+		// Always include binary-all/Packages when the upstream serves it,
+		// regardless of configured architectures. avail.Build fans these
+		// packages into every binary arch index, capturing packages that
+		// only appear in the dedicated all-packages file (e.g. some Debian
+		// packages absent from per-arch Packages files).
+		allPrefix := component + "/binary-all/Packages"
+		for path := range rel.Files {
+			if strings.HasPrefix(path, allPrefix) {
+				add("all")
+				break
+			}
 		}
 	}
 	return archs
 }
 
-// releaseListsSources reports whether rel lists any Sources file variant
-// under component -- the same file-existence check fetchSourcesFile makes
-// before ever issuing a request, so a cached Release can confirm "this
-// upstream/component has no Sources at all" without a network round trip,
-// the Sources counterpart to releaseServedArchs.
-func releaseListsSources(rel *apt.Release, component string) bool {
-	base := component + "/source/"
-	for _, v := range srcVariants {
-		if _, ok := rel.Files[base+v.ext]; ok {
-			return true
+// releaseListsSources reports whether rel lists a Sources file variant under
+// any of components -- the same file-existence check fetchSourcesFile makes
+// before ever issuing a request, so a cached Release can confirm "none of
+// these upstream components has Sources at all" without a network round
+// trip, the Sources counterpart to releaseServedArchs.
+func releaseListsSources(rel *apt.Release, components []string) bool {
+	for _, component := range components {
+		base := component + "/source/"
+		for _, v := range srcVariants {
+			if _, ok := rel.Files[base+v.ext]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -215,8 +239,8 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 		// at all). Adopt it and skip the network entirely.
 		if f.cache.valkey != nil {
 			archs := append(append([]string{}, f.src.Archs...), "all")
-			if cached, ok := f.cache.adoptFromValkey(ctx, cacheKey, f.src.Name, f.src.Suite, f.src.Component, archs); ok {
-				slog.Debug("upstream index adopted from valkey (FetchIndex fast path)", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component)
+			if cached, ok := f.cache.adoptFromValkey(ctx, cacheKey, f.src.Name, f.src.Suite, f.componentKey(), archs); ok {
+				slog.Debug("upstream index adopted from valkey (FetchIndex fast path)", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey())
 				return &Index{Release: cached.release, ByArch: cached.archPkgs}, nil
 			}
 		}
@@ -237,7 +261,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 	// Nothing fresh anywhere. When Valkey coordination is enabled, only one
 	// replica should hit the network for this upstream at a time.
 	if f.cache != nil && f.cache.valkey != nil {
-		acquired, stopLock, err := f.cache.acquireFetchLock(ctx, f.src.Name, f.src.Suite, f.src.Component)
+		acquired, stopLock, err := f.cache.acquireFetchLock(ctx, f.src.Name, f.src.Suite, f.componentKey())
 		if err != nil {
 			slog.Warn("valkey fetch lock unavailable, fetching directly", "upstream", f.src.Name, "err", err)
 		} else if !acquired {
@@ -248,7 +272,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 			// through and fetch anyway: availability wins over strict
 			// single-fetcher exclusivity on a cold-start race.
 			if cachedEntry != nil {
-				slog.Debug("upstream index: another replica is fetching, serving stale comparison basis", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component)
+				slog.Debug("upstream index: another replica is fetching, serving stale comparison basis", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey())
 				return &Index{Release: cachedEntry.release, ByArch: cachedEntry.archPkgs}, nil
 			}
 		} else {
@@ -267,7 +291,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 	fetchCtx, cancel := withFallbackTimeout(ctx, haveArchFallback && clientIsWaiting(ctx))
 	defer cancel()
 
-	slog.Debug("upstream index: performing real network fetch", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component, "have_arch_fallback", haveArchFallback)
+	slog.Debug("upstream index: performing real network fetch", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey(), "have_arch_fallback", haveArchFallback)
 	releaseBody, resp, err := f.fetchVerifiedRelease(fetchCtx, cachedEntry)
 	if err != nil {
 		// All retries exhausted  --  serve stale cached data rather than failing hard.
@@ -308,7 +332,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 	archs := releaseServedArchs(rel, f.src.Component, f.src.Archs)
 	if len(archs) < len(f.src.Archs) {
 		slog.Debug("upstream does not serve all configured arches for component",
-			"upstream", f.src.Name, "component", f.src.Component,
+			"upstream", f.src.Name, "component", f.componentKey(),
 			"configured", f.src.Archs, "available", archs)
 	}
 
@@ -320,7 +344,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 		// all (see above) so a hung Packages download degrades fast into the
 		// per-arch stale fallback right below, same reasoning as
 		// fetchVerifiedRelease's own use of it.
-		paras, err := f.fetchPackagesMaybeReuse(fetchCtx, rel, arch, cachedEntry)
+		paras, err := f.fetchPackagesForArch(fetchCtx, rel, arch, cachedEntry)
 		if err != nil {
 			if cachedEntry != nil {
 				if stale, ok := cachedEntry.archPkgs[arch]; ok {
@@ -382,7 +406,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 		}
 		f.cache.store(cacheKey, entry)
 		if f.cache.valkey != nil {
-			f.cache.publishToValkey(ctx, f.src.Name, f.src.Suite, f.src.Component, entry)
+			f.cache.publishToValkey(ctx, f.src.Name, f.src.Suite, f.componentKey(), entry)
 		}
 	}
 
@@ -464,7 +488,7 @@ func (f *Fetcher) ReleaseOnly(ctx context.Context) (rel *apt.Release, ok bool) {
 	if f.cache.valkey == nil {
 		return nil, false
 	}
-	meta, ok := f.cache.valkey.getMetaRaw(ctx, f.src.Name, f.src.Suite, f.src.Component)
+	meta, ok := f.cache.valkey.getMetaRaw(ctx, f.src.Name, f.src.Suite, f.componentKey())
 	if !ok {
 		return nil, false
 	}
@@ -496,7 +520,7 @@ func (f *Fetcher) cachedForComparison(ctx context.Context, cacheKey string, arch
 	if f.cache.valkey == nil {
 		return nil, false
 	}
-	return f.cache.adoptFromValkeyForComparison(ctx, f.src.Name, f.src.Suite, f.src.Component, archs)
+	return f.cache.adoptFromValkeyForComparison(ctx, f.src.Name, f.src.Suite, f.componentKey(), archs)
 }
 
 // fetchVerifiedRelease sends a conditional GET (ETag/Last-Modified) for
@@ -529,7 +553,7 @@ func (f *Fetcher) fetchVerifiedRelease(ctx context.Context, cached *indexCacheEn
 				fps = append(fps, hex.EncodeToString(e.PrimaryKey.Fingerprint[:]))
 			}
 			slog.Error("InRelease signature verification failed, falling back to Release.gpg",
-				"upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component,
+				"upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey(),
 				"err", verr, "trusted_key_fingerprints", fps, "actual_signer_key_ids", signerIDs)
 			return f.fetchDetachedRelease(ctx)
 		}
@@ -558,7 +582,7 @@ func (f *Fetcher) fetchVerifiedReleaseFull(ctx context.Context) ([]byte, *http.R
 				fps = append(fps, hex.EncodeToString(e.PrimaryKey.Fingerprint[:]))
 			}
 			slog.Error("InRelease signature verification failed, falling back to Release.gpg",
-				"upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component,
+				"upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey(),
 				"err", verr, "trusted_key_fingerprints", fps, "actual_signer_key_ids", signerIDs)
 			return f.fetchDetachedRelease(ctx)
 		}
@@ -591,7 +615,7 @@ func (f *Fetcher) fetchDetachedRelease(ctx context.Context) ([]byte, *http.Respo
 			fps = append(fps, hex.EncodeToString(e.PrimaryKey.Fingerprint[:]))
 		}
 		slog.Error("Release.gpg signature verification failed",
-			"upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component,
+			"upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey(),
 			"err", err, "trusted_key_fingerprints", fps, "actual_signer_key_ids", signerIDs)
 		return nil, nil, err
 	}
@@ -622,17 +646,58 @@ var pkgVariants = []pkgVariant{
 	}},
 }
 
-// fetchPackagesMaybeReuse fetches Packages for arch, reusing the cached
-// paragraphs when the SHA256 in rel matches what was cached previously.
-func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release, arch string, cached *indexCacheEntry) ([]apt.RawPkg, error) {
-	base := fmt.Sprintf("%s/binary-%s/", f.src.Component, arch)
+// fetchPackagesForArch fetches and merges Packages for arch across every
+// component in f.src.Component (see model.UpstreamSource.Component -- apt's
+// own Components: field has always accepted more than one, e.g. "main
+// contrib"). Each is tried independently: fetchPackagesMaybeReuse already
+// returns (nil, nil) for a component that simply lists no Packages file for
+// this arch at all (nothing to contribute, not an error), so those are
+// silently skipped while merged results still come back from whichever
+// components do have something -- matching how a real multi-component
+// upstream can serve some architectures from only one of its components.
+//
+// A real fetch error (network failure, not "not listed") on any one
+// component fails the whole arch rather than just that component: there is
+// no cache-per-component granularity to preserve a partial merge across
+// calls, so this makes the same call FetchIndex already makes at the arch
+// level (fall back to whatever's cached for the whole arch, or mark it
+// incomplete) rather than inventing a new partial-failure state.
+//
+// The SHA-reuse and PDiff shortcuts inside fetchPackagesMaybeReuse are only
+// safe when there is exactly one component: cached.archPkgs[arch] holds the
+// *merged* result across every configured component, so comparing it
+// against a single component's own SHA and returning it outright would
+// silently include other components' packages in a check that only
+// verified this one component didn't change. With more than one component,
+// those shortcuts are skipped (allowCacheReuse=false); each component's own
+// conditional GET (ETag/If-None-Match, see getConditional) still avoids
+// re-downloading unchanged content over the wire either way.
+func (f *Fetcher) fetchPackagesForArch(ctx context.Context, rel *apt.Release, arch string, cached *indexCacheEntry) ([]apt.RawPkg, error) {
+	allowCacheReuse := len(f.src.Component) == 1
+	var merged []apt.RawPkg
+	for _, component := range f.src.Component {
+		paras, err := f.fetchPackagesMaybeReuse(ctx, rel, component, arch, cached, allowCacheReuse)
+		if err != nil {
+			return nil, err
+		}
+		merged = append(merged, paras...)
+	}
+	return merged, nil
+}
+
+// fetchPackagesMaybeReuse fetches Packages for component+arch, reusing the
+// cached paragraphs when the SHA256 in rel matches what was cached
+// previously and allowCacheReuse is true (see fetchPackagesForArch for why
+// that's only safe with exactly one component).
+func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release, component, arch string, cached *indexCacheEntry, allowCacheReuse bool) ([]apt.RawPkg, error) {
+	base := fmt.Sprintf("%s/binary-%s/", component, arch)
 	byHash := acquireByHash(rel)
 	if byHash {
 		slog.Debug("upstream supports by-hash index fetching", "upstream", f.src.Name, "arch", arch)
 	}
 
 	// Check if the Release hash matches the cached version  --  if so, skip the fetch.
-	if cached != nil && cached.release != nil {
+	if allowCacheReuse && cached != nil && cached.release != nil {
 		for _, v := range pkgVariants {
 			relPath := base + v.ext
 			newEntry, inNew := rel.Files[relPath]
@@ -646,7 +711,7 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 	}
 
 	// SHA256 changed  -- try PDiff before falling back to a full download.
-	if cached != nil && cached.release != nil {
+	if allowCacheReuse && cached != nil && cached.release != nil {
 		if cachedSHA256 := cached.release.Files[base+"Packages"].SHA256; cachedSHA256 != "" {
 			if updated, ok := f.tryPDiff(ctx, rel, base, arch, cachedSHA256, cached.archPkgs[arch]); ok {
 				return updated, nil
@@ -811,13 +876,13 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 		return nil, false
 	}
 	if err := verifyDigest(data, relEntry.SHA256); err != nil {
-		slog.Warn("pdiff: sources index digest mismatch", "upstream", f.src.Name, "component", f.src.Component, "err", err)
+		slog.Warn("pdiff: sources index digest mismatch", "upstream", f.src.Name, "component", f.componentKey(), "err", err)
 		return nil, false
 	}
 
 	idx, err := apt.ParsePDiffIndex(bytes.NewReader(data))
 	if err != nil {
-		slog.Warn("pdiff: parse sources index failed", "upstream", f.src.Name, "component", f.src.Component, "err", err)
+		slog.Warn("pdiff: parse sources index failed", "upstream", f.src.Name, "component", f.componentKey(), "err", err)
 		return nil, false
 	}
 
@@ -836,16 +901,16 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 		patchRelPath := base + "Sources.diff/" + name + ".gz"
 		pdata, presp, perr := f.getConditional(ctx, f.distsURL(patchRelPath), "", "")
 		if perr != nil || presp.StatusCode != http.StatusOK {
-			slog.Warn("pdiff: fetch sources patch failed", "upstream", f.src.Name, "component", f.src.Component, "name", name)
+			slog.Warn("pdiff: fetch sources patch failed", "upstream", f.src.Name, "component", f.componentKey(), "name", name)
 			return nil, false
 		}
 		entry, ok := rel.Files[patchRelPath]
 		if !ok {
-			slog.Warn("pdiff: sources patch not listed in Release", "upstream", f.src.Name, "component", f.src.Component, "name", name)
+			slog.Warn("pdiff: sources patch not listed in Release", "upstream", f.src.Name, "component", f.componentKey(), "name", name)
 			return nil, false
 		}
 		if err := verifyDigest(pdata, entry.SHA256); err != nil {
-			slog.Warn("pdiff: sources patch digest mismatch", "upstream", f.src.Name, "component", f.src.Component, "name", name, "err", err)
+			slog.Warn("pdiff: sources patch digest mismatch", "upstream", f.src.Name, "component", f.componentKey(), "name", name, "err", err)
 			return nil, false
 		}
 		gr, gerr := gzip.NewReader(bytes.NewReader(pdata))
@@ -859,7 +924,7 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 		}
 		srcs, err = apt.ApplyEdPatchSrc(srcs, decompressed)
 		if err != nil {
-			slog.Warn("pdiff: apply sources patch failed", "upstream", f.src.Name, "component", f.src.Component, "name", name, "err", err)
+			slog.Warn("pdiff: apply sources patch failed", "upstream", f.src.Name, "component", f.componentKey(), "name", name, "err", err)
 			return nil, false
 		}
 	}
@@ -867,11 +932,11 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 	// Verify final result matches expected SHA256 from the PDiff Index.
 	if err := verifyDigest(apt.SerializeRawSrcs(srcs), idx.CurrentSHA256); err != nil {
 		slog.Warn("pdiff: final Sources SHA256 mismatch after applying patches  -- falling back to full fetch",
-			"upstream", f.src.Name, "component", f.src.Component, "err", err)
+			"upstream", f.src.Name, "component", f.componentKey(), "err", err)
 		return nil, false
 	}
 
-	slog.Debug("pdiff: updated Sources index incrementally", "upstream", f.src.Name, "component", f.src.Component, "patches", len(chain))
+	slog.Debug("pdiff: updated Sources index incrementally", "upstream", f.src.Name, "component", f.componentKey(), "patches", len(chain))
 	return srcs, true
 }
 
@@ -902,7 +967,7 @@ func (f *Fetcher) srcsCachedForComparison(ctx context.Context, cacheKey string) 
 	if f.cache.valkey == nil {
 		return nil, false
 	}
-	return f.cache.adoptSrcsFromValkeyForComparison(ctx, f.src.Name, f.src.Suite, f.src.Component)
+	return f.cache.adoptSrcsFromValkeyForComparison(ctx, f.src.Name, f.src.Suite, f.componentKey(), f.src.Component)
 }
 
 // FetchSources downloads and parses the upstream Sources index for the configured
@@ -914,8 +979,8 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	// Valkey's Sources data more recently than our local copy. Adopt it and
 	// skip the network entirely, mirroring FetchIndex's fast path.
 	if f.cache != nil && f.cache.valkey != nil {
-		if srcs, ok := f.cache.adoptSrcsFromValkey(ctx, cacheKey, f.src.Name, f.src.Suite, f.src.Component); ok {
-			slog.Debug("upstream Sources adopted from valkey (FetchSources fast path)", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component)
+		if srcs, ok := f.cache.adoptSrcsFromValkey(ctx, cacheKey, f.src.Name, f.src.Suite, f.componentKey(), f.src.Component); ok {
+			slog.Debug("upstream Sources adopted from valkey (FetchSources fast path)", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey())
 			return srcs, nil
 		}
 	}
@@ -929,14 +994,14 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	// Nothing fresh anywhere. When Valkey coordination is enabled, only one
 	// replica should hit the network for this upstream at a time.
 	if f.cache != nil && f.cache.valkey != nil {
-		acquired, stopLock, err := f.cache.acquireFetchLock(ctx, f.src.Name, f.src.Suite, f.src.Component)
+		acquired, stopLock, err := f.cache.acquireFetchLock(ctx, f.src.Name, f.src.Suite, f.componentKey())
 		if err != nil {
 			slog.Warn("valkey fetch lock unavailable, fetching directly", "upstream", f.src.Name, "err", err)
 		} else if !acquired {
 			// Another replica is already fetching -- serve local stale srcs
 			// if we have any rather than duplicate the request.
 			if cachedEntry != nil && cachedEntry.srcs != nil {
-				slog.Debug("upstream Sources: another replica is fetching, serving stale comparison basis", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component)
+				slog.Debug("upstream Sources: another replica is fetching, serving stale comparison basis", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey())
 				return cachedEntry.srcs, nil
 			}
 		} else {
@@ -951,7 +1016,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	fetchCtx, cancel := withFallbackTimeout(ctx, haveSrcsFallback && clientIsWaiting(ctx))
 	defer cancel()
 
-	slog.Debug("upstream Sources: performing real network fetch", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component, "have_srcs_fallback", haveSrcsFallback)
+	slog.Debug("upstream Sources: performing real network fetch", "upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey(), "have_srcs_fallback", haveSrcsFallback)
 	releaseBody, resp, err := f.fetchVerifiedRelease(fetchCtx, cachedEntry)
 	if err != nil {
 		// All retries exhausted  --  serve stale cached data rather than failing
@@ -985,10 +1050,16 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	if rel == nil {
 		return nil, nil
 	}
-	base := f.src.Component + "/source/"
 
-	// Cache hit: if SHA256 unchanged, return cached srcs immediately.
-	if cachedEntry != nil && cachedEntry.srcsRelease != nil && cachedEntry.srcs != nil {
+	// Single-component cache hit: if SHA256 unchanged, return cached srcs
+	// immediately. Only safe with exactly one component (see
+	// fetchSourcesForComponents): cachedEntry.srcs holds the *merged* result
+	// across every configured component, so comparing it against one
+	// component's own SHA and returning it outright would silently include
+	// other components' Sources in a check that only verified this one
+	// didn't change.
+	if len(f.src.Component) == 1 && cachedEntry != nil && cachedEntry.srcsRelease != nil && cachedEntry.srcs != nil {
+		base := f.src.Component[0] + "/source/"
 		for _, v := range srcVariants {
 			relPath := base + v.ext
 			newEntry, inNew := rel.Files[relPath]
@@ -1004,7 +1075,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 				if f.cache != nil {
 					f.cache.updateSrcs(cacheKey, rel, updated)
 					if f.cache.valkey != nil {
-						f.cache.publishSrcsToValkey(ctx, f.src.Name, f.src.Suite, f.src.Component, updated)
+						f.cache.publishSrcsToValkey(ctx, f.src.Name, f.src.Suite, f.componentKey(), updated)
 					}
 				}
 				return updated, nil
@@ -1012,7 +1083,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 		}
 	}
 
-	srcs, err := f.fetchSourcesFile(fetchCtx, rel, base)
+	srcs, err := f.fetchSourcesForComponents(fetchCtx, rel)
 	if err != nil {
 		// Network/transport failure downloading the Sources file itself (as
 		// opposed to a missing/bad-status variant, which fetchSourcesFile
@@ -1024,7 +1095,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 		// slightly stale) copy already in hand from cachedForComparison above.
 		if haveSrcsFallback {
 			slog.Warn("fetch failed, serving stale sources",
-				"upstream", f.src.Name, "suite", f.src.Suite, "component", f.src.Component, "err", err)
+				"upstream", f.src.Name, "suite", f.src.Suite, "component", f.componentKey(), "err", err)
 			return cachedEntry.srcs, nil
 		}
 		return nil, err
@@ -1032,10 +1103,32 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	if srcs != nil && f.cache != nil {
 		f.cache.updateSrcs(cacheKey, rel, srcs)
 		if f.cache.valkey != nil {
-			f.cache.publishSrcsToValkey(ctx, f.src.Name, f.src.Suite, f.src.Component, srcs)
+			f.cache.publishSrcsToValkey(ctx, f.src.Name, f.src.Suite, f.componentKey(), srcs)
 		}
 	}
 	return srcs, nil
+}
+
+// fetchSourcesForComponents fetches and merges the Sources file across every
+// component in f.src.Component (see model.UpstreamSource.Component -- apt's
+// own Components: field has always accepted more than one). Each is tried
+// independently: fetchSourcesFile already returns (nil, nil) for a component
+// that lists no Sources variant at all (nothing to contribute, not an
+// error), so those are silently skipped while merged entries still come
+// back from whichever components do have one. A real fetch error on any one
+// component fails the whole call, the same tradeoff fetchPackagesForArch
+// makes for Packages.
+func (f *Fetcher) fetchSourcesForComponents(ctx context.Context, rel *apt.Release) ([]apt.RawSrc, error) {
+	var merged []apt.RawSrc
+	for _, component := range f.src.Component {
+		base := component + "/source/"
+		srcs, err := f.fetchSourcesFile(ctx, rel, base)
+		if err != nil {
+			return nil, err
+		}
+		merged = append(merged, srcs...)
+	}
+	return merged, nil
 }
 
 // fetchSourcesFile downloads and parses the Sources file for one component,

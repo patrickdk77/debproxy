@@ -216,13 +216,13 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 				idx, _ = f.AdoptFromValkeyOutright(ctx)
 			}
 			if idx != nil {
-				slog.Debug("upstream index adopted from valkey outright", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
+				slog.Debug("upstream index adopted from valkey outright", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey())
 			} else {
-				slog.Debug("upstream index outright-adopt miss, falling through to normal fetch path", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "layout_data_fresh", layoutDataFresh)
+				slog.Debug("upstream index outright-adopt miss, falling through to normal fetch path", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey(), "layout_data_fresh", layoutDataFresh)
 				var err error
 				idx, err = f.FetchIndex(ctx)
 				if err != nil {
-					slog.Error("upstream index unavailable, skipping", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
+					slog.Error("upstream index unavailable, skipping", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey(), "err", err)
 					realFetchFailed.Store(true)
 					return
 				}
@@ -232,7 +232,7 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			for _, stanzas := range idx.ByArch {
 				total += len(stanzas)
 			}
-			slog.Debug("fetched upstream index", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "packages", total)
+			slog.Debug("fetched upstream index", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey(), "packages", total)
 			results[i] = upstreamResult{component: j.component, src: j.src, idx: idx}
 		}(i, j)
 	}
@@ -421,20 +421,20 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 					raws, _ = f.AdoptSourcesFromValkeyOutright(ctx)
 				}
 				if raws != nil {
-					slog.Debug("upstream Sources adopted from valkey outright", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component)
+					slog.Debug("upstream Sources adopted from valkey outright", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey())
 				} else {
-					slog.Debug("upstream Sources outright-adopt miss, falling through to normal fetch path", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "layout_data_fresh", layoutDataFresh)
+					slog.Debug("upstream Sources outright-adopt miss, falling through to normal fetch path", "upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey(), "layout_data_fresh", layoutDataFresh)
 					var err error
 					raws, err = f.FetchSources(ctx)
 					if err != nil {
 						slog.Warn("upstream Sources unavailable, skipping",
-							"upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.Component, "err", err)
+							"upstream", j.src.Name, "suite", j.src.Suite, "component", j.src.ComponentKey(), "err", err)
 						realFetchFailed.Store(true)
 						return
 					}
 					didRealFetch.Store(true)
 				}
-				slog.Debug("fetched upstream Sources", "upstream", j.src.Name, "component", j.src.Component, "packages", len(raws))
+				slog.Debug("fetched upstream Sources", "upstream", j.src.Name, "component", j.src.ComponentKey(), "packages", len(raws))
 				srcResults[i] = srcResult{j.component, j.src, raws}
 			}(i, j)
 		}
