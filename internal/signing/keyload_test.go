@@ -2,6 +2,7 @@ package signing
 
 import (
 	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -63,6 +64,31 @@ func TestReadKeyring_ToleratesInvalidUIDSelfSig(t *testing.T) {
 		t.Fatalf("ReadKeyring returned no usable private key (entities=%d)", len(kr))
 	}
 	t.Logf("lenient parse recovered private key, entities=%d", len(kr))
+}
+
+// TestReadKeyring_WarnsOnLenientFallback confirms the lenient recovery path
+// logs a warning naming the affected key -- this is what makes a broken
+// exported debproxy.asc/gpg discoverable at load time instead of only when a
+// downstream strict verifier (gpg, sequoia's sqv) later rejects it.
+func TestReadKeyring_WarnsOnLenientFallback(t *testing.T) {
+	broken := tamperUID(t, newTestSecretKeyBinary(t))
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	if _, err := ReadKeyring(broken); err != nil {
+		t.Fatalf("ReadKeyring rejected a key with only an invalid UID self-sig: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "lenient fallback") {
+		t.Fatalf("expected a warning about the lenient fallback, got log output: %q", out)
+	}
+	if !strings.Contains(out, "level=WARN") {
+		t.Fatalf("expected the message logged at WARN level, got: %q", out)
+	}
 }
 
 // TestReadKeyring_ToleratesMissingArmorCRC confirms an ASCII-armored key with

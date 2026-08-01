@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -36,6 +37,18 @@ func ReadKeyring(data []byte) (openpgp.EntityList, error) {
 	if keys, err := readStrict(data); err == nil {
 		return keys, nil
 	} else if lenient, lerr := readLenient(data); lerr == nil && len(lenient) > 0 {
+		// The tolerance below only makes loading survive a bad UID
+		// self-signature -- it does not, and cannot, make that signature
+		// valid. Anything later serialized from this entity (notably
+		// signing.Key.Publish's exported .asc/.gpg) carries the exact same
+		// defect, and strict OpenPGP verifiers (gpg, sequoia's sqv) will
+		// drop the identity and reject it. Warn loudly here, once, at the
+		// point the tolerance is actually exercised, so a broken published
+		// key is never silently discovered only by a downstream consumer.
+		for _, e := range lenient {
+			slog.Warn("openpgp: key loaded via lenient fallback after failing strict validation; any public key exported from it (e.g. debproxy.asc) will carry the same defect and may be rejected by strict verifiers such as gpg or sequoia's sqv -- regenerate this key's User ID self-signature (see README.md)",
+				"key_id", e.PrimaryKey.KeyIdString(), "strict_parse_err", err)
+		}
 		return lenient, nil
 	} else {
 		// Surface the strict error: it names the real defect, and the lenient

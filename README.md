@@ -20,16 +20,56 @@ debproxy serve --config config.example.yaml
 ## Generating the repository signing key
 
 debproxy signs every snapshot and `/live` index it publishes. You need a private
-key in ASCII-armored OpenPGP format. Generate one with GnuPG:
+key in ASCII-armored OpenPGP format. Generate one with GnuPG, **using your real
+identity directly** -- substitute your own name and email into the command below
+rather than generating a placeholder and renaming it later:
 
 ```bash
 gpg --batch --passphrase '' --quick-gen-key \
-    'Debproxy Signing Key <apt@example.com>' rsa4096
+    'Your Org Debproxy <debproxy@your-domain.example>' rsa4096
 
 # Export the private key (keep this secret)
-gpg --armor --export-secret-keys apt@example.com \
+gpg --armor --export-secret-keys debproxy@your-domain.example \
     > /etc/debproxy/keys/debproxy-signing.asc
+```
 
+**Verify the export before deploying it.** A key whose User ID was edited or
+re-typed after generation (rather than created with the right identity up
+front) can end up with a self-signature that no longer matches the UID text --
+gpg and other strict OpenPGP tools (sequoia's `sqv`, used by newer Debian apt)
+then drop the identity entirely and reject the key, even though debproxy
+itself will still load and sign with it (see `internal/signing/keyload.go`'s
+lenient key-loading tolerance, which deliberately doesn't fail on this so a
+signing key already in this state doesn't take the server down -- but that
+tolerance can't make an invalid self-signature valid, it only avoids crashing
+on it). Confirm the export is clean:
+
+```bash
+gpg --dearmor < /etc/debproxy/keys/debproxy-signing.asc | gpg --list-packets | grep -i "user id\|sig"
+# Expect a "User ID packet" line followed by a signature packet with no
+# complaints. Re-importing into a scratch keyring is a stronger check:
+GNUPGHOME=$(mktemp -d) gpg --import /etc/debproxy/keys/debproxy-signing.asc
+# If this prints a uid line (not "new key but contains no user ID - skipped"),
+# the self-signature is valid.
+```
+
+**If you ever need to change the name or email on an existing key**, never
+hand-edit the exported `.asc`/`.gpg` file or the UID text directly -- that
+breaks the self-signature the same way (the signature is computed over the
+exact UID bytes; changing the text without re-signing invalidates it). Use
+GnuPG's own identity management instead, which re-certifies properly:
+
+```bash
+gpg --edit-key debproxy@your-domain.example
+gpg> adduid          # add the new identity, sign it when prompted
+gpg> primary         # make the new UID primary (select it first with "uid N")
+gpg> deluid          # remove the old identity (select it first with "uid N")
+gpg> save
+```
+
+Then re-export and re-verify with the commands above before redeploying.
+
+```bash
 # Publish the derived public key into the storage root so apt clients can fetch it
 debproxy publish-key --config /etc/debproxy/config.yaml
 ```
