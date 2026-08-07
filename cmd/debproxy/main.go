@@ -47,23 +47,23 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "serve":
-		os.Exit(runServe(os.Args[2:]))
+		exit(runServe(os.Args[2:]))
 	case "rebuild":
-		os.Exit(runRebuild(os.Args[2:]))
+		exit(runRebuild(os.Args[2:]))
 	case "update":
-		os.Exit(runUpdate(os.Args[2:]))
+		exit(runUpdate(os.Args[2:]))
 	case "snapshot":
-		os.Exit(runSnapshot(os.Args[2:]))
+		exit(runSnapshot(os.Args[2:]))
 	case "prime":
-		os.Exit(runPrime(os.Args[2:]))
+		exit(runPrime(os.Args[2:]))
 	case "publish-key":
-		os.Exit(runPublishKey(os.Args[2:]))
+		exit(runPublishKey(os.Args[2:]))
 	case "cleanup":
-		os.Exit(runCleanup(os.Args[2:]))
+		exit(runCleanup(os.Args[2:]))
 	case "healthcheck":
-		os.Exit(runHealthcheck(os.Args[2:]))
+		exit(runHealthcheck(os.Args[2:]))
 	case "version":
-		os.Exit(runVersion())
+		exit(runVersion())
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -71,6 +71,16 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// exit flushes the background log writers before terminating. Log
+// output is queued rather than written inline (see internal/logwriter),
+// so exiting without this drops whatever has not been written yet --
+// including the slog.Error explaining why the command is failing.
+func exit(code int) {
+	server.FlushAccessLog()
+	config.FlushLogs()
+	os.Exit(code)
 }
 
 func runHealthcheck(args []string) int {

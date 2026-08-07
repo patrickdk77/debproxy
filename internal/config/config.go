@@ -13,6 +13,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"gopkg.in/yaml.v3"
 
+	"github.com/debproxy/debproxy/internal/logwriter"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/publish"
 	"github.com/debproxy/debproxy/internal/signing"
@@ -480,6 +481,18 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// stderrLog backs the default slog handler. Request handlers log
+// through slog while holding an unflushed HTTP response, so a direct
+// write to os.Stderr blocking on a full container log pipe stalls the
+// request itself. One package-level writer is reused across calls so
+// repeated Load does not leak a goroutine per call. See
+// internal/logwriter, and FlushLogs for the shutdown path.
+var stderrLog = logwriter.New(os.Stderr, 0)
+
+// FlushLogs writes any queued log records and stops the background
+// writer. Call it before exiting so a fatal message is not lost.
+func FlushLogs() { _ = stderrLog.Close() }
+
 func (c *Config) applyLogLevel() {
 	var level slog.Level
 	switch strings.ToLower(c.LogLevel) {
@@ -492,7 +505,7 @@ func (c *Config) applyLogLevel() {
 	default:
 		level = slog.LevelInfo
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(stderrLog, &slog.HandlerOptions{Level: level})))
 }
 
 func applyEnvOverrides(cfg *Config) {

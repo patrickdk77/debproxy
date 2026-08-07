@@ -6,9 +6,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/debproxy/debproxy/internal/logwriter"
 
 	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/gzip"
@@ -196,6 +199,17 @@ func sanitizeLogField(s string) string {
 	return b.String()
 }
 
+// accessLog is where logging writes. It is non-blocking: a direct
+// write to os.Stdout can block on a full container log pipe, and the
+// caller here is a request handler whose response is still buffered
+// and unflushed, so blocking there means the client never gets an
+// answer at all. See internal/logwriter.
+var accessLog = logwriter.New(os.Stdout, 0)
+
+// FlushAccessLog writes any queued access log lines and stops the
+// background writer. Called during shutdown.
+func FlushAccessLog() { _ = accessLog.Close() }
+
 // logging writes one Apache Combined Log Format line per request to stdout.
 // Format: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-agent}i"
 func logging(next http.Handler) http.Handler {
@@ -213,7 +227,8 @@ func logging(next http.Handler) http.Handler {
 			userAgent = "-"
 		}
 
-		fmt.Printf("%s - - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
+		fmt.Fprintf(accessLog,
+			"%s - - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
 			clientIP(r),
 			t.Format("02/Jan/2006:15:04:05 -0700"),
 			r.Method,
