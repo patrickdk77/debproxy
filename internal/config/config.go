@@ -393,6 +393,29 @@ type S3Config struct {
 	// access is granted by bucket policy. When false, ACL use is attempted and,
 	// if the bucket rejects ACLs, disabled automatically after the first upload.
 	DisableACL bool `yaml:"disable_acl"`
+	// ResponseHeaderTimeout bounds how long a single S3 request may wait
+	// for response headers. The AWS SDK's default transport leaves this
+	// unset, so a request that gets no reply hangs until whatever
+	// triggered it gives up -- which in practice meant HeadObject and
+	// GetObject calls stuck for tens of seconds, ending only when the apt
+	// client disconnected. This caps time-to-first-byte only, never total
+	// transfer time, so streaming a large .deb is unaffected. Empty or
+	// "0" uses s3store.DefaultResponseHeaderTimeout.
+	ResponseHeaderTimeout string `yaml:"response_header_timeout"`
+}
+
+// ResponseHeaderTimeoutDuration parses ResponseHeaderTimeout. Empty,
+// "0", or an invalid value all resolve to 0, leaving the caller to
+// apply its own default.
+func (c S3Config) ResponseHeaderTimeoutDuration() time.Duration {
+	if c.ResponseHeaderTimeout == "" || c.ResponseHeaderTimeout == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(c.ResponseHeaderTimeout)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 type SigningConfig struct {

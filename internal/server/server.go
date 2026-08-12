@@ -72,6 +72,12 @@ type Server struct {
 	// shared Valkey deployment so multiple debproxy replicas avoid redundant
 	// compression work. Nil unless EnableValkey is called; see valkey.go.
 	valkey *serverValkeyBacking
+
+	// keyPayloads holds the published public-key files, rendered once
+	// from the in-memory signing key so /keys/* never reaches the
+	// storage backend. See serveKeyFromMemory in keys.go.
+	keyPayloadsOnce sync.Once
+	keyPayloads     map[string][]byte
 }
 
 const (
@@ -650,6 +656,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(clean, "/")
 	switch parts[0] {
 	case "keys":
+		// Answered from memory, never from the storage backend: the
+		// public key is derived from the in-memory signing key, it is
+		// static for the life of the process, and it sits on the hot
+		// path for every apt client. A backend round trip here made a
+		// constant, tiny file hostage to storage latency.
+		if s.serveKeyFromMemory(w, r, clean) {
+			return
+		}
 		s.servePublished(w, r, clean)
 	case "live":
 		s.handleLive(w, r, parts[1:])
@@ -824,6 +838,11 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 			s.servePublishedFromCompressed(w, r, relPath)
 			return
 		}
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during published stat",
+				"path", relPath, "err", err)
+			return
+		}
 		slog.Error("stat published file", "path", relPath, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -832,6 +851,11 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
+			return
+		}
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during published open",
+				"path", relPath, "err", err)
 			return
 		}
 		slog.Error("open published file", "path", relPath, "err", err)
@@ -1040,6 +1064,11 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 			http.NotFound(w, r)
 			return
 		}
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during pool stat",
+				"path", poolPath, "err", err)
+			return
+		}
 		slog.Error("pool stat", "path", poolPath, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1048,6 +1077,11 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
+			return
+		}
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during pool open",
+				"path", poolPath, "err", err)
 			return
 		}
 		slog.Error("pool open", "path", poolPath, "err", err)

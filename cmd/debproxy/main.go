@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
@@ -37,6 +38,7 @@ import (
 	syncerpkg "github.com/debproxy/debproxy/internal/syncer"
 	"github.com/debproxy/debproxy/internal/upstream"
 	"github.com/debproxy/debproxy/internal/valkeycache"
+	"github.com/debproxy/debproxy/internal/watchdog"
 	"github.com/debproxy/debproxy/internal/webhook"
 )
 
@@ -779,8 +781,29 @@ func runServe(args []string) int {
 	stopSnapshotter := startPeriodicSnapshot(syncr, snapSched, oplock, indexCache, snapshotDebounce, vclient)
 	stopCleaner := startPeriodicCleanup(syncr, cleanupSched, cfg, oplock)
 
+	// The watchdog reports stalls where nothing in this process is
+	// scheduled -- the shape of failure that makes a health probe time
+	// out against a provably live process, because the kernel accepts
+	// the connection and no goroutine ever runs to answer it. It also
+	// records CPU time across the stall, which separates "our own work
+	// saturated the CPU budget" from "something outside took the CPU
+	// away". See internal/watchdog.
+	watchdogCtx, stopWatchdog := context.WithCancel(context.Background())
+	defer stopWatchdog()
+	watchdog.Start(watchdogCtx, watchdog.Config{})
+
 	if cfg.MetricsAddr != "" {
-		metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: promhttp.Handler()}
+		// pprof rides on the metrics listener, not the public one:
+		// goroutine and heap dumps are exactly what a stall needs and
+		// there is no reason to expose them to apt clients.
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		metricsMux.HandleFunc("/debug/pprof/", pprof.Index)
+		metricsMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		metricsMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		metricsMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		metricsMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux}
 		go func() {
 			slog.Info("metrics listening", "addr", cfg.MetricsAddr)
 			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -61,7 +61,9 @@ func New(cfg config.S3Config) (*Store, error) {
 		return nil, fmt.Errorf("s3.region is required")
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(cfg.Region))
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithHTTPClient(newHTTPClient(cfg)))
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}

@@ -112,7 +112,12 @@ func (k *Key) PublishedNames() []string {
 // formats: the current key as "debproxy", and current + old keys by fingerprint.
 // Fingerprint-named files are never overwritten with different content, so keys
 // from prior rotations remain available to verify older snapshots.
-func (k *Key) Publish(ctx context.Context, w FileWriter) ([]string, error) {
+// PublishedPayloads returns the bytes for every name in
+// PublishedNames, keyed by that name. The public key is derived
+// entirely from the in-memory Key, so a server holding one can answer
+// /keys/* requests without touching the storage backend at all -- see
+// Server.serveKeyFromMemory. Publish writes exactly this map.
+func (k *Key) PublishedPayloads() (map[string][]byte, error) {
 	asc, err := k.ArmoredPublic()
 	if err != nil {
 		return nil, fmt.Errorf("armor public key: %w", err)
@@ -123,11 +128,18 @@ func (k *Key) Publish(ctx context.Context, w FileWriter) ([]string, error) {
 	}
 
 	fp := k.Fingerprint()
-	payloads := map[string][]byte{
+	return map[string][]byte{
 		path.Join(KeysDir, fp+".asc"):      asc,
 		path.Join(KeysDir, fp+".gpg"):      bin,
 		path.Join(KeysDir, "debproxy.asc"): asc,
 		path.Join(KeysDir, "debproxy.gpg"): bin,
+	}, nil
+}
+
+func (k *Key) Publish(ctx context.Context, w FileWriter) ([]string, error) {
+	payloads, err := k.PublishedPayloads()
+	if err != nil {
+		return nil, err
 	}
 
 	names := make([]string, 0, len(payloads))
