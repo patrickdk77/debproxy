@@ -191,3 +191,84 @@ func TestClientGoneClassification(t *testing.T) {
 		}
 	}
 }
+
+// cancelStore returns a context error from every read, standing in for
+// a storage call that was aborted because the client hung up.
+type cancelStore struct {
+	storage.Storage
+	calls int
+}
+
+func (c *cancelStore) StatPublished(ctx context.Context, rel string) (
+	storage.FileInfo, error) {
+	c.calls++
+	return storage.FileInfo{}, fmt.Errorf("s3 stat %q: %w", rel,
+		context.Canceled)
+}
+
+func (c *cancelStore) OpenPublished(ctx context.Context, rel string) (
+	io.ReadCloser, error) {
+	c.calls++
+	return nil, fmt.Errorf("s3 open %q: %w", rel, context.Canceled)
+}
+
+func (c *cancelStore) Stat(ctx context.Context, p string) (
+	storage.FileInfo, error) {
+	c.calls++
+	return storage.FileInfo{}, fmt.Errorf("s3 stat %q: %w", p,
+		context.Canceled)
+}
+
+func (c *cancelStore) Open(ctx context.Context, p string) (
+	io.ReadCloser, error) {
+	c.calls++
+	return nil, fmt.Errorf("s3 open %q: %w", p, context.Canceled)
+}
+
+// TestServePublishedDoesNotErrorOnClientCancel covers the call site,
+// not just the clientGone helper. Removing the clientGone guard from
+// servePublished must fail this test: a storage read aborted by the
+// client hanging up has to leave the response untouched rather than
+// writing a 500 nobody is reading.
+func TestServePublishedDoesNotErrorOnClientCancel(t *testing.T) {
+	store := &cancelStore{}
+	s := &Server{store: store}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet,
+		"/current/debian/dists/trixie/InRelease", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	s.servePublished(rec, req, "current/debian/dists/trixie/InRelease")
+
+	if store.calls == 0 {
+		t.Fatal("storage was never consulted; test proves nothing")
+	}
+	if rec.Code == http.StatusInternalServerError {
+		t.Errorf("client cancellation reported as a 500")
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("wrote %d bytes to a client that hung up: %q",
+			rec.Body.Len(), rec.Body.String())
+	}
+}
+
+// TestServePublishedStillErrorsOnRealFailure is the other half: a
+// genuine backend failure with a live client must still surface as a
+// 500, so the clientGone guard cannot be widened into swallowing real
+// errors.
+func TestServePublishedStillErrorsOnRealFailure(t *testing.T) {
+	store := &failingStore{}
+	s := &Server{store: store}
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/current/debian/dists/trixie/InRelease", nil)
+	rec := httptest.NewRecorder()
+
+	s.servePublished(rec, req, "current/debian/dists/trixie/InRelease")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("real backend failure returned %d, want 500", rec.Code)
+	}
+}

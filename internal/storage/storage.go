@@ -100,3 +100,29 @@ type Storage interface {
 	Publisher
 	Ping(ctx context.Context) error
 }
+
+// PoolRouter is an optional capability for backends that can publish
+// prefix-rewrite rules mapping a published base's pool path back to the
+// shared pool.
+//
+// It exists because apt resolves a Packages stanza's Filename relative
+// to the sources.list URIs base, while debproxy publishes each
+// snapshot's metadata under its own prefix and keeps one shared pool.
+// Requests through debproxy are rewritten by the router; requests made
+// straight to the backend are not, so without this every .deb 404s for
+// a client pointed directly at the bucket even though the metadata
+// resolves fine.
+//
+// Backends that need no rewrite -- the filesystem tree, where a single
+// symlink does the same job -- simply do not implement it, and callers
+// skip the step via a type assertion rather than branching on backend
+// type.
+type PoolRouter interface {
+	// SyncPoolRoutes reconciles the backend's rewrite rules so every
+	// base in bases resolves pool files. bases are publish bases with
+	// no trailing slash, e.g. "current/debian" or "2026-08-11/debian".
+	// The full set is passed every time: implementations reconcile
+	// rather than diff, so pruned snapshots lose their rules without a
+	// separate delete path.
+	SyncPoolRoutes(ctx context.Context, bases []string) error
+}

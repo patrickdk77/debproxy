@@ -84,6 +84,92 @@ On S3 these are simply key prefixes within the configured bucket/prefix.
 | `/keys/...` | Published signing key files |
 | `/healthz` | Always 200 OK |
 
+## Serving snapshots straight from storage
+
+The `/{selector}/{os}/pool/...` row above is what makes a snapshot work
+through debproxy. The router drops the selector and reads the shared
+`pool/` key. Point a client at the storage backend directly and nothing
+does that dropping.
+
+apt resolves a `Packages` stanza's `Filename` against the sources.list
+`URIs` base, so it requests `<base>/<Filename>`. Given
+`URIs: http://bucket/current/debian` and `Filename: pool/debian/...`,
+apt asks for `current/debian/pool/debian/...`. The object is at
+`pool/debian/...`. Metadata resolves and every `.deb` 404s.
+
+Publishing a pool copy under each snapshot would fix it and cost one
+full copy of every `.deb` per snapshot, so debproxy rewrites the
+request instead.
+
+### S3
+
+`SyncPoolRoutes` reconciles the bucket's website routing rules after
+every snapshot and every cleanup, mapping `{snapshot-id}/{os}/pool/`
+back to `pool/`. It writes the whole set rather than diffing one rule
+at a time, so a pruned snapshot loses its rule with no separate delete
+step and a hand-edited configuration heals on the next run. It leaves
+rules that rewrite to anything other than `pool/` alone.
+
+S3 matches a literal key prefix. There are no wildcards, no regex, and
+no way to match a varying middle segment, so every published base needs
+its own rule against a limit of 50 per bucket. With `history: 30` and
+one OS that comes to 31. Past the limit, debproxy keeps `current`
+first, fills the rest with the newest snapshots, and logs what it
+dropped at WARN.
+
+Website hosting must already be enabled on the bucket. debproxy will
+not turn it on, because that changes how the whole bucket serves.
+
+The role needs `s3:GetBucketWebsite` and `s3:PutBucketWebsite` on the
+bucket itself, alongside the usual object permissions:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject"
+            ],
+            "Resource": "arn:aws:s3:::example-debproxy/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetBucketWebsite",
+                "s3:PutBucketWebsite"
+            ],
+            "Resource": "arn:aws:s3:::example-debproxy"
+        }
+    ]
+}
+```
+
+Watch which ARN each statement uses. Object actions apply to
+`arn:aws:s3:::example-debproxy/*`, the bucket-level ones to
+`arn:aws:s3:::example-debproxy` with no suffix.
+
+Missing the website permissions is not fatal. The update fails,
+debproxy logs a warning, and snapshots still publish. Only
+direct-from-bucket downloads break.
+
+### Filesystem
+
+No code and no reconciler. A symlink per published base does the same
+job, and unlike S3 rules there is no cap on how many:
+
+```
+ln -s ../../pool root/current/debian/pool
+ln -s ../../pool root/2026-06-29/debian/pool
+```
+
+Requests through debproxy work either way, so this only matters when a
+web server is pointed at the storage root.
+
 ## Package layout
 
 ```

@@ -347,6 +347,10 @@ func (s *Syncer) Snapshot(ctx context.Context, now time.Time) error {
 	if err := s.store.WriteFile(ctx, currentSnapshotNamePath, strings.NewReader(snapshotID), int64(len(idBytes))); err != nil {
 		return fmt.Errorf("write %s: %w", currentSnapshotNamePath, err)
 	}
+
+	// The new snapshot needs its own pool rewrite rule before anything
+	// points at it directly.
+	s.syncPoolRoutes(ctx)
 	return nil
 }
 
@@ -492,4 +496,44 @@ func groupStanzas(entries []model.IndexEntry, components, arches []string) map[s
 		}
 	}
 	return out
+}
+
+// syncPoolRoutes reconciles the storage backend's pool rewrite rules
+// against the snapshots that currently exist, so a client pointed
+// straight at the backend can resolve package files as well as one
+// going through debproxy.
+//
+// Backends that need no rewriting do not implement storage.PoolRouter,
+// and this is then a no-op. Failures are logged and swallowed: routing
+// only affects direct-to-backend access, so a bucket policy that
+// forbids the update, or a transient error, must not fail a snapshot
+// or cleanup run that otherwise succeeded.
+func (s *Syncer) syncPoolRoutes(ctx context.Context) {
+	router, ok := s.store.(storage.PoolRouter)
+	if !ok {
+		return
+	}
+
+	var bases []string
+	for _, osName := range s.osNames() {
+		// "current" is listed first and unconditionally: it is what
+		// live clients point at, and it must resolve even if listing
+		// dated snapshots fails below.
+		bases = append(bases, "current/"+osName)
+
+		refs, err := s.store.ListSnapshots(ctx, osName)
+		if err != nil {
+			slog.Warn("list snapshots for pool routing",
+				"os", osName, "err", err)
+			continue
+		}
+		for _, ref := range refs {
+			bases = append(bases, ref.ID+"/"+osName)
+		}
+	}
+
+	if err := router.SyncPoolRoutes(ctx, bases); err != nil {
+		slog.Warn("sync pool routing rules", "bases", len(bases),
+			"err", err)
+	}
 }

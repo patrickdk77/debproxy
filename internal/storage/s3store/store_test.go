@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -26,6 +27,28 @@ type fakeS3 struct {
 	deleteObject func() (*s3.DeleteObjectOutput, error)
 	headBucket   func() (*s3.HeadBucketOutput, error)
 	listObjects  func() (*s3.ListObjectsV2Output, error)
+
+	getWebsite func() (*s3.GetBucketWebsiteOutput, error)
+	putWebsite func(*s3.PutBucketWebsiteInput) (
+		*s3.PutBucketWebsiteOutput, error)
+}
+
+func (f *fakeS3) GetBucketWebsite(context.Context,
+	*s3.GetBucketWebsiteInput, ...func(*s3.Options)) (
+	*s3.GetBucketWebsiteOutput, error) {
+	if f.getWebsite == nil {
+		return nil, fmt.Errorf("getWebsite not set")
+	}
+	return f.getWebsite()
+}
+
+func (f *fakeS3) PutBucketWebsite(_ context.Context,
+	in *s3.PutBucketWebsiteInput, _ ...func(*s3.Options)) (
+	*s3.PutBucketWebsiteOutput, error) {
+	if f.putWebsite == nil {
+		return nil, fmt.Errorf("putWebsite not set")
+	}
+	return f.putWebsite(in)
 }
 
 func (f *fakeS3) HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {

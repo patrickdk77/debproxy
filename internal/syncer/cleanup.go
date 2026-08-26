@@ -33,6 +33,13 @@ func (s *Syncer) Cleanup(ctx context.Context, maxSnapshots int, maxSnapshotAge t
 	slog.Info("cleanup: snapshots pruned", "deleted", deleted)
 	metrics.SnapshotsPrunedTotal.Add(float64(deleted))
 
+	// Drop rewrite rules for the snapshots that just went away, and
+	// re-assert the ones that remain. Reconciling the whole set here
+	// means a pruned snapshot needs no separate delete path.
+	if deleted > 0 {
+		s.syncPoolRoutes(ctx)
+	}
+
 	// Reconcile entries against reality before GC'ing files against entries:
 	// this direction (entry exists, file gone -- e.g. an out-of-band deletion,
 	// or a prior GC run that had to touch the pool without the index being
