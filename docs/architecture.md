@@ -229,7 +229,7 @@ The binary is built statically (`CGO_ENABLED=0`) and runs on a minimal distroles
 image as a non-root user.
 
 ```dockerfile
-FROM golang:1.26 AS build
+FROM golang:1.27 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
