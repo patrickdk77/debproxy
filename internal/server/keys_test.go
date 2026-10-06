@@ -272,3 +272,27 @@ func TestServePublishedStillErrorsOnRealFailure(t *testing.T) {
 		t.Errorf("real backend failure returned %d, want 500", rec.Code)
 	}
 }
+
+// TestServerErrorBodyDoesNotEchoBackendError is the regression test for
+// raw err.Error() reaching clients. A backend failure names buckets,
+// keys and hosts; none of that may appear in the response body.
+func TestServerErrorBodyDoesNotEchoBackendError(t *testing.T) {
+	store := &failingStore{}
+	s := &Server{store: store}
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/current/debian/dists/trixie/InRelease", nil)
+	rec := httptest.NewRecorder()
+	s.servePublished(rec, req, "current/debian/dists/trixie/InRelease")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status %d, want 500", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "storage is down") {
+		t.Errorf("backend error text leaked to client: %q", body)
+	}
+	if strings.TrimSpace(body) != internalErrorBody {
+		t.Errorf("body %q, want %q", strings.TrimSpace(body), internalErrorBody)
+	}
+}

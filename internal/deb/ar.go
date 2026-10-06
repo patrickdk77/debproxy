@@ -62,6 +62,13 @@ func readAR(r io.Reader) ([]arHeader, error) {
 	return members, nil
 }
 
+// maxARMemberBytes caps how large a member openARMember will load into
+// memory. The ar size field is ten decimal digits, so a crafted header can
+// claim close to ten gigabytes and the allocation below would honor it.
+// The only member ever opened this way is control.tar, which is a few
+// kilobytes; 64MiB leaves room for anything legitimate.
+const maxARMemberBytes = 64 << 20
+
 func openARMember(r io.ReadSeeker, memberName string) (io.Reader, error) {
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
@@ -84,6 +91,10 @@ func openARMember(r io.ReadSeeker, memberName string) (io.Reader, error) {
 			return nil, err
 		}
 		if name == memberName {
+			if size > maxARMemberBytes {
+				return nil, fmt.Errorf("ar member %q: size %d exceeds %d byte limit",
+					memberName, size, maxARMemberBytes)
+			}
 			data := make([]byte, size)
 			if _, err := io.ReadFull(r, data); err != nil {
 				return nil, fmt.Errorf("read ar member %q: %w", memberName, err)

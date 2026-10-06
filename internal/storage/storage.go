@@ -30,7 +30,16 @@ var ErrAccessDenied = errors.New("access denied")
 // client/upstream-controlled path can never resolve outside of it -- neither
 // backend should reimplement this check independently.
 func CleanRelPath(p string) (string, error) {
-	trimmed := strings.TrimPrefix(strings.TrimSpace(p), "/")
+	if strings.IndexByte(p, 0) >= 0 {
+		// A NUL cannot appear in any real path. The OS rejects it, and an
+		// object store accepts it, so letting it through produces a key
+		// nothing can read back.
+		return "", fmt.Errorf("invalid path %q: contains NUL", p)
+	}
+	// TrimLeft rather than TrimPrefix: "//x" must become "x", not "/x".
+	// A surviving leading slash is not traversal, but it is a path that
+	// no longer sits under the root it was meant to.
+	trimmed := strings.TrimLeft(strings.TrimSpace(p), "/")
 	clean := path.Clean(trimmed)
 	if clean == "." {
 		clean = ""

@@ -38,7 +38,8 @@ func newGuardTestAPI(t *testing.T) *API {
 				ResSnapshot: {ActCreate: {"alice"}},
 			},
 		},
-		authn: authn,
+		authn:    authn,
+		throttle: newAuthThrottle(defaultAuthFailureLimit, defaultAuthFailureWindow),
 	}
 }
 
@@ -101,7 +102,8 @@ func TestGuard_ValidButNotAllowListedReturns403(t *testing.T) {
 		cfg: &config.Config{
 			API: map[string]map[string][]string{ResSnapshot: {ActCreate: {"alice"}}},
 		},
-		authn: authn,
+		authn:    authn,
+		throttle: newAuthThrottle(defaultAuthFailureLimit, defaultAuthFailureWindow),
 	}
 	h := a.guard(ResSnapshot, ActCreate, okHandler)
 

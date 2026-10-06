@@ -43,19 +43,35 @@ func (a *API) guard(resource, action string, next guardedHandler) http.HandlerFu
 			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusUnauthorized)).Inc()
 			return
 		}
+		// Checked before any credential is examined, so a source that has
+		// tripped the limit costs nothing further: no hash computation, no
+		// JWKS lookup, and no information about why its last attempts
+		// failed. 429 rather than 403 so a legitimate caller stuck behind a
+		// shared address can tell "wait" from "wrong".
+		source := throttleSource(r)
+		if a.throttle.blocked(source) {
+			w.Header().Set("Retry-After", strconv.Itoa(int(a.throttle.window.Seconds())))
+			http.Error(w, "too many failed authentication attempts", http.StatusTooManyRequests)
+			metrics.APIAuthFailuresTotal.WithLabelValues("throttled").Inc()
+			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusTooManyRequests)).Inc()
+			return
+		}
 		identity, err := a.authn.Authenticate(r)
 		if err != nil {
+			a.throttle.fail(source)
 			metrics.APIAuthFailuresTotal.WithLabelValues("invalid_credentials").Inc()
 			http.Error(w, "forbidden", http.StatusForbidden)
 			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusForbidden)).Inc()
 			return
 		}
 		if !Allowed(rules, identity) {
+			a.throttle.fail(source)
 			metrics.APIAuthFailuresTotal.WithLabelValues("not_permitted").Inc()
 			http.Error(w, "forbidden", http.StatusForbidden)
 			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusForbidden)).Inc()
 			return
 		}
+		a.throttle.reset(source)
 
 		sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next(sw, r, identity)

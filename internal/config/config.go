@@ -771,9 +771,16 @@ func expandEnvRef(s string) string {
 // s, unlike expandEnvRef which only handles the whole value being a single
 // reference. Used for valkey.url, where a credential is typically embedded
 // inside a larger URL (e.g. "valkey://user:$VALKEY_PASSWORD@host:6379/0")
-// rather than standing alone.
+// rather than standing alone. Write "$$" for a literal dollar sign.
 func expandURLEnvRefs(s string) string {
-	return os.Expand(s, os.Getenv)
+	// os.Expand has no escape, so a literal "$" in a credential would be
+	// read as the start of a variable reference and silently replaced
+	// with an empty string. "$$" is the escape here: it survives as a
+	// single "$" in the output and is never treated as a reference.
+	const sentinel = "\x00dollar\x00"
+	escaped := strings.ReplaceAll(s, "$$", sentinel)
+	expanded := os.Expand(escaped, os.Getenv)
+	return strings.ReplaceAll(expanded, sentinel, "$")
 }
 
 func loadKeyring(paths []string) (openpgp.EntityList, error) {

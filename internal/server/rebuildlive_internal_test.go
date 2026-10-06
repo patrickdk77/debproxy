@@ -36,7 +36,7 @@ func testSigningKey(t *testing.T) (*signing.Key, openpgp.EntityList) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Create(privPath)
+	f, err := os.OpenFile(privPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}

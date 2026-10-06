@@ -25,15 +25,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	}
 }
 
+// maxAPIBodyBytes caps a request body on every /api/v1 endpoint.
+const maxAPIBodyBytes = 1 << 20
+
 // decodeBody decodes r's JSON body into v, if any. An empty body is not an
 // error -- every /api/v1 request body is optional, defaulting every field to
 // its zero value (false/""/nil), which is always the safe/conservative
 // choice per the design doc (e.g. force defaults to false).
-func decodeBody(r *http.Request, v any) error {
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
 	if r.ContentLength == 0 {
 		return nil
 	}
-	return json.NewDecoder(r.Body).Decode(v)
+	// Every /api/v1 body is a handful of short fields; a megabyte is
+	// orders of magnitude more than any of them need. Without a bound an
+	// authenticated caller could hold a handler reading an arbitrarily
+	// large body, and json.Decoder would buffer it.
+	body := http.MaxBytesReader(w, r.Body, maxAPIBodyBytes)
+	return json.NewDecoder(body).Decode(v)
 }
 
 // --- snapshot ---
@@ -44,7 +52,7 @@ type snapshotRequest struct {
 
 func (a *API) handleSnapshotCreate(w http.ResponseWriter, r *http.Request, _ auth.Identity) {
 	var req snapshotRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -167,7 +175,7 @@ type rebuildRequest struct {
 
 func (a *API) handleRebuild(w http.ResponseWriter, r *http.Request, _ auth.Identity) {
 	var req rebuildRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -190,7 +198,7 @@ type primeRequest struct {
 
 func (a *API) handlePrime(w http.ResponseWriter, r *http.Request, _ auth.Identity) {
 	var req primeRequest
-	if err := decodeBody(r, &req); err != nil {
+	if err := decodeBody(w, r, &req); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}

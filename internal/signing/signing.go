@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -29,10 +30,29 @@ type FileWriter interface {
 	WriteFile(ctx context.Context, relPath string, r io.Reader, size int64) error
 }
 
+// warnIfKeyReadable logs when the private key file is readable by anyone
+// other than its owner. A container Secret mount normally arrives as
+// 0400 or 0440, so a looser mode means the file was placed by hand or the
+// mount was misconfigured, and the key is exposed to every other process
+// sharing the filesystem. Loading still proceeds: refusing would turn a
+// permissions slip into an outage, and the warning is what gets it fixed.
+func warnIfKeyReadable(path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		slog.Warn("signing key file is readable by group or others; "+
+			"restrict it to the owner",
+			"path", path, "mode", fmt.Sprintf("%04o", mode))
+	}
+}
+
 // Load reads an OpenPGP private key from path, accepting armored (.asc) or
 // binary (.gpg) input and tolerating keys whose User ID self-signatures do not
 // verify (see ReadKeyring): only the private key material is needed to sign.
 func Load(path string) (*Key, error) {
+	warnIfKeyReadable(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open signing key: %w", err)

@@ -75,6 +75,7 @@ type API struct {
 	debounce     time.Duration
 	snapshotWait time.Duration
 	vclient      valkey.Client // nil unless Valkey is enabled; see handleSnapshotCreate
+	throttle     *authThrottle
 }
 
 // Deps bundles New's dependencies.
@@ -124,6 +125,7 @@ func New(deps Deps) (*API, error) {
 		debounce:     deps.SnapshotDebounce,
 		snapshotWait: snapshotLockWait,
 		vclient:      deps.VClient,
+		throttle:     newAuthThrottle(defaultAuthFailureLimit, defaultAuthFailureWindow),
 	}
 	a.queue = newOperationRunner(queueMax, deps.OpLock, deps.IndexCache, deps.VClient, deps.VKeys, deps.Notifier)
 	a.queue.start()

@@ -589,6 +589,12 @@ func hashFromByHashKey(key string) string {
 	return key[i+len(marker):]
 }
 
+// internalErrorBody is the only text a client ever sees for a server-side
+// failure. The real error goes to the log: err.Error() from a storage
+// backend names buckets, object keys and internal hosts, none of which an
+// apt client has any business reading.
+const internalErrorBody = "internal error"
+
 // Handler returns the HTTP handler with logging, response compression, and metrics.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -688,7 +694,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request, parts []
 			return
 		}
 		slog.Warn("resolve snapshot failed", "os", osName, "selector", selector, "err", err)
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, "upstream snapshot unavailable", http.StatusBadGateway)
 		return
 	}
 
@@ -844,7 +850,7 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 			return
 		}
 		slog.Error("stat published file", "path", relPath, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	rc, err := s.store.OpenPublished(r.Context(), relPath)
@@ -859,7 +865,7 @@ func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath 
 			return
 		}
 		slog.Error("open published file", "path", relPath, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	defer rc.Close()
@@ -974,7 +980,7 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 	exists, err := s.store.Exists(r.Context(), poolPath)
 	if err != nil {
 		slog.Error("pool exists check", "path", poolPath, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	if !exists {
@@ -1070,7 +1076,7 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 			return
 		}
 		slog.Error("pool stat", "path", poolPath, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	rc, err := s.store.Open(r.Context(), poolPath)
@@ -1085,7 +1091,7 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 			return
 		}
 		slog.Error("pool open", "path", poolPath, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	defer rc.Close()
@@ -1099,7 +1105,7 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 	exists, err := s.store.Exists(r.Context(), srcPath)
 	if err != nil {
 		slog.Error("src exists check", "path", srcPath, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	if !exists {
@@ -1120,7 +1126,8 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("src file access", "path", srcPath, "err", err)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	rc, err := s.store.Open(r.Context(), srcPath)
@@ -1129,7 +1136,8 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("src file access", "path", srcPath, "err", err)
+		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
 	}
 	defer rc.Close()

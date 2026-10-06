@@ -42,6 +42,16 @@ import (
 	"github.com/debproxy/debproxy/internal/webhook"
 )
 
+const (
+	// serverReadHeaderTimeout caps the wait for a client to finish sending
+	// request headers. Real apt clients send them in one packet.
+	serverReadHeaderTimeout = 10 * time.Second
+	// serverIdleTimeout reaps keep-alive connections with no request in
+	// flight. apt reuses connections within a run and closes them after;
+	// two minutes covers a slow run without pinning descriptors forever.
+	serverIdleTimeout = 2 * time.Minute
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -803,7 +813,12 @@ func runServe(args []string) int {
 		metricsMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
 		metricsMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		metricsMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux}
+		metricsSrv := &http.Server{
+			Addr:              cfg.MetricsAddr,
+			Handler:           metricsMux,
+			ReadHeaderTimeout: serverReadHeaderTimeout,
+			IdleTimeout:       serverIdleTimeout,
+		}
 		go func() {
 			slog.Info("metrics listening", "addr", cfg.MetricsAddr)
 			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -869,7 +884,20 @@ func runServe(args []string) int {
 	topMux.Handle("/api/", apiSrv.Handler())
 	topMux.Handle("/", webServer.Handler())
 
-	srv := &http.Server{Addr: *addr, Handler: topMux}
+	// ReadHeaderTimeout bounds how long a connection may sit sending
+	// headers, which is the slowloris shape: hold many connections open
+	// trickling bytes and never finish a request. IdleTimeout reaps
+	// keep-alive connections a client has abandoned, which otherwise hold
+	// a file descriptor each for as long as the process runs. Neither
+	// WriteTimeout nor ReadTimeout is set: both bound the whole exchange,
+	// and a multi-hundred-megabyte .deb over a slow link legitimately
+	// takes longer than any fixed value that would also be useful.
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           topMux,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
 	go func() {
 		slog.Info("listening", "addr", *addr, "layouts", len(cfg.ResolvedLayouts))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

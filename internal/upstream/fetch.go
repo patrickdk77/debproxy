@@ -23,6 +23,7 @@ import (
 	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/signing"
+	"github.com/debproxy/debproxy/internal/storage"
 )
 
 // Fetcher retrieves and verifies content from a single upstream source.
@@ -622,6 +623,58 @@ func (f *Fetcher) fetchDetachedRelease(ctx context.Context) ([]byte, *http.Respo
 	return release, resp, nil
 }
 
+// maxDecompressedIndexBytes caps how much decompressed index data a single
+// fetch will materialize. The compressed bytes are hash-verified against
+// the signed Release before any of this runs, so exceeding it means the
+// upstream really published something this large, not that a stranger
+// slipped in a bomb. The largest real-world Packages files run to a few
+// hundred megabytes decompressed; a gigabyte is well clear of that and
+// still stops a single response from exhausting the process.
+const maxDecompressedIndexBytes = 1 << 30
+
+// errIndexTooLarge is returned through the reader when the cap is hit, so
+// the parser fails loudly instead of silently working on a truncated
+// prefix.
+var errIndexTooLarge = errors.New("decompressed index exceeds size limit")
+
+// boundedReader wraps r so that reading past maxDecompressedIndexBytes
+// returns errIndexTooLarge rather than EOF. io.LimitReader alone is not
+// enough: it reports a clean EOF at the limit, and a deb822 parser handed
+// a clean EOF mid-stanza would happily return whatever it had parsed so
+// far as if that were the whole index.
+func boundedReader(r io.Reader) io.Reader {
+	return &sizeBoundedReader{r: r, remaining: maxDecompressedIndexBytes}
+}
+
+type sizeBoundedReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (b *sizeBoundedReader) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return 0, errIndexTooLarge
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	// Read at most one byte past the cap. A stream of exactly cap bytes
+	// then sees its own EOF on the next call (remaining is 0, the probe
+	// read returns nothing), while a stream of cap+1 bytes consumes the
+	// probe byte, drives remaining negative, and errors. Checking
+	// remaining <= 0 up front, as this once did, refused the EOF probe and
+	// mis-reported an exactly-at-cap index as too large.
+	if int64(len(p)) > b.remaining+1 {
+		p = p[:b.remaining+1]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining < 0 {
+		return n, errIndexTooLarge
+	}
+	return n, err
+}
+
 // pkgVariant describes one compressed (or plain) Packages file variant.
 type pkgVariant struct {
 	ext    string
@@ -756,7 +809,7 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 		if rc, ok := r.(io.Closer); ok {
 			defer rc.Close()
 		}
-		return apt.ParsePackageRaws(r)
+		return apt.ParsePackageRaws(boundedReader(r))
 	}
 
 	return nil, nil
@@ -818,7 +871,7 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 		if gerr != nil {
 			return nil, false
 		}
-		decompressed, derr := io.ReadAll(gr)
+		decompressed, derr := io.ReadAll(boundedReader(gr))
 		gr.Close()
 		if derr != nil {
 			return nil, false
@@ -917,7 +970,7 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 		if gerr != nil {
 			return nil, false
 		}
-		decompressed, derr := io.ReadAll(gr)
+		decompressed, derr := io.ReadAll(boundedReader(gr))
 		gr.Close()
 		if derr != nil {
 			return nil, false
@@ -1189,7 +1242,11 @@ func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadC
 	if f.src.Network != "" {
 		ctx = withNetwork(ctx, f.src.Network)
 	}
-	url := f.base() + "/" + strings.TrimLeft(filename, "/")
+	rel, err := upstreamRelPath(filename)
+	if err != nil {
+		return nil, err
+	}
+	url := f.base() + "/" + rel
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -1209,6 +1266,27 @@ func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadC
 	return resp.Body, nil
 }
 
+// upstreamRelPath validates a path taken from an upstream index before it
+// is joined onto the configured base URL. The index is signed, so a bad
+// value here means a compromised or broken upstream rather than a hostile
+// client, but the URL is still built from it: "?" or "#" would turn the
+// rest of the path into a query or fragment, and ".." would walk out of
+// the mirror's dists tree. Rejecting those keeps the request shaped like
+// the mirror layout the signature vouched for.
+func upstreamRelPath(p string) (string, error) {
+	if strings.ContainsAny(p, "?#") {
+		return "", fmt.Errorf("upstream path %q: contains query or fragment delimiter", p)
+	}
+	clean, err := storage.CleanRelPath(p)
+	if err != nil {
+		return "", fmt.Errorf("upstream path: %w", err)
+	}
+	if clean == "" {
+		return "", fmt.Errorf("upstream path %q: empty after cleaning", p)
+	}
+	return clean, nil
+}
+
 // FetchSourceFileStream is FetchDebStream's source-file counterpart: issues
 // a GET for directory/filename and returns the raw response body stream
 // without reading it into memory. directory is the upstream's Directory:
@@ -1219,7 +1297,11 @@ func (f *Fetcher) FetchSourceFileStream(ctx context.Context, directory, filename
 	if f.src.Network != "" {
 		ctx = withNetwork(ctx, f.src.Network)
 	}
-	url := f.base() + "/" + strings.TrimLeft(directory, "/") + "/" + filename
+	rel, err := upstreamRelPath(strings.TrimLeft(directory, "/") + "/" + filename)
+	if err != nil {
+		return nil, err
+	}
+	url := f.base() + "/" + rel
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
