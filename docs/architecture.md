@@ -225,22 +225,31 @@ All compression and cryptography runs in-process; no external binaries (`gpg`, `
 
 ## Containerization
 
-The binary is built statically (`CGO_ENABLED=0`) and runs on a minimal distroless
-image as a non-root user.
+`CGO_ENABLED=0` on the Alpine toolchain produces a static PIE binary. The
+runtime image is `scratch` plus CA certificates, zoneinfo and the musl
+loader, and it runs as uid 65532. The `.git` directory stays in the build
+context on purpose, because `debproxy version` reports the commit from
+the build's `vcs.revision` stamp.
 
 ```dockerfile
-FROM golang:1.27 AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/debproxy ./cmd/debproxy
+FROM golang:alpine AS builder
+RUN apk --no-cache add gcc musl-dev git
+WORKDIR /go/src/debproxy/
+COPY . /go/src/debproxy/
+RUN go mod verify \
+ && CGO_ENABLED=0 GOAMD64=v2 go build -trimpath -buildmode=pie \
+    -ldflags "-s -w" -o /debproxy ./cmd/debproxy
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/debproxy /usr/local/bin/debproxy
-EXPOSE 8080
-USER nonroot:nonroot
-ENTRYPOINT ["debproxy"]
+FROM alpine AS libs
+RUN apk --no-cache add ca-certificates tzdata
+
+FROM scratch
+COPY --from=libs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=libs /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /lib/ld-musl-*.so.1 /lib/
+COPY --from=builder /debproxy /debproxy
+USER 65532:65532
+ENTRYPOINT ["/debproxy"]
 CMD ["serve", "--config", "/etc/debproxy/config.yaml"]
 ```
 

@@ -1,6 +1,26 @@
-PLAN.md
-*.md
+# Build artifacts
+debproxy
 coverage.out
 tmp
-debproxy
 *.deb
+vendor/
+
+# Development config (contains secrets)
+config.yaml
+*.pem
+*.key
+*.p8
+
+# Documentation
+PLAN.md
+*.md
+
+# Test data
+*.test
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,15 +1,40 @@
-FROM golang:1.27 AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/debproxy ./cmd/debproxy
+# debproxy - APT proxy and snapshot publisher for Debian repositories
+# docker run -d -p 8080:8080 \
+#   -v /etc/debproxy/config.yaml:/etc/debproxy/config.yaml:ro \
+#   -v /etc/debproxy/signing:/etc/debproxy/signing:ro \
+#   -v /var/lib/debproxy/keys:/var/lib/debproxy/keys:ro \
+#   patrickdk/debproxy
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/debproxy /usr/local/bin/debproxy
+ARG BUILD_FROM_PREFIX
+
+FROM ${BUILD_FROM_PREFIX}golang:alpine AS builder
+RUN apk --no-cache add gcc musl-dev git
+WORKDIR /go/src/debproxy/
+COPY . /go/src/debproxy/
+ARG BUILD_VERSION
+ARG BUILD_DATE
+ARG BUILD_REF
+ARG BUILD_GOARCH
+ARG BUILD_GOOS
+RUN export GOPROXY_DISABLED=direct \
+ && go mod verify \
+ && CGO_ENABLED=0 GOAMD64=v2 go build -trimpath -buildmode=pie \
+    -ldflags "-s -w" \
+    -o /debproxy ./cmd/debproxy
+
+FROM alpine AS libs
+RUN apk --no-cache add ca-certificates tzdata
+
+FROM scratch
+COPY --from=libs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=libs /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /lib/ld-musl-*.so.1 /lib/
+COPY --from=builder /debproxy /debproxy
+
+WORKDIR /
 EXPOSE 8080
-USER nonroot:nonroot
-ENTRYPOINT ["debproxy"]
+USER 65532:65532
+ENTRYPOINT ["/debproxy"]
 CMD ["serve", "--config", "/etc/debproxy/config.yaml"]
 
 ARG BUILD_VERSION
@@ -34,4 +59,3 @@ LABEL maintainer="Patrick Domack (patrickdk@patrickdk.com)" \
   org.opencontainers.image.licenses="MIT" \
   org.opencontainers.image.ref.name="debproxy" \
   version="${BUILD_VERSION}"
-
