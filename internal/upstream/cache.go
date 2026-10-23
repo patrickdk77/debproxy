@@ -202,8 +202,12 @@ func parseExpiry(resp *http.Response) time.Time {
 					base := time.Now()
 					if d := resp.Header.Get("Date"); d != "" {
 						if t, err := http.ParseTime(d); err == nil {
+							// Age is how long the response has already sat in an
+							// intermediate cache, so the freshness window started
+							// that long before Date, not after it. Adding it
+							// extended every CDN-served index past its max-age.
 							ageS, _ := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Age")))
-							base = t.Add(time.Duration(ageS) * time.Second)
+							base = t.Add(-time.Duration(ageS) * time.Second)
 						}
 					}
 					return base.Add(time.Duration(n) * time.Second)

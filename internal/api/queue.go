@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -247,18 +249,34 @@ func (q *operationRunner) runOne(qj queuedJob) {
 		if held == nil {
 			err = errors.New("operation lock unavailable")
 		} else {
-			if indexLockedKinds[job.Kind] {
-				q.indexCache.Lock()
-			}
-			_, stopRenew := held.StartRenewing(q.runCtx, OperationLockTTL, OperationLockRenewInterval)
-			err = qj.run(q.runCtx)
-			stopRenew()
-			if indexLockedKinds[job.Kind] {
-				q.indexCache.Unlock()
-			}
-			if rerr := held.Release(saveCtx); rerr != nil {
-				slog.Warn("release operation lock", "job_id", job.ID, "err", rerr)
-			}
+			err = func() (rerr error) {
+				// Everything acquired here is released by defer, so a panic
+				// inside the operation unwinds through the unlock, the
+				// renewal stop and the release instead of past them. Before
+				// this was deferred, a recovered panic left the build lock
+				// held, the cluster lock renewed until shutdown, and this
+				// job kind answering 409 until restart. The recover below
+				// turns the panic into a normal failure so the status save,
+				// clearActive and webhook that follow still run.
+				if indexLockedKinds[job.Kind] {
+					q.indexCache.Lock()
+					defer q.indexCache.Unlock()
+				}
+				_, stopRenew := held.StartRenewing(q.runCtx, OperationLockTTL, OperationLockRenewInterval)
+				defer stopRenew()
+				defer func() {
+					if e := held.Release(saveCtx); e != nil {
+						slog.Warn("release operation lock", "job_id", job.ID, "err", e)
+					}
+				}()
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("async operation panicked", "job_id", job.ID, "kind", job.Kind, "panic", r, "stack", string(debug.Stack()))
+						rerr = fmt.Errorf("operation panicked: %v", r)
+					}
+				}()
+				return qj.run(q.runCtx)
+			}()
 		}
 	}
 	metrics.OperationDuration.WithLabelValues(string(job.Kind)).Observe(time.Since(start).Seconds())

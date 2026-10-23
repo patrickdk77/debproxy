@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/gzip"
-	"github.com/klauspost/compress/zstd"
 	"github.com/ulikunitz/xz"
 
 	"github.com/debproxy/debproxy/internal/apt"
@@ -683,7 +682,11 @@ type pkgVariant struct {
 
 var pkgVariants = []pkgVariant{
 	{"Packages.zst", func(d []byte) (io.Reader, error) {
-		return zstd.NewReader(bytes.NewReader(d))
+		// apt.OpenCompressed wraps the decoder in an io.Closer so the
+		// caller's closer check below actually fires; the bare
+		// *zstd.Decoder is not one, and its worker goroutines leaked
+		// on every parse that was abandoned partway.
+		return apt.OpenCompressed("Packages.zst", bytes.NewReader(d))
 	}},
 	{"Packages.gz", func(d []byte) (io.Reader, error) {
 		return gzip.NewReader(bytes.NewReader(d))
@@ -898,7 +901,7 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 
 var srcVariants = []pkgVariant{
 	{"Sources.zst", func(d []byte) (io.Reader, error) {
-		return zstd.NewReader(bytes.NewReader(d))
+		return apt.OpenCompressed("Sources.zst", bytes.NewReader(d))
 	}},
 	{"Sources.gz", func(d []byte) (io.Reader, error) {
 		return gzip.NewReader(bytes.NewReader(d))
@@ -1226,7 +1229,7 @@ func (f *Fetcher) fetchSourcesFile(ctx context.Context, rel *apt.Release, base s
 		if rc, ok := r.(io.Closer); ok {
 			defer rc.Close()
 		}
-		return apt.ParseSourceRaws(r)
+		return apt.ParseSourceRaws(boundedReader(r))
 	}
 	return nil, nil
 }
@@ -1353,12 +1356,23 @@ func (f *Fetcher) getConditional(ctx context.Context, url, etag, lastMod string)
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil, resp, nil
 	}
-	data, err := io.ReadAll(resp.Body)
+	// Bounded before any digest or signature check can run on it: every
+	// caller verifies these bytes afterwards, so a truncated read fails
+	// that check rather than being used, and the bound only has to stop
+	// the allocation. The largest real index bodies are tens of MB.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRawIndexBytes+1))
 	if err != nil {
 		return nil, resp, err
 	}
+	if int64(len(data)) > maxRawIndexBytes {
+		return nil, resp, fmt.Errorf("%s: response exceeds %d byte limit", url, maxRawIndexBytes)
+	}
 	return data, resp, nil
 }
+
+// maxRawIndexBytes caps one fetched index or Release body as received,
+// before decompression (which boundedReader bounds separately).
+const maxRawIndexBytes = 256 << 20
 
 // ErrDigestMismatch is returned when a fetched file's SHA256 does not match
 // the value declared in the Release file. It typically indicates the mirror is

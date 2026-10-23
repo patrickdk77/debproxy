@@ -77,6 +77,10 @@ func ControlParagraph(r io.ReadSeeker) (*apt.Paragraph, error) {
 	return paras[0], nil
 }
 
+// maxControlBytes caps the decompressed control file read out of
+// control.tar.
+const maxControlBytes = 1 << 20
+
 func readControlTar(r io.Reader, name string) ([]byte, error) {
 	var inner io.Reader = r
 	switch {
@@ -113,7 +117,17 @@ func readControlTar(r io.Reader, name string) ([]byte, error) {
 			return nil, err
 		}
 		if hdr.Name == "./control" || hdr.Name == "control" {
-			return io.ReadAll(tr)
+			// The ar member is already capped, but control.tar is
+			// compressed and this is the decompressed control file, so
+			// it needs its own bound. A real control file is a few KB.
+			data, err := io.ReadAll(io.LimitReader(tr, maxControlBytes+1))
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(data)) > maxControlBytes {
+				return nil, fmt.Errorf("control file in %s exceeds %d byte limit", name, maxControlBytes)
+			}
+			return data, nil
 		}
 	}
 	return nil, fmt.Errorf("control file not found in %s", name)

@@ -57,7 +57,13 @@ func (a *API) handleSnapshotCreate(w http.ResponseWriter, r *http.Request, _ aut
 		return
 	}
 
-	ctx := r.Context()
+	// Detached from the request: a client that times out mid-publish
+	// used to cancel the next storage write and leave a half-written,
+	// listed snapshot behind. The publish runs to its own bound instead,
+	// the same 30m the scheduler allows, and the lock is released on a
+	// context that outlives the client too.
+	ctx, cancel := syncOperationContext(r.Context())
+	defer cancel()
 	held, err := a.oplock.Acquire(ctx, OperationLockTTL, a.snapshotWait)
 	if err != nil {
 		slog.Error("api snapshot: acquire operation lock", "err", err)
@@ -70,6 +76,11 @@ func (a *API) handleSnapshotCreate(w http.ResponseWriter, r *http.Request, _ aut
 		return
 	}
 	defer held.Release(ctx)
+	// Renewed while the publish runs: the lock's TTL is two minutes and a
+	// snapshot against S3 routinely runs longer, after which another
+	// replica's scheduled job would start alongside it.
+	_, stopRenew := held.StartRenewing(ctx, OperationLockTTL, OperationLockRenewInterval)
+	defer stopRenew()
 
 	if !req.Force && a.debounce > 0 {
 		if age, ok, ageErr := a.syncr.CurrentSnapshotAge(ctx, time.Now()); ageErr != nil {
@@ -270,4 +281,17 @@ func (a *API) enqueueAndRespond(w http.ResponseWriter, r *http.Request, kind Job
 		slog.Error("api: enqueue job", "kind", kind, "err", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
+}
+
+// syncOperationTimeout bounds a synchronous admin operation that was
+// started by an HTTP request. It matches the scheduler's own allowance for
+// a snapshot so the two paths fail the same way on the same stall.
+const syncOperationTimeout = 30 * time.Minute
+
+// syncOperationContext derives the context a synchronous admin operation
+// runs under: detached from the request's cancellation, so a client that
+// hangs up cannot abort a publish partway, but bounded so a stalled backend
+// cannot hold the operation lock indefinitely.
+func syncOperationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), syncOperationTimeout)
 }

@@ -135,7 +135,27 @@ func (in *Ingestor) CacheStreamingBody(ctx context.Context, osName, codename str
 	if err := in.store.PutFile(ctx, p.PoolPath, dvr, p.Size); err != nil {
 		return err
 	}
-	in.onDownloaded(osName, codename, p, notify)
+	if dvr.read == 0 {
+		// The backend answered success without reading a byte, which the
+		// filesystem store does when another request already landed this
+		// file. The caller has already sent a 200 with a Content-Length,
+		// so the client is waiting on exactly that many bytes and would
+		// otherwise get none. Serve the stored copy to it instead. No
+		// download happened, so the freshly-cached log, metric and
+		// webhook stay silent.
+		if w != nil {
+			rc, err := in.store.Open(ctx, p.PoolPath)
+			if err != nil {
+				return fmt.Errorf("open already-cached %s: %w", p.PoolPath, err)
+			}
+			defer rc.Close()
+			if _, err := io.Copy(w, rc); err != nil {
+				return fmt.Errorf("serve already-cached %s: %w", p.PoolPath, err)
+			}
+		}
+	} else {
+		in.onDownloaded(osName, codename, p, notify)
+	}
 	if in.exists != nil {
 		in.exists.Add(p.PoolPath)
 	}
@@ -217,6 +237,10 @@ type digestVerifyingReader struct {
 	clientOK       bool
 	hash           hash.Hash
 	expectedSHA256 string
+	// read counts bytes pulled from src. Zero after a successful PutFile
+	// means the backend never consumed the stream, which the filesystem
+	// store does when the file already exists; see CacheStreamingBody.
+	read int64
 }
 
 func newDigestVerifyingReader(src io.Reader, client io.Writer, expectedSHA256 string) *digestVerifyingReader {
@@ -234,6 +258,7 @@ func newDigestVerifyingReader(src io.Reader, client io.Writer, expectedSHA256 st
 func (d *digestVerifyingReader) Read(p []byte) (int, error) {
 	n, err := d.src.Read(p)
 	if n > 0 {
+		d.read += int64(n)
 		d.hash.Write(p[:n]) // hash.Hash.Write never returns an error
 		if d.clientOK {
 			if _, werr := d.client.Write(p[:n]); werr != nil {

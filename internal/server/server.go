@@ -65,8 +65,14 @@ type Server struct {
 	// respectively, built once from cfg.ResolvedLayouts. Deeper path segments
 	// (section, first-letter bucket, package name, filename) are per-package
 	// and unbounded, so they're never validated or used as metric labels.
+	validOS         map[string]bool
 	validOSCodename map[string]bool
 	validTriple     map[string]bool
+
+	// snapList caches each OS's snapshot listing for snapListTTL; see
+	// resolveSnapshot.
+	snapListMu sync.Mutex
+	snapList   map[string]snapListEntry
 
 	// valkey optionally backs /live's compressed serving artifacts with a
 	// shared Valkey deployment so multiple debproxy replicas avoid redundant
@@ -78,6 +84,11 @@ type Server struct {
 	// storage backend. See serveKeyFromMemory in keys.go.
 	keyPayloadsOnce sync.Once
 	keyPayloads     map[string][]byte
+
+	// resolveMu guards the two maps below; see resolvePoolPackage.
+	resolveMu       sync.Mutex
+	resolveMiss     map[string]time.Time
+	resolveInflight map[string]*resolveFlight
 }
 
 const (
@@ -289,9 +300,11 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 	if indexCache == nil {
 		indexCache = upstream.NewIndexCache()
 	}
+	validOS := map[string]bool{}
 	validOSCodename := map[string]bool{}
 	validTriple := map[string]bool{}
 	for _, l := range cfg.ResolvedLayouts {
+		validOS[l.OS] = true
 		validOSCodename[l.OS+"/"+l.Codename] = true
 		for _, u := range l.Upstreams {
 			validTriple[l.OS+"/"+l.Codename+"/"+u.Name] = true
@@ -300,6 +313,7 @@ func New(cfg *config.Config, store storage.Storage, index metadata.MetadataIndex
 
 	return &Server{
 		cfg:              cfg,
+		validOS:          validOS,
 		store:            store,
 		index:            index,
 		key:              key,
@@ -595,6 +609,16 @@ func hashFromByHashKey(key string) string {
 // apt client has any business reading.
 const internalErrorBody = "internal error"
 
+// TopHandler is the process's root handler: api serves everything under
+// /api/ and Handler() everything else, with the access log around both.
+// net/http's ServeMux picks the more specific pattern, so /api/ wins there.
+func (s *Server) TopHandler(api http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/api/", logging(api))
+	mux.Handle("/", s.Handler())
+	return mux
+}
+
 // Handler returns the HTTP handler with logging, response compression, and metrics.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -729,8 +753,12 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 
 	if remainder[0] == "pool" {
 		// remainder: [pool, os, codename, upstream, ...]
+		// The pool path carries its own os segment, and resolvePoolPackage
+		// builds a live index for whatever it says. It has to match the os
+		// the URL was validated under, or any string in that slot becomes
+		// a layout this server will build, sign and cache on request.
 		cn, up := segAt(remainder, 2), segAt(remainder, 3)
-		if !s.isKnownTriple(osName, cn, up) {
+		if segAt(remainder, 1) != osName || !s.isKnownTriple(osName, cn, up) {
 			// Reject before any real work (pull-through, live-index build) is
 			// attempted for a combination that could never be served -- not
 			// just relabeled to a metrics sentinel after the fact.
@@ -744,7 +772,7 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request, rest []strin
 		// remainder: [src, os, codename, upstream, ...] -- see the comment on the
 		// analogous branch in handleSnapshot for why os appears twice here.
 		codename := segAt(remainder, 2)
-		if !s.isKnownOSCodename(osName, codename) {
+		if segAt(remainder, 1) != osName || !s.isKnownOSCodename(osName, codename) {
 			http.NotFound(w, r)
 			return
 		}
@@ -818,7 +846,13 @@ func (s *Server) resolveSnapshot(ctx context.Context, osName, selector string) (
 	if selector == "current" {
 		return "current", nil
 	}
-	refs, err := s.store.ListSnapshots(ctx, osName)
+	// An OS no layout defines cannot have snapshots, and the check costs
+	// nothing. Without it every scanner probe shaped like /a/b/c paid for
+	// a storage listing before being told no.
+	if !s.validOS[osName] {
+		return "", errUnknownSelector
+	}
+	refs, err := s.cachedSnapshots(ctx, osName)
 	if err != nil {
 		return "", err
 	}
@@ -827,13 +861,61 @@ func (s *Server) resolveSnapshot(ctx context.Context, osName, selector string) (
 			return selector, nil
 		}
 	}
+	var at time.Time
 	if t, err := time.Parse("2006-01-02", selector); err == nil {
-		return s.store.ResolveSnapshot(ctx, osName, t.Add(24*time.Hour-time.Second))
+		at = t.Add(24*time.Hour - time.Second)
+	} else if t, err := time.Parse("2006-01-02T15-04-05", selector); err == nil {
+		at = t
+	} else {
+		return "", errUnknownSelector
 	}
-	if t, err := time.Parse("2006-01-02T15-04-05", selector); err == nil {
-		return s.store.ResolveSnapshot(ctx, osName, t)
+	// Resolved from the cached listing rather than a second storage call:
+	// the newest snapshot created at or before the requested instant.
+	var chosen storage.SnapshotRef
+	for _, ref := range refs {
+		if !ref.CreatedAt.After(at) && ref.CreatedAt.After(chosen.CreatedAt) {
+			chosen = ref
+		}
 	}
-	return "", errUnknownSelector
+	if chosen.ID == "" {
+		// A date before the first snapshot is a client asking for
+		// something that does not exist, not a backend failure.
+		return "", os.ErrNotExist
+	}
+	return chosen.ID, nil
+}
+
+// snapListTTL is how long one OS's snapshot listing is reused. Snapshots
+// are created on a schedule measured in hours and pruned weekly, so a
+// listing that is a few seconds stale changes nothing a client can see;
+// without it every request under a dated selector cost one storage LIST
+// per retained snapshot.
+const snapListTTL = 30 * time.Second
+
+type snapListEntry struct {
+	refs []storage.SnapshotRef
+	at   time.Time
+}
+
+func (s *Server) cachedSnapshots(ctx context.Context, osName string) ([]storage.SnapshotRef, error) {
+	s.snapListMu.Lock()
+	if e, ok := s.snapList[osName]; ok && time.Since(e.at) < snapListTTL {
+		s.snapListMu.Unlock()
+		return e.refs, nil
+	}
+	s.snapListMu.Unlock()
+
+	refs, err := s.store.ListSnapshots(ctx, osName)
+	if err != nil {
+		return nil, err
+	}
+	s.snapListMu.Lock()
+	if s.snapList == nil {
+		s.snapList = map[string]snapListEntry{}
+	}
+	s.snapList[osName] = snapListEntry{refs: refs, at: time.Now()}
+	s.snapListMu.Unlock()
+	return refs, nil
 }
 
 func (s *Server) servePublished(w http.ResponseWriter, r *http.Request, relPath string) {
@@ -890,7 +972,20 @@ func (s *Server) servePublishedFromCompressed(w http.ResponseWriter, r *http.Req
 	for _, sfx := range []string{".zst", ".gz", ".xz"} {
 		rc, err := s.store.OpenPublished(r.Context(), relPath+sfx)
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			// A missing variant means try the next one. Anything else
+			// means the backend failed, and reporting that as 404 told
+			// apt the index does not exist when the real problem was an
+			// S3 timeout or a denied read, with nothing in the log.
+			if clientGone(r.Context(), err) {
+				slog.Debug("client gone reading published index", "path", relPath+sfx, "err", err)
+				return
+			}
+			slog.Error("open compressed published index", "path", relPath+sfx, "err", err)
+			http.Error(w, internalErrorBody, http.StatusInternalServerError)
+			return
 		}
 		b, rerr := io.ReadAll(rc)
 		rc.Close()
@@ -979,6 +1074,10 @@ func (s *Server) servePool(w http.ResponseWriter, r *http.Request, poolPath stri
 	osLabel, cnLabel, upLabel = s.metricTriple(osLabel, cnLabel, upLabel)
 	exists, err := s.store.Exists(r.Context(), poolPath)
 	if err != nil {
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during pool exists check", "path", poolPath, "err", err)
+			return
+		}
 		slog.Error("pool exists check", "path", poolPath, "err", err)
 		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
@@ -1104,6 +1203,10 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 	// Ensure the file exists locally, pulling through from upstream if needed.
 	exists, err := s.store.Exists(r.Context(), srcPath)
 	if err != nil {
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during src exists check", "path", srcPath, "err", err)
+			return
+		}
 		slog.Error("src exists check", "path", srcPath, "err", err)
 		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
@@ -1126,6 +1229,10 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 			http.NotFound(w, r)
 			return
 		}
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during src stat", "path", srcPath, "err", err)
+			return
+		}
 		slog.Error("src file access", "path", srcPath, "err", err)
 		http.Error(w, internalErrorBody, http.StatusInternalServerError)
 		return
@@ -1134,6 +1241,10 @@ func (s *Server) serveSrc(w http.ResponseWriter, r *http.Request, osName, codena
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
+			return
+		}
+		if clientGone(r.Context(), err) {
+			slog.Debug("client gone during src open", "path", srcPath, "err", err)
 			return
 		}
 		slog.Error("src file access", "path", srcPath, "err", err)
@@ -1283,6 +1394,9 @@ func (s *Server) resolvePoolPackage(ctx context.Context, poolPath string) (osNam
 		return "", "", avail.Pkg{}, errors.New("invalid pool path")
 	}
 	osName, codename = segs[1], segs[2]
+	if !s.isKnownOSCodename(osName, codename) {
+		return "", "", avail.Pkg{}, errors.New("unknown os/codename in pool path")
+	}
 
 	entry, err := s.getLive(ctx, osName, codename)
 	if err != nil {
@@ -1293,13 +1407,101 @@ func (s *Server) resolvePoolPackage(ctx context.Context, poolPath string) (osNam
 		return osName, codename, p, nil
 	}
 
+	// A miss past this point costs a full index fetch for the upstream the
+	// path names (see avail.ResolvePoolPath), so two things bound it. A
+	// confirmed miss is answered from memory for resolveMissTTL, and
+	// concurrent requests for one path share a single re-resolve instead of
+	// each running their own. Without both, an apt fleet holding stale
+	// package lists, or anyone requesting made-up names, drives one upstream
+	// index download per request with nothing in between.
+	if s.recentMiss(poolPath) {
+		return "", "", avail.Pkg{}, errNotUpstream
+	}
+	fl, leader := s.beginResolve(poolPath)
+	if !leader {
+		select {
+		case <-fl.done:
+		case <-ctx.Done():
+			return "", "", avail.Pkg{}, ctx.Err()
+		}
+		if fl.err != nil {
+			return "", "", avail.Pkg{}, errNotUpstream
+		}
+		return osName, codename, fl.pkg, nil
+	}
+
 	slog.Warn("package not in current live index, re-resolving directly against its upstream", "path", poolPath)
-	p, ferr := avail.ResolvePoolPath(ctx, s.cfg, s.client, s.indexCache, osName, codename, poolPath)
+	ferr := errors.New("resolve aborted")
+	func() {
+		// finishResolve must run even if the resolve panics, or every
+		// follower parked on fl.done waits until its own context ends.
+		defer func() { s.finishResolve(poolPath, fl, p, ferr) }()
+		p, ferr = avail.ResolvePoolPath(ctx, s.cfg, s.client, s.indexCache, osName, codename, poolPath)
+	}()
 	if ferr != nil {
 		slog.Error("package not available upstream", "path", poolPath, "err", ferr)
-		return "", "", avail.Pkg{}, errors.New("package not available upstream")
+		return "", "", avail.Pkg{}, errNotUpstream
 	}
 	return osName, codename, p, nil
+}
+
+// resolveMissTTL is how long a confirmed upstream miss for one pool path is
+// answered from memory before the next request re-checks upstream.
+const resolveMissTTL = time.Minute
+
+var errNotUpstream = errors.New("package not available upstream")
+
+// resolveFlight is one in-flight re-resolve that concurrent requests for the
+// same pool path share. pkg and err are written before done is closed and
+// read only after it, so the channel orders them.
+type resolveFlight struct {
+	done chan struct{}
+	pkg  avail.Pkg
+	err  error
+}
+
+func (s *Server) recentMiss(poolPath string) bool {
+	s.resolveMu.Lock()
+	defer s.resolveMu.Unlock()
+	until, ok := s.resolveMiss[poolPath]
+	if !ok {
+		return false
+	}
+	if time.Now().After(until) {
+		delete(s.resolveMiss, poolPath)
+		return false
+	}
+	return true
+}
+
+// beginResolve joins the in-flight resolve for poolPath, or starts one and
+// reports that the caller leads it. A leader must call finishResolve.
+func (s *Server) beginResolve(poolPath string) (*resolveFlight, bool) {
+	s.resolveMu.Lock()
+	defer s.resolveMu.Unlock()
+	if fl, ok := s.resolveInflight[poolPath]; ok {
+		return fl, false
+	}
+	if s.resolveInflight == nil {
+		s.resolveInflight = map[string]*resolveFlight{}
+	}
+	fl := &resolveFlight{done: make(chan struct{})}
+	s.resolveInflight[poolPath] = fl
+	return fl, true
+}
+
+func (s *Server) finishResolve(poolPath string, fl *resolveFlight, p avail.Pkg, err error) {
+	fl.pkg, fl.err = p, err
+	s.resolveMu.Lock()
+	delete(s.resolveInflight, poolPath)
+	if err != nil {
+		if s.resolveMiss == nil {
+			s.resolveMiss = map[string]time.Time{}
+		}
+		s.resolveMiss[poolPath] = time.Now().Add(resolveMissTTL)
+	}
+	s.resolveMu.Unlock()
+	close(fl.done)
 }
 
 // pullThrough resolves poolPath to an available upstream package and caches it
@@ -1491,6 +1693,15 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	wait := make(chan struct{})
 	s.liveBuilding[cacheKey] = wait
 	s.mu.Unlock()
+	// Cleared and closed on every exit, a panic unwinding through here
+	// included. Leaving the marker set parks every later request for this
+	// layout on a channel nobody will ever close.
+	defer func() {
+		s.mu.Lock()
+		delete(s.liveBuilding, cacheKey)
+		s.mu.Unlock()
+		close(wait)
+	}()
 
 	// Detach from the client context so a disconnect doesn't abort a build
 	// that will populate the cache for subsequent requests. Marked
@@ -1500,7 +1711,12 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	// that marking matters: it's what lets FetchIndex/FetchSources degrade
 	// early to stale data here, while background rebuilds and the periodic
 	// refresher (neither marked) always spend the full retry budget instead.
-	buildCtx := upstream.WithClientWaiting(context.WithoutCancel(ctx))
+	// Bounded by retryTimeout, the same ceiling rebuildLive uses: an
+	// upstream that sends headers and then stops sending body bytes would
+	// otherwise hold this build, and every request queued behind it, for
+	// as long as the TCP connection survives.
+	buildCtx, cancelBuild := context.WithTimeout(upstream.WithClientWaiting(context.WithoutCancel(ctx)), retryTimeout)
+	defer cancelBuild()
 	slog.Info("building live cache", "os", osName, "codename", codename)
 	buildStart := time.Now()
 	// Deliberately s.buildAvailBestEffort, not s.buildAvail: this is the
@@ -1516,9 +1732,6 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 	files, hashes, builtAt, expiry, fresh, err := s.buildOrAdoptLiveFiles(buildCtx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 
-	s.mu.Lock()
-	delete(s.liveBuilding, cacheKey)
-	s.mu.Unlock()
 	if err == nil {
 		fingerprint, _ := avail.QuickFingerprint(buildCtx, s.cfg, s.client, s.indexCache, osName, codename)
 		entry = &liveEntry{av: av, files: files, hashes: hashes, built: builtAt, expiry: expiry, fingerprint: fingerprint}
@@ -1528,7 +1741,6 @@ func (s *Server) getLive(ctx context.Context, osName, codename string) (*liveEnt
 		slog.Error("live file generation failed, no stale data available",
 			"os", osName, "codename", codename, "elapsed", elapsed, "err", err)
 	}
-	close(wait)
 
 	if err != nil {
 		return nil, err
@@ -1565,6 +1777,15 @@ func (s *Server) extendExpiry(existing *liveEntry) *liveEntry {
 
 func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct{}) {
 	defer close(wait)
+	// Registered after close(wait), so it runs first: the marker is gone
+	// before any waiter wakes, and it goes on a panic too. Left set, getLive
+	// never starts another rebuild for this layout and the stale entry is
+	// served until restart.
+	defer func() {
+		s.mu.Lock()
+		delete(s.liveBuilding, cacheKey)
+		s.mu.Unlock()
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), retryTimeout)
 	defer cancel()
 
@@ -1582,7 +1803,6 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 		s.mu.Unlock()
 		if hasExisting && existing.fingerprint == quickFP {
 			s.mu.Lock()
-			delete(s.liveBuilding, cacheKey)
 			s.liveCache[cacheKey] = s.extendExpiry(existing)
 			s.mu.Unlock()
 			slog.Debug("live cache content unchanged, extending expiry without rebuilding", "os", osName, "codename", codename)
@@ -1604,9 +1824,6 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 			// all fetch from the winner at once either); failing that, the
 			// next client request re-checks this lock fresh.
 			slog.Debug("live build already in progress on another replica, skipping redundant rebuild", "os", osName, "codename", codename)
-			s.mu.Lock()
-			delete(s.liveBuilding, cacheKey)
-			s.mu.Unlock()
 			return
 		} else {
 			defer func() {
@@ -1639,7 +1856,6 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 		s.mu.Unlock()
 		if hasExisting {
 			s.mu.Lock()
-			delete(s.liveBuilding, cacheKey)
 			s.liveCache[cacheKey] = s.extendExpiry(existing)
 			s.mu.Unlock()
 			slog.Warn("upstream fetch failed this cycle, keeping previous live cache instead of publishing an incomplete one", "os", osName, "codename", codename)
@@ -1650,9 +1866,6 @@ func (s *Server) rebuildLive(osName, codename, cacheKey string, wait chan struct
 	files, hashes, builtAt, expiry, fresh, err := s.buildOrAdoptLiveFiles(ctx, osName, codename, av)
 	elapsed := time.Since(buildStart)
 
-	s.mu.Lock()
-	delete(s.liveBuilding, cacheKey)
-	s.mu.Unlock()
 	swapped := err == nil
 	if err == nil {
 		fingerprint, _ := avail.QuickFingerprint(ctx, s.cfg, s.client, s.indexCache, osName, codename)

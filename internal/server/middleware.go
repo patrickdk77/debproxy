@@ -229,7 +229,7 @@ func logging(next http.Handler) http.Handler {
 
 		fmt.Fprintf(accessLog,
 			"%s - - [%s] \"%s %s %s\" %d %d \"%s\" \"%s\"\n",
-			clientIP(r),
+			sanitizeLogField(clientIP(r)),
 			t.Format("02/Jan/2006:15:04:05 -0700"),
 			r.Method,
 			sanitizeLogField(r.RequestURI),

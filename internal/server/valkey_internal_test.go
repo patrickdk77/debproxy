@@ -401,7 +401,10 @@ func TestBuildOrAdoptLiveFiles_AdoptsFromPeerViaHTTP(t *testing.T) {
 	sentinel := []byte("SENTINEL-FROM-PUBLISHER-NOT-RECOMPILED")
 	builtAt := time.Now().Truncate(time.Second)
 	expiry := builtAt.Add(time.Hour)
-	hashes := map[string]string{fileKey: "deadbeef"}
+	// The advertised hash must be the sentinel's real digest: the consumer
+	// verifies fetched bytes against it, which is what stops a reused
+	// peer address from feeding it someone else's content.
+	hashes := map[string]string{fileKey: sha(sentinel)}
 
 	// Publisher: a cache hit, not a real build -- liveCache is populated
 	// directly, so serving it needs no real upstream/metadata machinery.
@@ -684,5 +687,47 @@ func TestRebuildLiveSkipsWhenAnotherReplicaHoldsTheBuildLock(t *testing.T) {
 	}
 	if stillBuilding {
 		t.Fatal("expected liveBuilding to be cleared even on the early-skip path, or a stuck flag would block all future rebuilds for this layout")
+	}
+}
+
+// TestBuildOrAdoptLiveFiles_RejectsPeerBytesNotMatchingHash is the other
+// half of the by-hash check: a publisher that answers with bytes whose
+// digest is not the one the notice advertised must not have those bytes
+// adopted as the generation.
+func TestBuildOrAdoptLiveFiles_RejectsPeerBytesNotMatchingHash(t *testing.T) {
+	const fileKey = "dists/trixie/main/binary-amd64/Packages.gz"
+	impostor := []byte("<html>whatever now lives at this address</html>")
+	builtAt := time.Now().Truncate(time.Second)
+	expiry := builtAt.Add(time.Hour)
+	// A digest that is not impostor's, as a notice for the real file
+	// would carry.
+	hashes := map[string]string{fileKey: sha([]byte("the real Packages.gz"))}
+
+	publisher := New(testLayoutConfig(), nil, nil, nil, nil, nil, nil, nil)
+	publisher.liveCache["debian/trixie"] = &liveEntry{
+		files: map[string][]byte{fileKey: impostor}, hashes: hashes, built: builtAt, expiry: expiry,
+	}
+	pubSrv := httptest.NewServer(publisher.Handler())
+	defer pubSrv.Close()
+
+	consumer := newValkeyEnabledServer(t, ":0")
+	notice := liveUpdatedMsg{
+		OS: "debian", Codename: "trixie",
+		Addrs:   []string{pubSrv.Listener.Addr().String()},
+		BuiltAt: builtAt, Expiry: expiry,
+		Hashes: hashes, Files: []string{fileKey},
+	}
+	data, err := json.Marshal(notice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.handleLiveUpdatedMessage(valkey.PubSubMessage{Message: string(data)})
+
+	files, _, _, _, fresh, err := consumer.buildOrAdoptLiveFiles(context.Background(), "debian", "trixie", &avail.Available{})
+	if err == nil && !fresh && string(files[fileKey]) == string(impostor) {
+		t.Fatal("impostor bytes were adopted under a hash they do not match")
+	}
+	if err == nil && string(files[fileKey]) == string(impostor) {
+		t.Fatal("impostor bytes present in the result")
 	}
 }

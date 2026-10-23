@@ -53,9 +53,12 @@ const (
 	DefaultThreshold = 1 * time.Second
 
 	// maxStackBytes caps the goroutine dump. Large enough for the
-	// hundreds of goroutines a saturated fetch fan-out produces,
-	// bounded so a pathological case cannot allocate without limit.
-	maxStackBytes = 4 << 20
+	// hundreds of goroutines a saturated fetch fan-out produces, and
+	// small enough that one dump is a modest log record: the log writer
+	// bounds its queue by record count, not bytes, so a multi-megabyte
+	// record repeated across a long stall would be the one way to grow
+	// that queue past what it was sized for.
+	maxStackBytes = 1 << 20
 )
 
 // Config tunes the watchdog. The zero value is usable: Interval and

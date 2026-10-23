@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -31,7 +32,14 @@ type basicVerifier struct {
 func newBasicVerifier(basic map[string]string) (*basicVerifier, error) {
 	for user, hash := range basic {
 		if !recognizedHashPrefix(hash) {
-			return nil, fmt.Errorf("auth.basic user %q: unrecognized password hash format (expected $2a$/$2b$/$2$, $argon2id$, $6$, or $5$)", user)
+			return nil, fmt.Errorf("auth.basic user %q: unrecognized password hash format (expected $2a$/$2b$/$2y$/$2$, $argon2id$, $6$, or $5$)", user)
+		}
+		// A prefix check alone let an argon2id hash with t=0 or p=0
+		// through to the request path, where the library panics on it.
+		if strings.HasPrefix(hash, "$argon2id$") {
+			if _, err := parseArgon2id(hash); err != nil {
+				return nil, fmt.Errorf("auth.basic user %q: %w", user, err)
+			}
 		}
 	}
 	return &basicVerifier{users: basic}, nil

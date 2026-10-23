@@ -166,3 +166,90 @@ func newAuthWithUsers(t *testing.T, users map[string]string) (*auth.Authenticato
 func authCfgWithBasic(users map[string]string) config.AuthConfig {
 	return config.AuthConfig{Basic: users}
 }
+
+// TestGuardThrottleIsPerAccountBehindSharedPeer is the regression test
+// for the shared-proxy lockout: failures against one username from a
+// peer must not block a different username from the same peer.
+func TestGuardThrottleIsPerAccountBehindSharedPeer(t *testing.T) {
+	a := newGuardTestAPI(t)
+	a.throttle = newAuthThrottle(2, time.Minute)
+	var err error
+	a.authn, err = newAuthWithUsers(t, map[string]string{
+		"alice": mustBcryptHash(t, "s3cret"),
+		"bob":   mustBcryptHash(t, "s3cret"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.cfg.API[ResSnapshot][ActCreate] = []string{"alice", "bob"}
+	h := a.guard(ResSnapshot, ActCreate, okHandler)
+
+	// Someone behind the proxy hammers bob's account.
+	for i := 0; i < 3; i++ {
+		h(httptest.NewRecorder(), guardReq("bob", "wrong", "10.0.0.9:1"))
+	}
+	rec := httptest.NewRecorder()
+	h(rec, guardReq("bob", "s3cret", "10.0.0.9:1"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("bob not throttled after repeated failures: %d", rec.Code)
+	}
+
+	// alice, same peer address, must be unaffected.
+	rec = httptest.NewRecorder()
+	h(rec, guardReq("alice", "s3cret", "10.0.0.9:1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice locked out by bob's failures from the shared peer: %d", rec.Code)
+	}
+}
+
+// TestGuardThrottleChargesBeforeVerify: with the charge taken before
+// authentication, a burst of concurrent bad attempts cannot all slip
+// through the check; at most limit of them reach the verifier.
+func TestGuardThrottleChargesBeforeVerify(t *testing.T) {
+	a := newGuardTestAPI(t)
+	a.throttle = newAuthThrottle(3, time.Minute)
+	h := a.guard(ResSnapshot, ActCreate, okHandler)
+
+	const burst = 20
+	codes := make(chan int, burst)
+	start := make(chan struct{})
+	for i := 0; i < burst; i++ {
+		go func() {
+			<-start
+			rec := httptest.NewRecorder()
+			h(rec, guardReq("alice", "wrong", "10.0.0.10:1"))
+			codes <- rec.Code
+		}()
+	}
+	close(start)
+	forbidden := 0
+	for i := 0; i < burst; i++ {
+		if <-codes == http.StatusForbidden {
+			forbidden++
+		}
+	}
+	// 403 means the request reached the verifier. With pre-charging that
+	// is bounded by the limit plus whatever was already past the check
+	// when the limit tripped, which cannot be the whole burst.
+	if forbidden >= burst {
+		t.Fatalf("all %d concurrent attempts reached the verifier; throttle never tripped mid-burst", burst)
+	}
+}
+
+func TestThrottleKeyBasicIncludesUsername(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "10.1.2.3:5"
+	r.SetBasicAuth("alice", "x")
+	if got := throttleKey(r); got != "10.1.2.3|alice" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestThrottleKeyBearerIsPeerOnly(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.RemoteAddr = "10.1.2.3:5"
+	r.Header.Set("Authorization", "Bearer abc")
+	if got := throttleKey(r); got != "10.1.2.3" {
+		t.Errorf("got %q", got)
+	}
+}

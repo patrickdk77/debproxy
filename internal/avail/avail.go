@@ -706,5 +706,5 @@ func poolPathFromFilename(os, codename, upstreamName, section, pkgName, upstream
 	if pkgName != "" {
 		first = strings.ToLower(pkgName[:1])
 	}
-	return "pool/" + os + "/" + codename + "/" + upstreamName + "/" + section + "/" + first + "/" + pkgName + "/" + debFile
+	return "pool/" + os + "/" + codename + "/" + upstreamName + "/" + model.PoolSection(section) + "/" + first + "/" + pkgName + "/" + debFile
 }

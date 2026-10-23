@@ -10,7 +10,7 @@ services:
       - cache:/var/lib/debproxy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/usr/local/bin/debproxy", "healthcheck"]
+      test: ["CMD", "/debproxy", "healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 5s

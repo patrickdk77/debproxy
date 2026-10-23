@@ -28,7 +28,7 @@ func verifyPassword(plaintext, hash string) bool {
 	switch {
 	case strings.HasPrefix(hash, "$6$"), strings.HasPrefix(hash, "$5$"):
 		return verifyCrypt(plaintext, hash)
-	case strings.HasPrefix(hash, "$2a$"), strings.HasPrefix(hash, "$2b$"), strings.HasPrefix(hash, "$2$"):
+	case strings.HasPrefix(hash, "$2a$"), strings.HasPrefix(hash, "$2b$"), strings.HasPrefix(hash, "$2y$"), strings.HasPrefix(hash, "$2$"):
 		return verifyBcrypt(plaintext, hash)
 	case strings.HasPrefix(hash, "$argon2id$"):
 		return verifyArgon2id(plaintext, hash)
@@ -44,7 +44,7 @@ func verifyPassword(plaintext, hash string) bool {
 func recognizedHashPrefix(hash string) bool {
 	switch {
 	case strings.HasPrefix(hash, "$6$"), strings.HasPrefix(hash, "$5$"),
-		strings.HasPrefix(hash, "$2a$"), strings.HasPrefix(hash, "$2b$"), strings.HasPrefix(hash, "$2$"),
+		strings.HasPrefix(hash, "$2a$"), strings.HasPrefix(hash, "$2b$"), strings.HasPrefix(hash, "$2y$"), strings.HasPrefix(hash, "$2$"),
 		strings.HasPrefix(hash, "$argon2id$"):
 		return true
 	}
@@ -61,7 +61,7 @@ func verifyCrypt(plaintext, hash string) bool {
 	return c.Verify(hash, []byte(plaintext)) == nil
 }
 
-// --- bcrypt ($2a$/$2b$/$2$) ---
+// --- bcrypt ($2a$/$2b$/$2y$/$2$) ---
 
 func verifyBcrypt(plaintext, hash string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(plaintext)) == nil
@@ -108,6 +108,19 @@ func parseArgon2id(encoded string) (*argon2idParams, error) {
 	threads, err := parseKV(params[2], "p")
 	if err != nil {
 		return nil, err
+	}
+	// argon2.IDKey panics rather than erroring on a zero time cost or
+	// zero parallelism, and memory must cover at least 8 KiB per lane.
+	// Caught here so a bad hash is rejected at config load instead of
+	// taking down a request goroutine on every login attempt.
+	if timeCost < 1 {
+		return nil, fmt.Errorf("invalid argon2id params: t must be >= 1")
+	}
+	if threads < 1 || threads > 255 {
+		return nil, fmt.Errorf("invalid argon2id params: p must be 1..255")
+	}
+	if memory < 8*threads {
+		return nil, fmt.Errorf("invalid argon2id params: m must be >= 8*p")
 	}
 
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])

@@ -77,6 +77,15 @@ func New(cfg config.S3Config) (*Store, error) {
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
+		// Pull-through writes stream an unseekable body. With the SDK's
+		// default of computing a request checksum whenever supported, an
+		// unseekable body is only accepted over TLS (the checksum goes in a
+		// trailer), so every cache write to a plain-http endpoint such as
+		// an in-cluster MinIO failed before a single byte was sent. Only
+		// compute checksums where the operation requires one.
+		if strings.HasPrefix(strings.ToLower(cfg.Endpoint), "http://") {
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}
 		if cfg.ForcePathStyle {
 			o.UsePathStyle = true
 		}

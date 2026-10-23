@@ -65,6 +65,7 @@ spec:
         - name: signing
           secret:
             secretName: debproxy-secret
+            defaultMode: 0400
         - name: pool
           persistentVolumeClaim:
             claimName: debproxy-pool

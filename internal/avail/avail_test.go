@@ -590,11 +590,7 @@ func TestBuildSetsHasFetchFailureWhenUpstreamUnreachable(t *testing.T) {
 }
 
 // buildFakeUpstreamWithSection is like buildFakeUpstream but sets an
-// explicit Section: utils on the one package it serves ("hello" 1.0) --
-// needed whenever a test computes the expected pool path via
-// model.PoolPath, which (unlike the unexported poolPathFromFilename actually
-// used to build it) defaults an empty section to "misc" rather than leaving
-// it blank, so the two would otherwise disagree for a section-less stanza.
+// explicit Section: utils on the one package it serves ("hello" 1.0).
 func buildFakeUpstreamWithSection(t *testing.T, key *signing.Key) (srvURL string) {
 	t.Helper()
 

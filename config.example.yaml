@@ -166,7 +166,7 @@ storage:
 #
 # auth:
 #   # basic maps username -> password hash. Supported formats are
-#   # auto-detected from their prefix: $2a$/$2b$/$2$ (bcrypt), $argon2id$,
+#   # auto-detected from their prefix: $2a$/$2b$/$2y$/$2$ (bcrypt), $argon2id$,
 #   # $6$ (sha512crypt), $5$ (sha256crypt). Generate with an operator tool
 #   # (e.g. `htpasswd -B -C 12` for bcrypt, `mkpasswd -m sha-512`) -- this
 #   # config never stores or accepts a plaintext password.

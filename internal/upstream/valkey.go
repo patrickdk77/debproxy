@@ -338,16 +338,24 @@ func (c *IndexCache) publishToValkey(ctx context.Context, upstream, suite, compo
 	}
 	b := c.valkey
 
+	// Buckets first, meta last. A reader decides whether to adopt from the
+	// meta's Expires, so meta is the commit point: written first, a
+	// replica adopting during the seconds the buckets take to stream saw a
+	// fresh Release over partial or stale buckets and kept it, because the
+	// fingerprint check compares Release digests alone. Written last, that
+	// reader sees the previous meta, declines, and fetches for itself.
+	// If any bucket write fails the meta is left alone for the same
+	// reason: the old Expires must not vouch for mixed data.
+	for arch, pkgs := range entry.archPkgs {
+		if err := b.publishArchPkgs(ctx, upstream, suite, component, arch, pkgs); err != nil {
+			slog.Warn("valkey: write upstream pkgs failed; meta not advanced", "upstream", upstream, "arch", arch, "err", err)
+			return
+		}
+	}
+
 	payload := valkeyPayload{ETag: entry.etag, LastMod: entry.lastMod, Expires: entry.expires, Release: entry.release}
 	if err := valkeycache.SetJSON(ctx, b.client, b.keys.UpstreamMeta(upstream, suite, component), payload); err != nil {
 		slog.Warn("valkey: write upstream meta failed", "upstream", upstream, "err", err)
-		return
-	}
-
-	for arch, pkgs := range entry.archPkgs {
-		if err := b.publishArchPkgs(ctx, upstream, suite, component, arch, pkgs); err != nil {
-			slog.Warn("valkey: write upstream pkgs failed", "upstream", upstream, "arch", arch, "err", err)
-		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -48,24 +49,31 @@ func (a *API) guard(resource, action string, next guardedHandler) http.HandlerFu
 		// JWKS lookup, and no information about why its last attempts
 		// failed. 429 rather than 403 so a legitimate caller stuck behind a
 		// shared address can tell "wait" from "wrong".
-		source := throttleSource(r)
+		source := throttleKey(r)
 		if a.throttle.blocked(source) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(a.throttle.window.Seconds())))
 			http.Error(w, "too many failed authentication attempts", http.StatusTooManyRequests)
+			logAuthFailure(r, resource, action, "throttled")
 			metrics.APIAuthFailuresTotal.WithLabelValues("throttled").Inc()
 			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusTooManyRequests)).Inc()
 			return
 		}
+		// Charged before the credential is examined and refunded on
+		// success. Charging only after a failure left a window between
+		// the check above and the verify below in which any number of
+		// concurrent attempts all passed; charging first means the limit
+		// trips while they are still in flight.
+		a.throttle.fail(source)
 		identity, err := a.authn.Authenticate(r)
 		if err != nil {
-			a.throttle.fail(source)
+			logAuthFailure(r, resource, action, "invalid_credentials")
 			metrics.APIAuthFailuresTotal.WithLabelValues("invalid_credentials").Inc()
 			http.Error(w, "forbidden", http.StatusForbidden)
 			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusForbidden)).Inc()
 			return
 		}
 		if !Allowed(rules, identity) {
-			a.throttle.fail(source)
+			logAuthFailure(r, resource, action, "not_permitted")
 			metrics.APIAuthFailuresTotal.WithLabelValues("not_permitted").Inc()
 			http.Error(w, "forbidden", http.StatusForbidden)
 			metrics.APIRequestsTotal.WithLabelValues(resource, action, strconv.Itoa(http.StatusForbidden)).Inc()
@@ -88,4 +96,19 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// logAuthFailure is the audit record for a refused API request. The
+// metrics count these; this names the account and the peer, which is
+// what an operator needs to tell a mistyped password from a guessing
+// run. Only the Basic username is known before verification; a bearer
+// request is recorded by peer alone.
+func logAuthFailure(r *http.Request, resource, action, reason string) {
+	user := "-"
+	if u, _, ok := r.BasicAuth(); ok && u != "" {
+		user = u
+	}
+	slog.Warn("api request refused",
+		"user", user, "peer", throttleSource(r),
+		"resource", resource, "action", action, "reason", reason)
 }

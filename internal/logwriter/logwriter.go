@@ -107,13 +107,17 @@ func (lw *Writer) run(w io.Writer) {
 			buf = lw.batch(append(buf[:0], rec...))
 			_, _ = w.Write(buf)
 		case <-lw.stop:
-			// Drain whatever is still queued so a graceful
-			// shutdown does not silently discard it.
-			buf = lw.batch(buf[:0])
-			if len(buf) > 0 {
+			// Drain everything still queued so a graceful shutdown
+			// does not discard it. batch stops at batchBytes, so loop
+			// until a pass comes back empty rather than taking one
+			// batch and dropping the rest uncounted.
+			for {
+				buf = lw.batch(buf[:0])
+				if len(buf) == 0 {
+					return
+				}
 				_, _ = w.Write(buf)
 			}
-			return
 		}
 	}
 }

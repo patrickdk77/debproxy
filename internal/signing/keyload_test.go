@@ -150,4 +150,3 @@ func TestReadKeyring_StrictPathUnchanged(t *testing.T) {
 		t.Error("well-formed key lost its identities on the strict path")
 	}
 }
-

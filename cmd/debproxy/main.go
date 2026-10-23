@@ -386,7 +386,7 @@ func runRebuild(args []string) int {
 		if err := index.Flush(context.Background()); err != nil {
 			slog.Error("flush index on interrupt", "err", err)
 		}
-		os.Exit(1)
+		exit(1)
 	}()
 
 	if err := rebuild.Run(ctx, cfg, store, index, rebuild.Options{ResetIndex: *reset, HTTPClient: upstream.NewHTTPClient(cfg.UserAgent, cfg.UpstreamNetwork)}); err != nil {
@@ -875,14 +875,7 @@ func runServe(args []string) int {
 		return 1
 	}
 
-	// /api/ is matched ahead of "/" by net/http's ServeMux (the more specific
-	// pattern wins), so apiSrv.Handler() -- which itself does its own
-	// resource/action/permission routing under /api/v1/... -- sees every
-	// request under /api/, and webServer.Handler() sees everything else,
-	// unchanged from before this feature existed.
-	topMux := http.NewServeMux()
-	topMux.Handle("/api/", apiSrv.Handler())
-	topMux.Handle("/", webServer.Handler())
+	topMux := webServer.TopHandler(apiSrv.Handler())
 
 	// ReadHeaderTimeout bounds how long a connection may sit sending
 	// headers, which is the slowloris shape: hold many connections open
@@ -902,7 +895,7 @@ func runServe(args []string) int {
 		slog.Info("listening", "addr", *addr, "layouts", len(cfg.ResolvedLayouts))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("serve", "err", err)
-			os.Exit(1)
+			exit(1)
 		}
 	}()
 
@@ -1341,6 +1334,8 @@ func startPeriodicSnapshot(syncr *syncerpkg.Syncer, sched snapshotSched, oplock 
 						return
 					}
 					defer held.Release(ctx)
+					_, stopRenew := held.StartRenewing(ctx, api.OperationLockTTL, api.OperationLockRenewInterval)
+					defer stopRenew()
 
 					if debounce > 0 {
 						if age, ok, ageErr := syncr.CurrentSnapshotAge(ctx, time.Now()); ageErr != nil {
@@ -1426,6 +1421,11 @@ func startPeriodicCleanup(syncr *syncerpkg.Syncer, sched snapshotSched, cfg *con
 						return
 					}
 					defer held.Release(ctx)
+					// A cleanup against S3 issues one HEAD per index entry and
+					// runs well past the lock's two-minute TTL; without renewal
+					// another replica's job starts alongside the GC.
+					_, stopRenew := held.StartRenewing(ctx, api.OperationLockTTL, api.OperationLockRenewInterval)
+					defer stopRenew()
 
 					maxAge, ageErr := config.ParseDuration(cfg.Schedule.Age)
 					if ageErr != nil {

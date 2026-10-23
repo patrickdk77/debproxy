@@ -140,3 +140,19 @@ func throttleSource(r *http.Request) string {
 	}
 	return host
 }
+
+// throttleKey is the bucket a request's failures count against. Behind a
+// reverse proxy every client shares one peer address, and keying on that
+// alone let ten bad passwords from anyone lock every admin out of the API
+// for a minute, repeatable indefinitely. Folding the Basic username in
+// narrows a lockout to the one account being guessed at from that peer;
+// other users behind the same proxy are untouched. Bearer requests carry
+// no name before verification and stay keyed on the peer, which is fine
+// because a bad token costs a signature check, not a password hash.
+func throttleKey(r *http.Request) string {
+	source := throttleSource(r)
+	if user, _, ok := r.BasicAuth(); ok && user != "" {
+		return source + "|" + user
+	}
+	return source
+}

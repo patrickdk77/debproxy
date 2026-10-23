@@ -204,6 +204,13 @@ func (s *Syncer) deleteOrphans(ctx context.Context, kind string, candidates []st
 			slog.Warn("cleanup: delete orphaned "+kind+" failed", "path", fi.Path, "err", err)
 			continue
 		}
+		// The exists cache is a positive-only shortcut that Ingestor.Cache
+		// trusts to skip a download. Left set after this delete, a later
+		// auto-update or prime for the same path skipped the fetch and
+		// upserted an entry with no file behind it.
+		if s.exists != nil {
+			s.exists.Remove(fi.Path)
+		}
 		slog.Debug("cleanup: deleted orphaned "+kind, "path", fi.Path)
 		deleted++
 	}
@@ -301,6 +308,9 @@ func (s *Syncer) pruneMissingEntries(ctx context.Context, now time.Time) (int, e
 			slog.Warn("cleanup: remove entry for missing pool file failed",
 				"path", e.PoolPath, "package", e.Package, "version", e.Version, "err", err)
 			continue
+		}
+		if s.exists != nil {
+			s.exists.Remove(e.PoolPath)
 		}
 		slog.Debug("cleanup: removed metadata entry for missing pool file",
 			"path", e.PoolPath, "package", e.Package, "version", e.Version)
@@ -425,18 +435,19 @@ func (s *Syncer) buildPoolRefSet(ctx context.Context) (map[string]bool, error) {
 		}
 	}
 
+	// Every failure below aborts the run rather than being logged and
+	// skipped. A prefix that cannot be listed, or an index that cannot be
+	// read, contributes zero references; deleting against that set would
+	// remove every file those indexes still name. The orphan-ratio guard
+	// catches the gross case but not a single missing snapshot.
 	for _, prefix := range prefixes {
 		files, err := s.store.ListPublished(ctx, prefix)
 		if err != nil {
-			slog.Warn("cleanup: list published files", "prefix", prefix, "err", err)
-			continue
+			return nil, fmt.Errorf("list published files under %s: %w", prefix, err)
 		}
-		for _, f := range files {
-			if !isUncompressedPackages(f) {
-				continue
-			}
+		for _, f := range pickIndexVariants(files, "Packages") {
 			if err := s.scanPackagesRefs(ctx, f, ref); err != nil {
-				slog.Warn("cleanup: scan Packages file", "path", f, "err", err)
+				return nil, fmt.Errorf("scan %s: %w", f, err)
 			}
 		}
 	}
@@ -475,15 +486,57 @@ func (s *Syncer) buildPoolRefSet(ctx context.Context) (map[string]bool, error) {
 	return ref, nil
 }
 
-// isUncompressedPackages reports whether relPath is a plain (non-compressed)
-// binary Packages index file from a dists/ tree.
-func isUncompressedPackages(relPath string) bool {
-	return relPath[strings.LastIndexByte(relPath, '/')+1:] == "Packages"
+// pickIndexVariants returns one published index per directory from files,
+// choosing among base and its compressed forms (base.zst, base.gz,
+// base.xz) in the order apt.IndexSuffixes prefers them.
+//
+// Snapshots are published with compressed indexes only, so a scan that
+// looked for the plain file alone found nothing to reference and let GC
+// collect every package those snapshots still pointed at. Reading one
+// variant per directory, whichever is present, makes the reference set
+// independent of what the compression config happened to write.
+func pickIndexVariants(files []string, base string) []string {
+	best := map[string]string{}
+	rank := map[string]int{}
+	for _, f := range files {
+		dir, name := path.Split(f)
+		if apt.StripIndexSuffix(name) != base {
+			continue
+		}
+		r := indexSuffixRank(strings.TrimPrefix(name, base))
+		if r < 0 {
+			continue
+		}
+		if cur, ok := rank[dir]; !ok || r < cur {
+			best[dir] = f
+			rank[dir] = r
+		}
+	}
+	out := make([]string, 0, len(best))
+	for _, f := range best {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func indexSuffixRank(suffix string) int {
+	for i, s := range apt.IndexSuffixes {
+		if s == suffix {
+			return i
+		}
+	}
+	return -1
 }
 
 // scanPackagesRefs opens a Packages file and records every Filename: value.
 func (s *Syncer) scanPackagesRefs(ctx context.Context, relPath string, ref map[string]bool) error {
-	rc, err := s.store.OpenPublished(ctx, relPath)
+	raw, err := s.store.OpenPublished(ctx, relPath)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	rc, err := apt.OpenCompressed(relPath, raw)
 	if err != nil {
 		return err
 	}
@@ -554,15 +607,17 @@ func (s *Syncer) buildSrcRefSet(ctx context.Context) (map[string]bool, error) {
 	for _, prefix := range prefixes {
 		files, err := s.store.ListPublished(ctx, prefix)
 		if err != nil {
-			slog.Warn("cleanup: list published files for src GC", "prefix", prefix, "err", err)
-			continue
+			return nil, fmt.Errorf("list published files under %s: %w", prefix, err)
 		}
+		var sourceIdx []string
 		for _, f := range files {
-			if !isUncompressedSources(f) {
-				continue
+			if strings.Contains(f, "/source/") {
+				sourceIdx = append(sourceIdx, f)
 			}
+		}
+		for _, f := range pickIndexVariants(sourceIdx, "Sources") {
 			if err := s.scanSourcesRefs(ctx, f, ref); err != nil {
-				slog.Warn("cleanup: scan Sources file", "path", f, "err", err)
+				return nil, fmt.Errorf("scan %s: %w", f, err)
 			}
 		}
 	}
@@ -588,16 +643,15 @@ func (s *Syncer) buildSrcRefSet(ctx context.Context) (map[string]bool, error) {
 	return ref, nil
 }
 
-// isUncompressedSources reports whether relPath is a plain (non-compressed)
-// Sources index file from a dists/.../source/ tree.
-func isUncompressedSources(relPath string) bool {
-	return strings.HasSuffix(relPath, "/source/Sources")
-}
-
 // scanSourcesRefs opens a Sources index file and records every file path
 // (Directory: + filename from Files:/Checksums sections) into ref.
 func (s *Syncer) scanSourcesRefs(ctx context.Context, relPath string, ref map[string]bool) error {
-	rc, err := s.store.OpenPublished(ctx, relPath)
+	raw, err := s.store.OpenPublished(ctx, relPath)
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	rc, err := apt.OpenCompressed(relPath, raw)
 	if err != nil {
 		return err
 	}

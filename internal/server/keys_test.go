@@ -35,6 +35,11 @@ func (f *failingStore) OpenPublished(ctx context.Context, rel string) (
 	return nil, fmt.Errorf("storage is down")
 }
 
+func (f *failingStore) Exists(ctx context.Context, p string) (bool, error) {
+	f.reads++
+	return false, fmt.Errorf("storage is down")
+}
+
 // testKey reuses the package's existing signing-key helper (see
 // rebuildlive_internal_test.go) rather than adding a second one.
 func testKey(t *testing.T) *signing.Key {
@@ -223,6 +228,11 @@ func (c *cancelStore) Open(ctx context.Context, p string) (
 	io.ReadCloser, error) {
 	c.calls++
 	return nil, fmt.Errorf("s3 open %q: %w", p, context.Canceled)
+}
+
+func (c *cancelStore) Exists(ctx context.Context, p string) (bool, error) {
+	c.calls++
+	return false, fmt.Errorf("s3 head %q: %w", p, context.Canceled)
 }
 
 // TestServePublishedDoesNotErrorOnClientCancel covers the call site,

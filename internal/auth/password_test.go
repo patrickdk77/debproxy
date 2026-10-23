@@ -120,3 +120,23 @@ func TestGehirnCryptDispatchesBothVariants(t *testing.T) {
 		}
 	}
 }
+
+// htpasswdBcrypt is the literal output of `htpasswd -nbB alice secretA`
+// from Apache 2.4: the $2y$ minor version, which is what the documented
+// operator tool emits. Go's bcrypt accepts any minor version byte.
+const htpasswdBcrypt = "$2y$05$6nHeY28uXqswUWYwl43R3uhSQn.yVOhquWFxwgQ9VUpUMsq3Gzm1."
+
+func TestVerifyPassword_BcryptHtpasswd2y(t *testing.T) {
+	if !verifyPassword("secretA", htpasswdBcrypt) {
+		t.Fatal("hash produced by htpasswd -B does not verify")
+	}
+	if verifyPassword("wrong", htpasswdBcrypt) {
+		t.Fatal("wrong password verified against a $2y$ hash")
+	}
+}
+
+func TestRecognizedHashPrefix_Bcrypt2y(t *testing.T) {
+	if !recognizedHashPrefix(htpasswdBcrypt) {
+		t.Fatal("$2y$ hash from htpasswd -B rejected at load time")
+	}
+}

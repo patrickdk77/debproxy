@@ -105,7 +105,9 @@ request instead.
 
 `SyncPoolRoutes` reconciles the bucket's website routing rules after
 every snapshot and every cleanup, mapping `{snapshot-id}/{os}/pool/`
-back to `pool/`. It writes the whole set rather than diffing one rule
+back to `pool/`. With `storage.s3.prefix` set, both sides carry the
+prefix, and the reconciler only treats rules under its own prefix as
+its to manage, so two deployments can share a bucket. It writes the whole set rather than diffing one rule
 at a time, so a pruned snapshot loses its rule with no separate delete
 step and a hand-edited configuration heals on the next run. It leaves
 rules that rewrite to anything other than `pool/` alone.

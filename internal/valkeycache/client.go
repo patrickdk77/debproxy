@@ -7,8 +7,10 @@ package valkeycache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/valkey-io/valkey-go"
 )
@@ -23,7 +25,9 @@ import (
 func NewClient(rawURL string) (valkey.Client, error) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse raw URL string: %w", err)
+		// url.Error carries the full input, credentials included, so it
+		// must not be wrapped into something that gets logged.
+		return nil, fmt.Errorf("failed to parse valkey url (%s): %w", redactURL(rawURL), unwrapURLErr(err))
 	}
 	queryParams := parsedURL.Query()
 	sentinelUser := queryParams.Get("sentinel_username")
@@ -35,7 +39,7 @@ func NewClient(rawURL string) (valkey.Client, error) {
 	parsedURL.RawQuery = queryParams.Encode()
 	opt, err := valkey.ParseURL(parsedURL.String())
 	if err != nil {
-		return nil, fmt.Errorf("parse valkey url: %w", err)
+		return nil, fmt.Errorf("parse valkey url (%s): %w", redactURL(rawURL), unwrapURLErr(err))
 	}
 	if sentinelUser != "" {
 		opt.Sentinel.Username = sentinelUser
@@ -53,4 +57,34 @@ func NewClient(rawURL string) (valkey.Client, error) {
 		return nil, fmt.Errorf("connect to valkey: %w", err)
 	}
 	return client, nil
+}
+
+// redactURL returns rawURL with any userinfo password replaced, for use in
+// errors and logs. It works on the string rather than a parsed URL because
+// the common reason to need it is that parsing failed.
+func redactURL(rawURL string) string {
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd < 0 {
+		return rawURL
+	}
+	rest := rawURL[schemeEnd+3:]
+	at := strings.LastIndex(rest, "@")
+	if at < 0 {
+		return rawURL
+	}
+	userinfo := rest[:at]
+	if colon := strings.Index(userinfo, ":"); colon >= 0 {
+		userinfo = userinfo[:colon] + ":xxxxx"
+	}
+	return rawURL[:schemeEnd+3] + userinfo + rest[at:]
+}
+
+// unwrapURLErr strips the *url.Error wrapper, whose Error() prints the
+// whole URL, leaving only the underlying reason.
+func unwrapURLErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }

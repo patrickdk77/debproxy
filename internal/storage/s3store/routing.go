@@ -72,8 +72,8 @@ func (s *Store) SyncPoolRoutes(ctx context.Context, bases []string) error {
 		return nil
 	}
 
-	foreign, mine := partitionRules(current.RoutingRules)
-	desired, dropped := desiredRules(bases, len(foreign))
+	foreign, mine := partitionRules(current.RoutingRules, s.prefix)
+	desired, dropped := desiredRules(bases, len(foreign), s.prefix)
 	if dropped > 0 {
 		slog.Warn("s3 routing rule limit reached; some published "+
 			"bases will not resolve pool files directly from the "+
@@ -133,11 +133,11 @@ func isNoSuchWebsiteConfiguration(err error) bool {
 
 // partitionRules splits existing rules into those the reconciler does
 // not own (returned first, always preserved) and those it does.
-func partitionRules(rules []types.RoutingRule) (
+func partitionRules(rules []types.RoutingRule, prefix string) (
 	foreign, mine []types.RoutingRule) {
 
 	for _, r := range rules {
-		if isManagedRule(r) {
+		if isManagedRule(r, prefix) {
 			mine = append(mine, r)
 			continue
 		}
@@ -150,18 +150,37 @@ func partitionRules(rules []types.RoutingRule) (
 // created: a pool-prefix rewrite pointing at the shared pool. Rules are
 // unnamed in the S3 API, so this shape is the only ownership marker
 // available -- which is also why it is deliberately narrow.
-func isManagedRule(r types.RoutingRule) bool {
+func isManagedRule(r types.RoutingRule, prefix string) bool {
 	if r.Condition == nil || r.Condition.KeyPrefixEquals == nil {
 		return false
 	}
 	if r.Redirect == nil || r.Redirect.ReplaceKeyPrefixWith == nil {
 		return false
 	}
-	if aws.ToString(r.Redirect.ReplaceKeyPrefixWith) != poolPrefix {
+	// Ownership is scoped to this store's own key prefix. Two debproxy
+	// deployments sharing a bucket under different prefixes must not see
+	// each other's rules as theirs and reconcile them away.
+	if aws.ToString(r.Redirect.ReplaceKeyPrefixWith) != poolTarget(prefix) {
 		return false
 	}
 	key := aws.ToString(r.Condition.KeyPrefixEquals)
-	return strings.HasSuffix(key, "/"+poolPrefix)
+	return strings.HasPrefix(key, keyPrefix(prefix)) &&
+		strings.HasSuffix(key, "/"+poolPrefix)
+}
+
+// keyPrefix is the bucket-key prefix every object of this store sits
+// under: "" for a store at the bucket root, "prefix/" otherwise.
+func keyPrefix(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	return strings.Trim(prefix, "/") + "/"
+}
+
+// poolTarget is the key prefix the shared pool lives at, including the
+// store's own prefix, which is what every managed rule rewrites to.
+func poolTarget(prefix string) string {
+	return keyPrefix(prefix) + poolPrefix
 }
 
 // desiredRules builds the managed rule set for bases, trimmed to fit
@@ -173,7 +192,7 @@ func isManagedRule(r types.RoutingRule) bool {
 // less than the current suite losing it. Remaining bases are kept in
 // reverse lexical order, which for date-stamped snapshot IDs keeps the
 // newest.
-func desiredRules(bases []string, foreignCount int) (
+func desiredRules(bases []string, foreignCount int, prefix string) (
 	[]types.RoutingRule, int) {
 
 	ordered := orderBases(bases)
@@ -190,13 +209,17 @@ func desiredRules(bases []string, foreignCount int) (
 
 	rules := make([]types.RoutingRule, 0, len(ordered))
 	for _, base := range ordered {
-		prefix := strings.Trim(base, "/") + "/" + poolPrefix
+		// Both sides carry the store prefix: objects live at
+		// "<prefix>/<base>/pool/..." and the shared pool at
+		// "<prefix>/pool/...", so a rule built from the bare base never
+		// matched a real key when a prefix was configured.
+		cond := keyPrefix(prefix) + strings.Trim(base, "/") + "/" + poolPrefix
 		rules = append(rules, types.RoutingRule{
 			Condition: &types.Condition{
-				KeyPrefixEquals: aws.String(prefix),
+				KeyPrefixEquals: aws.String(cond),
 			},
 			Redirect: &types.Redirect{
-				ReplaceKeyPrefixWith: aws.String(poolPrefix),
+				ReplaceKeyPrefixWith: aws.String(poolTarget(prefix)),
 			},
 		})
 	}

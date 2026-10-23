@@ -7,7 +7,7 @@ package config
 // header names.
 type AuthConfig struct {
 	// Basic maps username -> password hash. Supported hash formats are
-	// auto-detected from their prefix: $2a$/$2b$/$2$ (bcrypt), $argon2id$
+	// auto-detected from their prefix: $2a$/$2b$/$2y$/$2$ (bcrypt), $argon2id$
 	// (argon2id), $6$ (sha512crypt), $5$ (sha256crypt). Generate hashes with
 	// an operator tool (e.g. htpasswd -B, mkpasswd) -- this config never
 	// stores or accepts a plaintext password.

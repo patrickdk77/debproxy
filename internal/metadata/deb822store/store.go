@@ -622,16 +622,23 @@ func (s *Store) mergeFromDisk(ctx context.Context, relPath string) error {
 }
 
 // mergeIndexEntries returns the union of disk and memory entries.
-// For the same (Package, Version), the memory entry wins.
+// For the same (Package, Version, Upstream), the memory entry wins.
+//
+// Upstream is part of the key because it is part of an entry's identity
+// everywhere else in this store (UpsertEntry, RemoveEntry), and because
+// two upstreams routinely carry the same package at the same version at
+// once. Keying on (Package, Version) alone collapsed such a pair into two
+// copies of whichever upstream the map happened to visit last, and the
+// other upstream's pool file was then orphaned and collected.
 func mergeIndexEntries(disk, memory []model.IndexEntry) []model.IndexEntry {
-	type pk struct{ pkg, ver string }
+	type pk struct{ pkg, ver, up string }
 	mem := make(map[pk]model.IndexEntry, len(memory))
 	for _, e := range memory {
-		mem[pk{e.Package, e.Version}] = e
+		mem[pk{e.Package, e.Version, e.Upstream}] = e
 	}
 	out := make([]model.IndexEntry, 0, len(disk)+len(memory))
 	for _, e := range disk {
-		k := pk{e.Package, e.Version}
+		k := pk{e.Package, e.Version, e.Upstream}
 		if m, ok := mem[k]; ok {
 			out = append(out, m)
 			delete(mem, k)
@@ -1080,15 +1087,17 @@ func sourceEntryFromParagraph(osName, codename, component string, p *apt.Paragra
 	}
 }
 
+// mergeSourceEntries is mergeIndexEntries for source entries; see that
+// function for why Upstream is part of the key.
 func mergeSourceEntries(disk, memory []model.SourceEntry) []model.SourceEntry {
-	type pk struct{ pkg, ver string }
+	type pk struct{ pkg, ver, up string }
 	mem := make(map[pk]model.SourceEntry, len(memory))
 	for _, e := range memory {
-		mem[pk{e.Package, e.Version}] = e
+		mem[pk{e.Package, e.Version, e.Upstream}] = e
 	}
 	out := make([]model.SourceEntry, 0, len(disk)+len(memory))
 	for _, e := range disk {
-		k := pk{e.Package, e.Version}
+		k := pk{e.Package, e.Version, e.Upstream}
 		if m, ok := mem[k]; ok {
 			out = append(out, m)
 			delete(mem, k)

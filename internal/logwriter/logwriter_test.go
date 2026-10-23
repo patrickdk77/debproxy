@@ -207,3 +207,23 @@ func TestNewClampsNonPositiveQueue(t *testing.T) {
 		_ = lw.Close()
 	}
 }
+
+// TestCloseFlushesMoreThanOneBatch is the regression test for Close
+// draining a single batch: with far more than batchBytes queued, every
+// record must reach the sink and none may be counted as dropped.
+func TestCloseFlushesMoreThanOneBatch(t *testing.T) {
+	var out syncBuf
+	lw := New(&out, 100000)
+	rec := strings.Repeat("x", 1000) + "\n"
+	const n = 300 // 300KB, several times batchBytes
+	for i := 0; i < n; i++ {
+		_, _ = lw.Write([]byte(rec))
+	}
+	if lw.Dropped() != 0 {
+		t.Fatalf("records dropped before Close: %d", lw.Dropped())
+	}
+	_ = lw.Close()
+	if got := strings.Count(out.String(), "\n"); got != n {
+		t.Fatalf("Close wrote %d of %d records", got, n)
+	}
+}

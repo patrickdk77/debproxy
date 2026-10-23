@@ -31,11 +31,12 @@ type FileWriter interface {
 }
 
 // warnIfKeyReadable logs when the private key file is readable by anyone
-// other than its owner. A container Secret mount normally arrives as
-// 0400 or 0440, so a looser mode means the file was placed by hand or the
-// mount was misconfigured, and the key is exposed to every other process
-// sharing the filesystem. Loading still proceeds: refusing would turn a
-// permissions slip into an outage, and the warning is what gets it fixed.
+// other than its owner. Kubernetes projects a Secret at 0644 unless the
+// volume sets defaultMode, so this fires on an unmodified mount; the
+// deployment manifests set 0400 for the signing volume, and a warning
+// here means that setting was dropped or the file was placed by hand.
+// Loading still proceeds: refusing would turn a permissions slip into an
+// outage, and the warning is what gets it fixed.
 func warnIfKeyReadable(path string) {
 	info, err := os.Stat(path)
 	if err != nil {

@@ -22,9 +22,9 @@ type Checksums struct {
 
 // UpstreamSource is a fully resolved upstream for a specific layout context.
 type UpstreamSource struct {
-	Name    string
-	URL     string
-	Suite   string
+	Name  string
+	URL   string
+	Suite string
 	// Component lists the upstream's own real component division(s) to fetch
 	// from, e.g. ["main"] or ["main", "contrib"] -- matching apt's own
 	// Components: field, which has always accepted more than one. Each is
@@ -178,12 +178,20 @@ func SourceFilePath(osName, codename, upstreamName, component, name, filename st
 	return SourceDir(osName, codename, upstreamName, component, name) + "/" + filename
 }
 
-// PoolPath builds the storage path for a package under pool/{os}/{codename}/{upstream}/...
-func PoolPath(os, codename, upstream, section, name, version, arch string) string {
+// PoolSection is the section segment of a pool path. Upstreams may publish
+// a blank Section (the GitHub CLI repository does), and a blank segment
+// cannot be addressed, so it becomes "misc".
+func PoolSection(section string) string {
 	section = strings.TrimSpace(section)
 	if section == "" {
-		section = "misc"
+		return "misc"
 	}
+	return section
+}
+
+// PoolPath builds the storage path for a package under pool/{os}/{codename}/{upstream}/...
+func PoolPath(os, codename, upstream, section, name, version, arch string) string {
+	section = PoolSection(section)
 	first := "_"
 	if name != "" {
 		first = strings.ToLower(name[:1])

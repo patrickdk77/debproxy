@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"path"
 	"runtime/debug"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -580,6 +582,9 @@ func (b *serverValkeyBacking) fetchLiveFilesFrom(ctx context.Context, addr, osNa
 		if err != nil {
 			return nil, fmt.Errorf("fetching %s from %s: %w", key, addr, err)
 		}
+		if err := verifyByHash(data, hash); err != nil {
+			return nil, fmt.Errorf("fetching %s from %s: %w", key, addr, err)
+		}
 		files[key] = data
 		if onFile != nil {
 			// An independent copy: the callback publishes this map where
@@ -663,6 +668,10 @@ func (s *Server) resolveByHashWithPeer(ctx context.Context, osName, codename str
 			lastErr = err
 			continue
 		}
+		if err := verifyByHash(data, hash); err != nil {
+			lastErr = err
+			continue
+		}
 		slog.Debug("live by-hash served from peer after local miss",
 			"os", osName, "codename", codename, "key", key)
 		return data, notice.BuiltAt, true
@@ -734,4 +743,18 @@ func (s *Server) publishLiveUpdate(osName, codename string, entry *liveEntry) {
 	if err := valkeycache.Publish(context.Background(), b.client, valkeycache.ChannelLiveUpdated, string(data)); err != nil {
 		slog.Warn("valkey: publish live update failed", "os", osName, "codename", codename, "err", err)
 	}
+}
+
+// verifyByHash checks that data is the content hash names. The address a
+// peer fetch goes to comes from a pub/sub notice, and pod addresses get
+// reused; whatever answers 200 there is otherwise staged under the
+// generation's Packages key and served to apt. The URL names the sha256,
+// so the bytes are checked against it before they are kept.
+func verifyByHash(data []byte, hash string) error {
+	sum := sha256.Sum256(data)
+	got := hex.EncodeToString(sum[:])
+	if !strings.EqualFold(got, hash) {
+		return fmt.Errorf("by-hash content mismatch: got %s want %s", got, hash)
+	}
+	return nil
 }

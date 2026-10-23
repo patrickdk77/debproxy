@@ -268,7 +268,7 @@ func TestIsManagedRuleOnlyMatchesOurShape(t *testing.T) {
 		}, false},
 	}
 	for _, tc := range cases {
-		if got := isManagedRule(tc.rule); got != tc.want {
+		if got := isManagedRule(tc.rule, ""); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
 	}
@@ -291,5 +291,79 @@ func TestOrderBasesDedupesAndPrioritizesCurrent(t *testing.T) {
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+// TestSyncPoolRoutesHonorsBucketPrefix is the regression test for rules
+// built from bare bases: with storage.s3.prefix set, objects live under
+// the prefix on both sides of the rewrite, so a rule without it never
+// matched a real key.
+func TestSyncPoolRoutesHonorsBucketPrefix(t *testing.T) {
+	rf := newRoutingFake(&s3.GetBucketWebsiteOutput{}, nil)
+	st := rf.store()
+	st.prefix = "deb"
+
+	err := st.SyncPoolRoutes(context.Background(), []string{"current/debian"})
+	if err != nil {
+		t.Fatalf("SyncPoolRoutes: %v", err)
+	}
+	if len(rf.written) != 1 {
+		t.Fatalf("wrote %d configs, want 1", len(rf.written))
+	}
+	rule := rf.written[0].WebsiteConfiguration.RoutingRules[0]
+	if got := aws.ToString(rule.Condition.KeyPrefixEquals); got != "deb/current/debian/pool/" {
+		t.Errorf("condition %q, want deb/current/debian/pool/", got)
+	}
+	if got := aws.ToString(rule.Redirect.ReplaceKeyPrefixWith); got != "deb/pool/" {
+		t.Errorf("replacement %q, want deb/pool/", got)
+	}
+}
+
+// TestIsManagedRuleScopedToOwnPrefix: two deployments sharing a bucket
+// under different prefixes must not claim each other's rules.
+func TestIsManagedRuleScopedToOwnPrefix(t *testing.T) {
+	ours := types.RoutingRule{
+		Condition: &types.Condition{KeyPrefixEquals: aws.String("deb/current/debian/pool/")},
+		Redirect:  &types.Redirect{ReplaceKeyPrefixWith: aws.String("deb/pool/")},
+	}
+	theirs := types.RoutingRule{
+		Condition: &types.Condition{KeyPrefixEquals: aws.String("other/current/debian/pool/")},
+		Redirect:  &types.Redirect{ReplaceKeyPrefixWith: aws.String("other/pool/")},
+	}
+	root := managedRule("current/debian/pool/")
+
+	if !isManagedRule(ours, "deb") {
+		t.Error("own prefixed rule not recognized")
+	}
+	if isManagedRule(theirs, "deb") {
+		t.Error("another prefix's rule claimed as ours")
+	}
+	if isManagedRule(root, "deb") {
+		t.Error("a root-level rule claimed by a prefixed store")
+	}
+	if isManagedRule(ours, "") {
+		t.Error("a prefixed rule claimed by a root store")
+	}
+}
+
+// TestSyncPoolRoutesPreservesOtherPrefixRules proves the scoping holds
+// through a full reconcile: the other deployment's rule survives.
+func TestSyncPoolRoutesPreservesOtherPrefixRules(t *testing.T) {
+	theirs := types.RoutingRule{
+		Condition: &types.Condition{KeyPrefixEquals: aws.String("other/current/debian/pool/")},
+		Redirect:  &types.Redirect{ReplaceKeyPrefixWith: aws.String("other/pool/")},
+	}
+	rf := newRoutingFake(&s3.GetBucketWebsiteOutput{RoutingRules: []types.RoutingRule{theirs}}, nil)
+	st := rf.store()
+	st.prefix = "deb"
+	if err := st.SyncPoolRoutes(context.Background(), []string{"current/debian"}); err != nil {
+		t.Fatalf("SyncPoolRoutes: %v", err)
+	}
+	got := strings.Join(prefixes(rf.written[0]), ",")
+	if !strings.Contains(got, "other/current/debian/pool/") {
+		t.Errorf("other deployment's rule was dropped: %v", got)
+	}
+	if !strings.Contains(got, "deb/current/debian/pool/") {
+		t.Errorf("own rule missing: %v", got)
 	}
 }
