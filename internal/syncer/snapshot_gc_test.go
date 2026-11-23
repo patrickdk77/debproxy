@@ -105,7 +105,7 @@ func TestSnapshotThenCleanupKeepsPackagesTheSnapshotReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second)
 	if err := s.Snapshot(ctx, now); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}

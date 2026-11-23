@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/avail"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/storage"
@@ -62,7 +63,7 @@ func sha256hex(data []byte) string {
 func TestDigestVerifyingReaderCorrectDigestPassesThrough(t *testing.T) {
 	content := []byte("the quick brown fox jumps over the lazy dog")
 	var client bytes.Buffer
-	dvr := newDigestVerifyingReader(bytes.NewReader(content), &client, sha256hex(content))
+	dvr := newDigestVerifyingReader(bytes.NewReader(content), &client, apt.Hashes{SHA256: sha256hex(content)})
 
 	got, err := io.ReadAll(dvr)
 	if err != nil {
@@ -84,7 +85,7 @@ func TestDigestVerifyingReaderCorrectDigestPassesThrough(t *testing.T) {
 // returned, not silently pass through.
 func TestDigestVerifyingReaderMismatchReturnsErrorInsteadOfEOF(t *testing.T) {
 	content := []byte("actual upstream content")
-	dvr := newDigestVerifyingReader(bytes.NewReader(content), nil, sha256hex([]byte("something else entirely")))
+	dvr := newDigestVerifyingReader(bytes.NewReader(content), nil, apt.Hashes{SHA256: sha256hex([]byte("something else entirely"))})
 
 	_, err := io.ReadAll(dvr)
 	if err == nil {
@@ -101,7 +102,7 @@ func TestDigestVerifyingReaderMismatchReturnsErrorInsteadOfEOF(t *testing.T) {
 // for the download that populates the cache for everyone else.
 func TestDigestVerifyingReaderClientWriteFailureIsBestEffort(t *testing.T) {
 	content := []byte("content that must still be fully read and hashed")
-	dvr := newDigestVerifyingReader(bytes.NewReader(content), alwaysFailWriter{}, sha256hex(content))
+	dvr := newDigestVerifyingReader(bytes.NewReader(content), alwaysFailWriter{}, apt.Hashes{SHA256: sha256hex(content)})
 
 	got, err := io.ReadAll(dvr)
 	if err != nil {

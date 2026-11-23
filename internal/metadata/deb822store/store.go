@@ -1043,7 +1043,8 @@ func sourceEntryToParagraph(e model.SourceEntry) *apt.Paragraph {
 	p.Set("X-Debproxy-Stanza", e.Stanza)
 	for i, f := range e.Files {
 		p.Set(fmt.Sprintf("X-Debproxy-File-%d", i),
-			fmt.Sprintf("%s %d %s", f.Filename, f.Size, string(f.SHA256)))
+			fmt.Sprintf("%s %d %s %s %s %s", f.Filename, f.Size,
+				digestOrDash(f.SHA256), digestOrDash(f.SHA512), digestOrDash(f.SHA1), digestOrDash(f.MD5)))
 	}
 	return p
 }
@@ -1060,15 +1061,19 @@ func sourceEntryFromParagraph(osName, codename, component string, p *apt.Paragra
 			break
 		}
 		parts := strings.Fields(v)
-		if len(parts) != 3 {
+		if len(parts) != 3 && len(parts) != 6 {
 			break
 		}
 		size, _ := strconv.ParseInt(parts[1], 10, 64)
-		files = append(files, model.SourceFile{
+		f := model.SourceFile{
 			Filename: parts[0],
 			Size:     size,
-			SHA256:   model.Digest(parts[2]),
-		})
+			SHA256:   dashToDigest(parts[2]),
+		}
+		if len(parts) == 6 {
+			f.SHA512, f.SHA1, f.MD5 = dashToDigest(parts[3]), dashToDigest(parts[4]), dashToDigest(parts[5])
+		}
+		files = append(files, f)
 	}
 
 	return model.SourceEntry{
@@ -1154,4 +1159,20 @@ func IndexRelPath(osName, codename, component, arch string) string {
 // file. Exported for the same reason as SourceRelPath.
 func StateRelPath(upstream string) string {
 	return upstreamPrefix + upstream + ".state.zst"
+}
+
+// A source file line holds one field per digest; "-" stands for a digest
+// the upstream did not publish, so the line stays splittable on spaces.
+func digestOrDash(d model.Digest) string {
+	if d == "" {
+		return "-"
+	}
+	return string(d)
+}
+
+func dashToDigest(s string) model.Digest {
+	if s == "-" {
+		return ""
+	}
+	return model.Digest(s)
 }

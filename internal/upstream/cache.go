@@ -55,7 +55,7 @@ type indexCacheEntry struct {
 	lastMod string
 	expires time.Time
 
-	// Parsed content (already GPG-verified and SHA256-verified)
+	// Parsed content (already GPG-verified and digest-verified)
 	release  *apt.Release
 	archPkgs map[string][]apt.RawPkg // arch -> verified+parsed Packages stanzas
 

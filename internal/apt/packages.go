@@ -19,6 +19,8 @@ type RawPkg struct {
 	Section    string
 	Filename   string // original upstream-relative path
 	Size       int64
+	MD5        string
+	SHA1       string
 	SHA256     string
 	SHA512     string
 	Depends    string
@@ -117,6 +119,10 @@ func ParsePackageRaws(r io.Reader) ([]RawPkg, error) {
 			cur.Filename = val
 		case "size":
 			cur.Size = rawParseInt64(val)
+		case "md5sum":
+			cur.MD5 = val
+		case "sha1":
+			cur.SHA1 = val
 		case "sha256":
 			cur.SHA256 = val
 		case "sha512":
@@ -254,4 +260,8 @@ func ParseStanza(s string) (*Paragraph, error) {
 		return nil, fmt.Errorf("empty stanza")
 	}
 	return paras[0], nil
+}
+
+func (p RawPkg) Hashes() Hashes {
+	return Hashes{MD5: p.MD5, SHA1: p.SHA1, SHA256: p.SHA256, SHA512: p.SHA512}
 }

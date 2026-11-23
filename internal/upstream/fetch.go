@@ -96,15 +96,25 @@ func acquireByHash(rel *apt.Release) bool {
 	return strings.EqualFold(rel.Get("Acquire-By-Hash"), "yes")
 }
 
-// indexURL returns the URL to use for fetching an index file.
-// When byHash is true and sha256 is non-empty it returns the by-hash path
-// ({dir}/by-hash/SHA256/{sha256}), otherwise the conventional dists path.
-func (f *Fetcher) indexURL(relPath, sha256 string, byHash bool) string {
-	if byHash && sha256 != "" {
+// indexURL returns the URL to use for fetching an index file. When byHash
+// is true and the Release lists a digest for it, that is the by-hash path
+// under the strongest listed algorithm ({dir}/by-hash/{algo}/{digest});
+// otherwise the conventional dists path.
+func (f *Fetcher) indexURL(relPath string, h apt.Hashes, byHash bool) string {
+	algo, digest := h.Best()
+	if byHash && digest != "" {
 		dir := relPath[:strings.LastIndexByte(relPath, '/')+1]
-		return f.distsURL(dir + "by-hash/SHA256/" + sha256)
+		return f.distsURL(dir + "by-hash/" + string(algo) + "/" + digest)
 	}
 	return f.distsURL(relPath)
+}
+
+// sameDigest reports whether two Release entries name the same content by
+// their strongest digest.
+func sameDigest(a, b apt.FileEntry) bool {
+	aa, ad := a.Hashes().Best()
+	ba, bd := b.Hashes().Best()
+	return ad != "" && aa == ba && strings.EqualFold(ad, bd)
 }
 
 // releaseServedArchs returns the union, across every component in
@@ -758,7 +768,7 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 			relPath := base + v.ext
 			newEntry, inNew := rel.Files[relPath]
 			oldEntry, inOld := cached.release.Files[relPath]
-			if inNew && inOld && newEntry.SHA256 == oldEntry.SHA256 {
+			if inNew && inOld && sameDigest(newEntry, oldEntry) {
 				if paras, ok := cached.archPkgs[arch]; ok {
 					return paras, nil
 				}
@@ -781,7 +791,7 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 		if !ok {
 			continue
 		}
-		data, resp, err := f.getConditional(ctx, f.indexURL(relPath, entry.SHA256, byHash), "", "")
+		data, resp, err := f.getConditional(ctx, f.indexURL(relPath, entry.Hashes(), byHash), "", "")
 		if err != nil {
 			return nil, err
 		}
@@ -800,7 +810,7 @@ func (f *Fetcher) fetchPackagesMaybeReuse(ctx context.Context, rel *apt.Release,
 			slog.Warn("Packages variant bad status, trying next", "url", f.distsURL(relPath), "status", resp.StatusCode, "arch", arch)
 			continue
 		}
-		if err := verifyDigest(data, entry.SHA256); err != nil {
+		if err := entry.Hashes().Verify(data); err != nil {
 			slog.Warn("Packages variant hash mismatch, trying next", "url", f.distsURL(relPath), "err", err, "arch", arch)
 			continue
 		}
@@ -832,7 +842,7 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return nil, false
 	}
-	if err := verifyDigest(data, relEntry.SHA256); err != nil {
+	if err := relEntry.Hashes().Verify(data); err != nil {
 		slog.Warn("pdiff: index digest mismatch", "upstream", f.src.Name, "arch", arch, "err", err)
 		return nil, false
 	}
@@ -866,7 +876,7 @@ func (f *Fetcher) tryPDiff(ctx context.Context, rel *apt.Release, base, arch, ca
 			slog.Warn("pdiff: patch not listed in Release", "upstream", f.src.Name, "name", name)
 			return nil, false
 		}
-		if err := verifyDigest(pdata, entry.SHA256); err != nil {
+		if err := entry.Hashes().Verify(pdata); err != nil {
 			slog.Warn("pdiff: patch digest mismatch", "name", name, "err", err)
 			return nil, false
 		}
@@ -931,7 +941,7 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return nil, false
 	}
-	if err := verifyDigest(data, relEntry.SHA256); err != nil {
+	if err := relEntry.Hashes().Verify(data); err != nil {
 		slog.Warn("pdiff: sources index digest mismatch", "upstream", f.src.Name, "component", f.componentKey(), "err", err)
 		return nil, false
 	}
@@ -965,7 +975,7 @@ func (f *Fetcher) tryPDiffSrc(ctx context.Context, rel *apt.Release, base, cache
 			slog.Warn("pdiff: sources patch not listed in Release", "upstream", f.src.Name, "component", f.componentKey(), "name", name)
 			return nil, false
 		}
-		if err := verifyDigest(pdata, entry.SHA256); err != nil {
+		if err := entry.Hashes().Verify(pdata); err != nil {
 			slog.Warn("pdiff: sources patch digest mismatch", "upstream", f.src.Name, "component", f.componentKey(), "name", name, "err", err)
 			return nil, false
 		}
@@ -1120,7 +1130,7 @@ func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 			relPath := base + v.ext
 			newEntry, inNew := rel.Files[relPath]
 			oldEntry, inOld := cachedEntry.srcsRelease.Files[relPath]
-			if inNew && inOld && newEntry.SHA256 == oldEntry.SHA256 {
+			if inNew && inOld && sameDigest(newEntry, oldEntry) {
 				return cachedEntry.srcs, nil
 			}
 		}
@@ -1199,7 +1209,7 @@ func (f *Fetcher) fetchSourcesFile(ctx context.Context, rel *apt.Release, base s
 		if !ok {
 			continue
 		}
-		data, resp, err := f.getConditional(ctx, f.indexURL(relPath, entry.SHA256, byHash), "", "")
+		data, resp, err := f.getConditional(ctx, f.indexURL(relPath, entry.Hashes(), byHash), "", "")
 		if err != nil {
 			return nil, err
 		}
@@ -1217,7 +1227,7 @@ func (f *Fetcher) fetchSourcesFile(ctx context.Context, rel *apt.Release, base s
 			slog.Warn("Sources variant bad status, trying next", "url", f.distsURL(relPath), "status", resp.StatusCode)
 			continue
 		}
-		if err := verifyDigest(data, entry.SHA256); err != nil {
+		if err := entry.Hashes().Verify(data); err != nil {
 			slog.Warn("Sources variant hash mismatch, trying next", "url", f.distsURL(relPath), "err", err)
 			continue
 		}
@@ -1374,10 +1384,11 @@ func (f *Fetcher) getConditional(ctx context.Context, url, etag, lastMod string)
 // before decompression (which boundedReader bounds separately).
 const maxRawIndexBytes = 256 << 20
 
-// ErrDigestMismatch is returned when a fetched file's SHA256 does not match
-// the value declared in the Release file. It typically indicates the mirror is
-// mid-sync and the Packages file has not yet been pushed after InRelease.
-var ErrDigestMismatch = errors.New("sha256 mismatch")
+// ErrDigestMismatch is returned when a fetched file's digest does not match
+// the strongest value the Release file lists for it. It typically indicates
+// the mirror is mid-sync and the Packages file has not yet been pushed after
+// InRelease.
+var ErrDigestMismatch = apt.ErrDigestMismatch
 
 func verifyDigest(data []byte, expected string) error {
 	sum := sha256.Sum256(data)

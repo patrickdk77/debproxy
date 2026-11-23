@@ -11,8 +11,14 @@ import (
 type FileEntry struct {
 	Path   string
 	Size   int64
+	MD5    string
+	SHA1   string
 	SHA256 string
 	SHA512 string
+}
+
+func (e FileEntry) Hashes() Hashes {
+	return Hashes{MD5: e.MD5, SHA1: e.SHA1, SHA256: e.SHA256, SHA512: e.SHA512}
 }
 
 // Release is a parsed Debian Release file.
@@ -38,6 +44,8 @@ func ParseRelease(r io.Reader) (*Release, error) {
 
 	parseHashSection(rel, p.Get("SHA256"), func(e *FileEntry, hash string) { e.SHA256 = hash })
 	parseHashSection(rel, p.Get("SHA512"), func(e *FileEntry, hash string) { e.SHA512 = hash })
+	parseHashSection(rel, p.Get("SHA1"), func(e *FileEntry, hash string) { e.SHA1 = hash })
+	parseHashSection(rel, p.Get("MD5Sum"), func(e *FileEntry, hash string) { e.MD5 = hash })
 
 	return rel, nil
 }

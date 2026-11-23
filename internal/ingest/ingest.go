@@ -4,8 +4,10 @@ package ingest
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
+	"github.com/debproxy/debproxy/internal/apt"
 	"hash"
 	"io"
 	"log/slog"
@@ -131,7 +133,7 @@ func (in *Ingestor) CacheStreaming(ctx context.Context, osName, codename string,
 // instead of a stream that never starts). body is the already-open,
 // already-200-confirmed upstream response; the caller owns closing it.
 func (in *Ingestor) CacheStreamingBody(ctx context.Context, osName, codename string, p avail.Pkg, body io.Reader, notify bool, w io.Writer) error {
-	dvr := newDigestVerifyingReader(body, w, p.SHA256)
+	dvr := newDigestVerifyingReader(body, w, p.Hashes())
 	if err := in.store.PutFile(ctx, p.PoolPath, dvr, p.Size); err != nil {
 		return err
 	}
@@ -159,7 +161,10 @@ func (in *Ingestor) CacheStreamingBody(ctx context.Context, osName, codename str
 	if in.exists != nil {
 		in.exists.Add(p.PoolPath)
 	}
-	return in.upsertEntry(ctx, osName, codename, p)
+	if dvr.read == 0 {
+		return in.upsertEntry(ctx, osName, codename, p)
+	}
+	return in.upsertEntryWith(ctx, osName, codename, p, dvr.checksums())
 }
 
 // onDownloaded logs and records metrics/webhook for a package that was just
@@ -187,6 +192,18 @@ func (in *Ingestor) onDownloaded(osName, codename string, p avail.Pkg, notify bo
 
 // upsertEntry records p's index entry, shared by Cache and CacheStreaming.
 func (in *Ingestor) upsertEntry(ctx context.Context, osName, codename string, p avail.Pkg) error {
+	cs := model.Checksums{SHA256: model.Digest(p.SHA256), SHA512: model.Digest(p.SHA512)}
+	if cs.SHA256 == "" {
+		computed, err := in.store.ComputeChecksums(ctx, p.PoolPath)
+		if err != nil {
+			return fmt.Errorf("compute checksums for %s: %w", p.PoolPath, err)
+		}
+		cs = computed
+	}
+	return in.upsertEntryWith(ctx, osName, codename, p, cs)
+}
+
+func (in *Ingestor) upsertEntryWith(ctx context.Context, osName, codename string, p avail.Pkg, cs model.Checksums) error {
 	entry := model.IndexEntry{
 		OS:             osName,
 		Codename:       codename,
@@ -197,73 +214,72 @@ func (in *Ingestor) upsertEntry(ctx context.Context, osName, codename string, p 
 		Upstream:       p.Upstream.Name,
 		FromAutoUpdate: p.Upstream.AutoUpdate,
 		PoolPath:       p.PoolPath,
-		Checksums: model.Checksums{
-			SHA256: model.Digest(p.SHA256),
-			SHA512: model.Digest(p.SHA512),
-		},
-		Size:      p.Size,
-		Control:   p.StanzaStr,
-		FirstSeen: metadata.Now(),
+		Checksums:      cs,
+		Size:           p.Size,
+		Control:        p.StanzaStr,
+		FirstSeen:      metadata.Now(),
 	}
 	return in.index.UpsertEntry(ctx, entry)
 }
 
 // digestVerifyingReader wraps an upstream response body, tee-ing bytes to an
-// optional client writer (best-effort: a write failure there -- the client
-// disconnecting mid-stream -- never aborts the read; only the copy into
-// storage matters for the cache to be usefully populated for the next
-// request) while computing a running SHA256. On EOF it substitutes
-// upstream.ErrDigestMismatch for io.EOF if the accumulated hash doesn't match
-// expectedSHA256, so the storage backend's own atomic write (a temp file +
-// rename for the filesystem backend, or an all-or-nothing PUT for S3) never
-// commits a corrupt download to the canonical pool path -- io.Copy (used
-// internally by every Storage.PutFile implementation) treats any non-EOF
-// Read error as fatal and aborts/cleans up rather than finishing the write.
-// flusher matches http.Flusher's shape structurally (without importing
-// net/http just for this): an http.ResponseWriter passed in as client
-// satisfies it automatically. Without flushing after every tee'd write, the
-// bytes just sit in Go's internal per-response buffer until enough
-// accumulates (or the handler returns) to trigger an automatic flush --
-// silently defeating real-time streaming to the client for small-to-medium
-// writes, which is the entire point of tee-ing in the first place.
+// optional client writer while hashing them. At io.EOF the strongest digest
+// the upstream published for the file (apt.Hashes.Best) is compared with
+// what was read, and a mismatch comes back in place of io.EOF so the storage
+// write fails and nothing corrupt is kept. SHA256 and SHA512 are computed
+// alongside whichever algorithm verifies, because they are what debproxy
+// publishes for the file afterwards.
+//
+// Client writes are best-effort: a failed write marks the client as gone and
+// the stream continues to storage, so one disconnected client does not
+// waste the download.
 type flusher interface {
 	Flush()
 }
 
 type digestVerifyingReader struct {
-	src            io.Reader
-	client         io.Writer // may be nil
-	clientFlush    flusher   // may be nil (client doesn't support it, or client is nil)
-	clientOK       bool
-	hash           hash.Hash
-	expectedSHA256 string
-	// read counts bytes pulled from src. Zero after a successful PutFile
-	// means the backend never consumed the stream, which the filesystem
-	// store does when the file already exists; see CacheStreamingBody.
-	read int64
+	src         io.Reader
+	client      io.Writer // may be nil
+	clientFlush flusher   // may be nil (client doesn't support it, or client is nil)
+	clientOK    bool
+	algo        apt.HashAlgo
+	expected    string
+	check       hash.Hash // hasher for algo when it is neither SHA256 nor SHA512
+	h256        hash.Hash
+	h512        hash.Hash
+	read        int64
 }
 
-func newDigestVerifyingReader(src io.Reader, client io.Writer, expectedSHA256 string) *digestVerifyingReader {
+func newDigestVerifyingReader(src io.Reader, client io.Writer, expected apt.Hashes) *digestVerifyingReader {
 	f, _ := client.(flusher)
-	return &digestVerifyingReader{
-		src:            src,
-		client:         client,
-		clientFlush:    f,
-		clientOK:       client != nil,
-		hash:           sha256.New(),
-		expectedSHA256: expectedSHA256,
+	d := &digestVerifyingReader{
+		src:         src,
+		client:      client,
+		clientFlush: f,
+		clientOK:    client != nil,
+		h256:        sha256.New(),
+		h512:        sha512.New(),
 	}
+	d.algo, d.expected = expected.Best()
+	switch d.algo {
+	case apt.HashSHA256, apt.HashSHA512, "":
+	default:
+		d.check = apt.NewHash(d.algo)
+	}
+	return d
 }
 
 func (d *digestVerifyingReader) Read(p []byte) (int, error) {
 	n, err := d.src.Read(p)
 	if n > 0 {
 		d.read += int64(n)
-		d.hash.Write(p[:n]) // hash.Hash.Write never returns an error
+		d.h256.Write(p[:n]) // hash.Hash.Write never returns an error
+		d.h512.Write(p[:n])
+		if d.check != nil {
+			d.check.Write(p[:n])
+		}
 		if d.clientOK {
 			if _, werr := d.client.Write(p[:n]); werr != nil {
-				// Best-effort only: stop trying to write to a broken client
-				// connection, but keep reading/hashing/caching regardless.
 				d.clientOK = false
 			} else if d.clientFlush != nil {
 				d.clientFlush.Flush()
@@ -271,17 +287,35 @@ func (d *digestVerifyingReader) Read(p []byte) (int, error) {
 		}
 	}
 	if err == io.EOF {
-		got := hex.EncodeToString(d.hash.Sum(nil))
-		if !strings.EqualFold(got, d.expectedSHA256) {
-			return n, fmt.Errorf("%w: got %s want %s", upstream.ErrDigestMismatch, got, d.expectedSHA256)
+		if d.expected == "" {
+			return n, apt.ErrNoDigest
+		}
+		got := d.got()
+		if !strings.EqualFold(got, d.expected) {
+			return n, fmt.Errorf("%w: %s got %s want %s", upstream.ErrDigestMismatch, d.algo, got, d.expected)
 		}
 	}
 	return n, err
 }
 
-// CacheSourceFile downloads one source package file from the upstream and
-// stores it under src/. It is idempotent: if the file is already present it
-// returns immediately without verifying the content.
+func (d *digestVerifyingReader) got() string {
+	switch d.algo {
+	case apt.HashSHA256:
+		return hex.EncodeToString(d.h256.Sum(nil))
+	case apt.HashSHA512:
+		return hex.EncodeToString(d.h512.Sum(nil))
+	}
+	return hex.EncodeToString(d.check.Sum(nil))
+}
+
+// checksums is meaningful once the stream has been read to EOF.
+func (d *digestVerifyingReader) checksums() model.Checksums {
+	return model.Checksums{
+		SHA256: model.Digest(hex.EncodeToString(d.h256.Sum(nil))),
+		SHA512: model.Digest(hex.EncodeToString(d.h512.Sum(nil))),
+	}
+}
+
 func (in *Ingestor) CacheSourceFile(ctx context.Context, entry model.SourceEntry, us model.UpstreamSource, filename string) error {
 	var srcFile *model.SourceFile
 	for i := range entry.Files {
@@ -317,7 +351,7 @@ func (in *Ingestor) CacheSourceFile(ctx context.Context, entry model.SourceEntry
 		return err
 	}
 	defer body.Close()
-	dvr := newDigestVerifyingReader(body, nil, string(srcFile.SHA256))
+	dvr := newDigestVerifyingReader(body, nil, srcFile.Hashes())
 	if err := in.store.PutFile(ctx, filePath, dvr, srcFile.Size); err != nil {
 		return err
 	}

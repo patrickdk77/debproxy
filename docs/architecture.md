@@ -203,7 +203,7 @@ internal/
   storagefactory/factory.go   -- New(cfg) switch on storage.backend
   syncer/syncer.go            -- Prime, Update (auto_update refresh), Snapshot (publish + set current)
   upstream/
-    fetch.go                  -- fetch + GPG-verify InRelease/Release, SHA256-verify Packages and .deb
+    fetch.go                  -- fetch + GPG-verify InRelease/Release, verify Packages and .deb by the strongest listed hash
     cache.go                  -- IndexCache: ETag/304 conditional re-fetch, Cache-Control expiry
     transport.go              -- tuned HTTP client, 3 retries on 5xx with idle-connection flush
     valkey.go                 -- optional: shared upstream availability cache, distributed fetch lock

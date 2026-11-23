@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"github.com/debproxy/debproxy/internal/apt"
 	"path"
 	"strings"
 	"time"
@@ -138,7 +139,25 @@ type UpstreamPackageState struct {
 type SourceFile struct {
 	Filename string
 	Size     int64
+	MD5      Digest
+	SHA1     Digest
 	SHA256   Digest
+	SHA512   Digest
+}
+
+func SourceFileFromRaw(f apt.RawSrcFile) SourceFile {
+	return SourceFile{
+		Filename: f.Filename,
+		Size:     f.Size,
+		MD5:      Digest(f.MD5),
+		SHA1:     Digest(f.SHA1),
+		SHA256:   Digest(f.SHA256),
+		SHA512:   Digest(f.SHA512),
+	}
+}
+
+func (f SourceFile) Hashes() apt.Hashes {
+	return apt.Hashes{MD5: string(f.MD5), SHA1: string(f.SHA1), SHA256: string(f.SHA256), SHA512: string(f.SHA512)}
 }
 
 // SourceEntry records one source package's placement within a layout component.

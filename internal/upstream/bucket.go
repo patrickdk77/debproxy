@@ -25,7 +25,7 @@ const upstreamPkgBatchSize = 1000
 // Identity here is deliberately just pkg+version, not also the stanza's
 // content hash: a well-formed Debian archive guarantees identical
 // package+version implies identical content (that's what the Release file's
-// own SHA256 verification already assumes elsewhere in this codebase), so
+// own digest verification already assumes elsewhere in this codebase), so
 // this diff-by-membership approach cannot miss a real content change without
 // upstream itself violating that guarantee.
 func upstreamPkgMember(pkg, version string) string {

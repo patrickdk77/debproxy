@@ -24,6 +24,7 @@ import (
 
 	"github.com/debproxy/debproxy/internal/apt"
 	"github.com/debproxy/debproxy/internal/config"
+	"github.com/debproxy/debproxy/internal/metadata"
 	"github.com/debproxy/debproxy/internal/metadata/deb822store"
 	"github.com/debproxy/debproxy/internal/model"
 	"github.com/debproxy/debproxy/internal/server"
@@ -918,7 +919,7 @@ func setupHelloUpstream(t *testing.T) (deb []byte, upstreamPath string, baseHand
 // newHelloServer writes the config wiring hello's upstream (at upstreamURL)
 // into a single debian/trixie/main layout and returns a ready server plus
 // its storage backend (for direct store.Exists assertions).
-func newHelloServer(t *testing.T, upstreamURL, upstreamPub string) (*server.Server, storage.Storage) {
+func newHelloServerWithIndex(t *testing.T, upstreamURL, upstreamPub string) (*server.Server, storage.Storage, metadata.MetadataIndex) {
 	t.Helper()
 	dir := t.TempDir()
 	repoPriv := filepath.Join(dir, "repo.priv.asc")
@@ -964,7 +965,13 @@ signing:
 	if err != nil {
 		t.Fatal(err)
 	}
-	return server.New(loaded, store, index, repoKey, nil, nil, nil, nil), store
+	return server.New(loaded, store, index, repoKey, nil, nil, nil, nil), store, index
+}
+
+func newHelloServer(t *testing.T, upstreamURL, upstreamPub string) (*server.Server, storage.Storage) {
+	t.Helper()
+	srv, store, _ := newHelloServerWithIndex(t, upstreamURL, upstreamPub)
+	return srv, store
 }
 
 // TestPoolPullThroughFallsBackToUpstreamWhenLiveIndexMisses is the direct

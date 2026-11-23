@@ -201,11 +201,7 @@ func (s *Syncer) runUpdate(ctx context.Context, cache *upstream.IndexCache, only
 			comp := sp.Component
 			files := make([]model.SourceFile, len(sp.Files))
 			for i, f := range sp.Files {
-				files[i] = model.SourceFile{
-					Filename: f.Filename,
-					Size:     f.Size,
-					SHA256:   model.Digest(f.SHA256),
-				}
+				files[i] = model.SourceFileFromRaw(f)
 			}
 			entry := model.SourceEntry{
 				OS:          k.osName,

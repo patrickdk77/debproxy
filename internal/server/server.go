@@ -1337,11 +1337,7 @@ func (s *Server) pullThroughSource(ctx context.Context, osName, srcPath string) 
 				Version:     raw.Version,
 				Upstream:    upstreamName,
 				UpstreamDir: raw.Directory,
-				Files: []model.SourceFile{{
-					Filename: sf.Filename,
-					Size:     sf.Size,
-					SHA256:   model.Digest(sf.SHA256),
-				}},
+				Files:       []model.SourceFile{model.SourceFileFromRaw(sf)},
 			}
 			return s.downloadAndCacheSourceFile(ctx, entry, upstreamName, filename)
 		}

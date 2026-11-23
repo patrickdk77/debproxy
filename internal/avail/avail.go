@@ -29,6 +29,8 @@ type Pkg struct {
 	Section    string
 	Component  string
 	Filename   string // upstream-relative path
+	MD5        string
+	SHA1       string
 	SHA256     string
 	SHA512     string
 	Size       int64
@@ -623,6 +625,8 @@ func buildPkg(osName, codename, component, arch string, src model.UpstreamSource
 		Section:    st.Section,
 		Component:  component,
 		Filename:   st.Filename,
+		MD5:        st.MD5,
+		SHA1:       st.SHA1,
 		SHA256:     st.SHA256,
 		SHA512:     st.SHA512,
 		Size:       st.Size,
@@ -707,4 +711,8 @@ func poolPathFromFilename(os, codename, upstreamName, section, pkgName, upstream
 		first = strings.ToLower(pkgName[:1])
 	}
 	return "pool/" + os + "/" + codename + "/" + upstreamName + "/" + model.PoolSection(section) + "/" + first + "/" + pkgName + "/" + debFile
+}
+
+func (p Pkg) Hashes() apt.Hashes {
+	return apt.Hashes{MD5: p.MD5, SHA1: p.SHA1, SHA256: p.SHA256, SHA512: p.SHA512}
 }

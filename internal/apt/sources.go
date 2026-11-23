@@ -20,7 +20,46 @@ type RawSrc struct {
 type RawSrcFile struct {
 	Filename string
 	Size     int64
+	MD5      string
+	SHA1     string
 	SHA256   string
+	SHA512   string
+}
+
+func (f RawSrcFile) Hashes() Hashes {
+	return Hashes{MD5: f.MD5, SHA1: f.SHA1, SHA256: f.SHA256, SHA512: f.SHA512}
+}
+
+func (f *RawSrcFile) set(algo HashAlgo, digest string) {
+	h := f.Hashes()
+	h.Set(algo, digest)
+	f.MD5, f.SHA1, f.SHA256, f.SHA512 = h.MD5, h.SHA1, h.SHA256, h.SHA512
+}
+
+// srcChecksumFields maps the stanza fields that list files to the digest
+// each one carries.
+var srcChecksumFields = map[string]HashAlgo{
+	"files":            HashMD5,
+	"checksums-sha1":   HashSHA1,
+	"checksums-sha256": HashSHA256,
+	"checksums-sha512": HashSHA512,
+}
+
+// addFile records one line of a checksum section, merging it into the
+// entry for the same filename from an earlier section.
+func (r *RawSrc) addFile(algo HashAlgo, digest string, size int64, name string) {
+	for i := range r.Files {
+		if r.Files[i].Filename == name {
+			r.Files[i].set(algo, digest)
+			if r.Files[i].Size == 0 {
+				r.Files[i].Size = size
+			}
+			return
+		}
+	}
+	f := RawSrcFile{Filename: name, Size: size}
+	f.set(algo, digest)
+	r.Files = append(r.Files, f)
 }
 
 // WithDirectory returns the stanza text with the Directory field replaced.
@@ -78,14 +117,9 @@ func ParseSourceRaws(r io.Reader) ([]RawSrc, error) {
 		raw.WriteString(line)
 		raw.WriteByte('\n')
 		if line[0] == ' ' || line[0] == '\t' {
-			if lastKey == "checksums-sha256" {
-				parts := strings.Fields(line)
-				if len(parts) == 3 {
-					cur.Files = append(cur.Files, RawSrcFile{
-						SHA256:   parts[0],
-						Size:     rawParseInt64(parts[1]),
-						Filename: parts[2],
-					})
+			if algo, ok := srcChecksumFields[lastKey]; ok {
+				if parts := strings.Fields(line); len(parts) == 3 {
+					cur.addFile(algo, parts[0], rawParseInt64(parts[1]), parts[2])
 				}
 			}
 			continue
