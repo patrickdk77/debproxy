@@ -345,10 +345,19 @@ upstreams:
   # so a bucket next to the cache bucket needs no s3 map at all. With the
   # filesystem backend, region falls back to AWS_REGION.
   #
+  # packages limits what an upstream may contribute, by package name, and
+  # works for every URL scheme. allow and deny are RE2 regular expressions
+  # matched anywhere in the name; anchor with ^ and $ for a whole-name
+  # match. A package must match allow (when set) and not match deny (when
+  # set). The default admits everything. Two vendors' repositories merged
+  # into one component each get an allow pattern, so neither can publish
+  # a package under the other's name.
   # vendor-a:
   #   url: s3://vendor-a-apt/debian
   #   s3:
   #     region: us-east-1
+  #   packages:
+  #     allow: '^vendor-a-'
   #   keys:
   #     - /etc/debproxy/keys/vendor-a.asc
   #   auto_update: true
@@ -360,6 +369,9 @@ upstreams:
   #     region: us-east-1
   #     endpoint: https://s3.us-east-1.amazonaws.com
   #     force_path_style: false
+  #   packages:
+  #     allow: '^vendor-b-'
+  #     deny: 'evil'
   #   keys:
   #     - /etc/debproxy/keys/vendor-b.asc
   #   auto_update: true

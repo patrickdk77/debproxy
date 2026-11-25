@@ -231,7 +231,17 @@ func withFallbackTimeout(ctx context.Context, useFastFallback bool) (context.Con
 // the Packages indices for the configured component and architectures.
 // When a cache is configured it sends conditional requests (ETag/304) and
 // reuses previously-parsed Packages data if the Release hash is unchanged.
+// Packages the upstream's filter rejects are dropped from the result on
+// every path, cached or fetched, so no caller sees them.
 func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
+	idx, err := f.fetchIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return filterIndex(idx, f.src.Filter), nil
+}
+
+func (f *Fetcher) fetchIndex(ctx context.Context) (*Index, error) {
 	// The cache key includes the component because the same upstream URL+suite
 	// may be used across multiple component layouts (e.g. ubuntu-main is listed
 	// in main, universe, restricted, and multiverse). Without the component, the
@@ -435,7 +445,8 @@ func (f *Fetcher) FetchIndex(ctx context.Context) (*Index, error) {
 // ok=false if neither local nor Valkey has anything at all, or what's cached
 // is known incomplete (see indexCacheEntry.archsComplete -- e.g. a transient
 // per-arch Valkey read error, not a confirmed "this upstream serves
-// nothing"); the caller should fall back to FetchIndex in that case.
+// nothing"); the caller should fall back to FetchIndex in that case. The
+// upstream's package filter applies here as it does in FetchIndex.
 func (f *Fetcher) AdoptFromValkeyOutright(ctx context.Context) (*Index, bool) {
 	cacheKey := f.cacheKey()
 	archs := append(append([]string{}, f.src.Archs...), "all")
@@ -449,7 +460,7 @@ func (f *Fetcher) AdoptFromValkeyOutright(ctx context.Context) (*Index, bool) {
 	if f.cache != nil {
 		f.cache.store(cacheKey, cached)
 	}
-	return &Index{Release: cached.release, ByArch: cached.archPkgs}, true
+	return filterIndex(&Index{Release: cached.release, ByArch: cached.archPkgs}, f.src.Filter), true
 }
 
 // AdoptSourcesFromValkeyOutright is AdoptFromValkeyOutright's Sources
@@ -473,7 +484,7 @@ func (f *Fetcher) AdoptSourcesFromValkeyOutright(ctx context.Context) ([]apt.Raw
 	if f.cache != nil {
 		f.cache.updateSrcs(cacheKey, cached.srcsRelease, cached.srcs)
 	}
-	return cached.srcs, true
+	return filterSources(cached.srcs, f.src.Filter), true
 }
 
 // ReleaseOnly returns this upstream's cached/adopted Release -- via the
@@ -1037,7 +1048,16 @@ func (f *Fetcher) srcsCachedForComparison(ctx context.Context, cacheKey string) 
 
 // FetchSources downloads and parses the upstream Sources index for the configured
 // component. Returns nil, nil when no Sources index is listed in the Release.
+// Source packages the upstream's filter rejects are dropped from the result.
 func (f *Fetcher) FetchSources(ctx context.Context) ([]apt.RawSrc, error) {
+	srcs, err := f.fetchSources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return filterSources(srcs, f.src.Filter), nil
+}
+
+func (f *Fetcher) fetchSources(ctx context.Context) ([]apt.RawSrc, error) {
 	cacheKey := f.cacheKey()
 
 	// Shared-cache fast path: another replica may have already refreshed

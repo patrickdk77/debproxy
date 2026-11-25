@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -457,6 +458,8 @@ type UpstreamDef struct {
 	// the same key under storage.s3 when the storage backend is s3, and the
 	// AWS SDK's default (AWS_REGION, shared config) otherwise.
 	S3 UpstreamS3 `yaml:"s3"`
+	// Packages limits what this upstream may contribute, by package name.
+	Packages PackageFilterDef `yaml:"packages"`
 	// UpstreamNetwork overrides the top-level upstream_network for this
 	// specific upstream only: "ipv4" or "ipv6". Omit to use the global
 	// default. Set this when only one particular mirror has a broken IP
@@ -471,6 +474,16 @@ type UpstreamS3 struct {
 	Region         string `yaml:"region"`
 	Endpoint       string `yaml:"endpoint"`
 	ForcePathStyle *bool  `yaml:"force_path_style"`
+}
+
+// PackageFilterDef is an upstream's packages map. Allow and Deny are RE2
+// regular expressions matched anywhere in a package name, so "evil" matches
+// "evil-tool" and "unevil"; anchor with ^ and $ for a whole-name match. An
+// empty allow admits every name and an empty deny rejects none. A package
+// must pass both to be published from the upstream.
+type PackageFilterDef struct {
+	Allow string `yaml:"allow"`
+	Deny  string `yaml:"deny"`
 }
 
 type OSLayout struct {
@@ -609,7 +622,11 @@ func (c *Config) resolveLayouts() error {
 		if err != nil {
 			return err
 		}
-		ru := resolvedUpstream{url: cleanURL, username: username, password: password}
+		filter, err := compileFilter(name, def.Packages)
+		if err != nil {
+			return err
+		}
+		ru := resolvedUpstream{url: cleanURL, username: username, password: password, filter: filter}
 		if strings.HasPrefix(cleanURL, "s3://") {
 			ru.s3 = c.upstreamS3(def.S3)
 		} else if def.S3 != (UpstreamS3{}) {
@@ -703,6 +720,7 @@ func (c *Config) resolveLayouts() error {
 						Password:     ru.password,
 						Network:      network,
 						S3:           ru.s3,
+						Filter:       ru.filter,
 					})
 				}
 
@@ -727,6 +745,7 @@ type resolvedUpstream struct {
 	url      string
 	username string
 	password string
+	filter   *model.PackageFilter
 	s3       model.S3Options
 }
 
@@ -790,6 +809,27 @@ func upstreamURL(name string, def UpstreamDef) (cleanURL, username, password str
 		return "", "", "", fmt.Errorf("upstream %q: s3 credentials need both the access key id and the secret, or neither for the default chain", name)
 	}
 	return cleanURL, username, password, nil
+}
+
+// compileFilter builds the package filter for an upstream's packages map,
+// or nil when the map is empty.
+func compileFilter(name string, def PackageFilterDef) (*model.PackageFilter, error) {
+	if def.Allow == "" && def.Deny == "" {
+		return nil, nil
+	}
+	f := &model.PackageFilter{}
+	var err error
+	if def.Allow != "" {
+		if f.Allow, err = regexp.Compile(def.Allow); err != nil {
+			return nil, fmt.Errorf("upstream %q: packages.allow: %w", name, err)
+		}
+	}
+	if def.Deny != "" {
+		if f.Deny, err = regexp.Compile(def.Deny); err != nil {
+			return nil, fmt.Errorf("upstream %q: packages.deny: %w", name, err)
+		}
+	}
+	return f, nil
 }
 
 // upstreamS3 resolves an s3 upstream's connection settings: each key the

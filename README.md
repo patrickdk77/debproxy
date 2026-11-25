@@ -133,6 +133,11 @@ credentials need `s3:GetObject` and `s3:ListBucket` on the bucket. Without
 fallbacks from InRelease to Release and from a by-hash path to the plain
 one act on 404 only.
 
+An upstream's `packages` map takes `allow` and `deny` patterns matched
+against the package name. Two repositories merged into one component each
+get an `allow` pattern, so neither can publish under the other's name.
+`config.example.yaml` shows both.
+
 ## Multi-replica deployments
 
 Running more than one debproxy replica requires a storage backend that

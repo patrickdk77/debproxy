@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/debproxy/debproxy/internal/apt"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -57,6 +58,9 @@ type UpstreamSource struct {
 	// carry the access key id and secret access key; both empty means the
 	// AWS default credential chain.
 	S3 S3Options
+	// Filter restricts which packages this upstream may contribute. nil
+	// allows every package the upstream lists.
+	Filter *PackageFilter
 }
 
 // S3Options selects the S3 endpoint an s3:// upstream is read from. Empty
@@ -72,6 +76,30 @@ type S3Options struct {
 // repositories. Empty for an http upstream.
 func (o S3Options) Identity() string {
 	return o.Endpoint + "\x00" + o.Region
+}
+
+// PackageFilter decides by package name which packages an upstream may
+// contribute. Allow and Deny are unanchored regular expressions; a name
+// passes when it matches Allow (or Allow is nil) and does not match Deny
+// (or Deny is nil).
+type PackageFilter struct {
+	Allow *regexp.Regexp
+	Deny  *regexp.Regexp
+}
+
+// Allows reports whether a package with the given name passes the filter.
+// A nil filter allows everything.
+func (f *PackageFilter) Allows(name string) bool {
+	if f == nil {
+		return true
+	}
+	if f.Allow != nil && !f.Allow.MatchString(name) {
+		return false
+	}
+	if f.Deny != nil && f.Deny.MatchString(name) {
+		return false
+	}
+	return true
 }
 
 // ComponentKey joins Component into the single opaque string used wherever
