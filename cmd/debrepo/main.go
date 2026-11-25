@@ -1,7 +1,8 @@
 // debrepo generates signed apt repository metadata (Packages, Release,
-// InRelease) from .deb files stored on disk. It requires no config file;
-// all parameters are supplied via flags. State is persisted per component
-// as a zstd-compressed deb822 file so subsequent runs only process changes.
+// InRelease) from .deb files stored on disk or in an S3 bucket. It requires
+// no config file; all parameters are supplied via flags. State is persisted
+// per component as a zstd-compressed deb822 file so subsequent runs only
+// process changes.
 package main
 
 import (
@@ -12,12 +13,14 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,23 +34,31 @@ import (
 	"github.com/debproxy/debproxy/internal/signing"
 )
 
-// diskEntry holds on-disk metadata used for change detection.
+// diskEntry holds the stored file's metadata used for change detection.
 type diskEntry struct {
 	size  int64
 	mtime string
 }
 
+func newDiskEntry(size int64, mtime time.Time) diskEntry {
+	return diskEntry{size: size, mtime: mtime.UTC().Format(time.RFC3339)}
+}
+
 func main() {
 	keyPath := flag.String("key", "", "path to OpenPGP signing key (required)")
-	dir := flag.String("dir", "", "path to repository root (required)")
+	dir := flag.String("dir", "", "repository root: a directory or s3://[key:secret@]bucket/prefix (required)")
 	osName := flag.String("os", "", "OS name, e.g. ubuntu (required)")
 	origin := flag.String("origin", "", "Release Origin (default: value of -os)")
 	label := flag.String("label", "", "Release Label (default: value of -os)")
 	force := flag.Bool("force", false, "discard saved state and reprocess all packages from scratch")
+	s3Region := flag.String("s3-region", "", "region of an s3:// repository (default: AWS_REGION)")
+	s3Endpoint := flag.String("s3-endpoint", "", "endpoint URL of an s3:// repository, for S3-compatible stores")
+	s3PathStyle := flag.Bool("s3-path-style", false, "use path-style addressing for an s3:// repository")
+	s3NoACL := flag.Bool("s3-no-acl", false, "set no object ACL on an s3:// repository (buckets with ACLs disabled or public ACLs blocked)")
 	flag.Parse()
 
 	if *keyPath == "" || *dir == "" || *osName == "" {
-		fmt.Fprintln(os.Stderr, "usage: debrepo -key <path> -dir <repo-root> -os <name> [-origin <s>] [-label <s>] [-force]")
+		fmt.Fprintln(os.Stderr, "usage: debrepo -key <path> -dir <repo-root> -os <name> [-origin <s>] [-label <s>] [-force] [-s3-region <r>] [-s3-endpoint <url>] [-s3-path-style] [-s3-no-acl]")
 		os.Exit(1)
 	}
 	if *origin == "" {
@@ -63,38 +74,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(context.Background(), *dir, *osName, *origin, *label, *force, signingKey); err != nil {
+	ctx := context.Background()
+	repo, err := openRepo(ctx, *dir, s3Flags{region: *s3Region, endpoint: *s3Endpoint, pathStyle: *s3PathStyle, noACL: *s3NoACL})
+	if err != nil {
+		slog.Error("open repository", "err", err)
+		os.Exit(1)
+	}
+	if err := run(ctx, repo, *osName, *origin, *label, *force, signingKey); err != nil {
 		slog.Error("failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, dir, osName, origin, label string, force bool, key *signing.Key) error {
-	sink := fsSink{base: dir}
-	distsDir := filepath.Join(dir, "dists")
+// errUnreadable marks a file the repository listed but could not deliver.
+// Such a file must not be dropped from the index as if it were deleted:
+// a read denial on a bucket would otherwise publish a signed index
+// without its packages.
+var errUnreadable = errors.New("listed file could not be read")
 
-	poolParas, err := scanPool(filepath.Join(dir, "pool"), force)
+func run(ctx context.Context, repo repoFS, osName, origin, label string, force bool, key *signing.Key) error {
+	poolParas, err := scanPool(ctx, repo, force)
 	if err != nil {
-		slog.Warn("pool scan failed", "err", err)
+		return fmt.Errorf("scan pool: %w", err)
 	}
 
-	codenames, err := subdirs(distsDir)
+	codenames, err := repo.subdirs(ctx, "dists")
 	if err != nil {
-		return fmt.Errorf("scan dists dir %s: %w", distsDir, err)
+		return fmt.Errorf("scan dists: %w", err)
 	}
 
+	failed := 0
 	for _, codename := range codenames {
-		if err := processCodename(ctx, sink, filepath.Join(distsDir, codename), codename, poolParas, osName, origin, label, force, key); err != nil {
+		if err := processCodename(ctx, repo, "dists/"+codename, codename, poolParas, osName, origin, label, force, key); err != nil {
 			slog.Error("codename failed", "codename", codename, "err", err)
+			failed++
 		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d codenames failed", failed, len(codenames))
 	}
 	return nil
 }
 
-func processCodename(ctx context.Context, sink fsSink, codenamePath, codename string, poolParas map[string][]*apt.Paragraph, osName, origin, label string, force bool, key *signing.Key) error {
+func processCodename(ctx context.Context, repo repoFS, codenamePath, codename string, poolParas map[string][]*apt.Paragraph, osName, origin, label string, force bool, key *signing.Key) error {
 	slog.Info("processing codename", "codename", codename)
 
-	comps, err := subdirs(codenamePath)
+	comps, err := repo.subdirs(ctx, codenamePath)
 	if err != nil {
 		return fmt.Errorf("scan codename dir: %w", err)
 	}
@@ -108,39 +133,30 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 	compMap := make(map[string]compData, len(comps))
 
 	for _, comp := range comps {
-		compPath := filepath.Join(codenamePath, comp)
+		compPath := codenamePath + "/" + comp
 
-		for _, a := range discoverArches(compPath) {
+		for _, a := range discoverArches(ctx, repo, compPath) {
 			archSet[a] = true
 		}
 
 		var paras []*apt.Paragraph
 		if !force {
 			var err error
-			paras, err = loadState(compPath, ".debrepo")
+			paras, err = loadState(ctx, repo, compPath, ".debrepo")
 			if err != nil {
 				slog.Warn("load state failed, starting fresh", "component", comp, "err", err)
 			}
 		}
 
 		// Enumerate .deb files recursively under deb/.
-		debDir := filepath.Join(compPath, "deb")
-		debPrefix := "dists/" + codename + "/" + comp + "/deb/"
+		debDir := compPath + "/deb"
+		debPrefix := debDir + "/"
 		diskFiles := make(map[string]diskEntry)
-		_ = filepath.Walk(debDir, func(p string, info os.FileInfo, err error) error {
-			if warnWalkErr("deb dir", p, err) {
-				return nil
-			}
-			if info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".deb") {
-				return nil
-			}
-			rel, _ := filepath.Rel(debDir, p)
-			diskFiles[debPrefix+filepath.ToSlash(rel)] = diskEntry{
-				size:  info.Size(),
-				mtime: info.ModTime().UTC().Format(time.RFC3339),
-			}
-			return nil
-		})
+		if err := repo.walk(ctx, debDir, ".deb", func(rel string, size int64, mtime time.Time) {
+			diskFiles[debPrefix+rel] = newDiskEntry(size, mtime)
+		}); err != nil {
+			return fmt.Errorf("walk %s: %w", debDir, err)
+		}
 
 		// Remove state entries for deleted or modified .deb files.
 		filtered := paras[:0:0]
@@ -178,11 +194,12 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 
 		newCount := 0
 		for _, filenameKey := range toProcess {
-			relPath := strings.TrimPrefix(filenameKey, debPrefix)
-			debFile := filepath.Join(debDir, filepath.FromSlash(relPath))
-			para, err := processDeb(debFile, debPrefix, relPath)
+			para, err := processDeb(ctx, repo, filenameKey)
+			if errors.Is(err, errUnreadable) {
+				return fmt.Errorf("component %s: %w", comp, err)
+			}
 			if err != nil {
-				slog.Warn("skip deb", "file", debFile, "err", err)
+				slog.Warn("skip deb", "file", filenameKey, "err", err)
 				continue
 			}
 			para.Set("X-Mtime", diskFiles[filenameKey].mtime)
@@ -195,37 +212,26 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 
 		if newCount > 0 || removedCount > 0 || modifiedCount > 0 || force {
 			slog.Info("state updated", "component", comp, "added", newCount, "removed", removedCount, "modified", modifiedCount)
-			if err := saveState(compPath, ".debrepo", paras); err != nil {
+			if err := saveState(ctx, repo, compPath, ".debrepo", paras); err != nil {
 				slog.Warn("save state failed", "component", comp, "err", err)
 			}
 		}
 
-		// Source packages: scan <component>/source/ for .dsc files.
-		// Skip entirely if the source directory does not exist.
-		srcDir := filepath.Join(compPath, "source")
-		srcPrefix := "dists/" + codename + "/" + comp + "/source/"
+		// Source packages: scan <component>/source/ for .dsc files. A
+		// component without a source directory yields none.
+		srcDir := compPath + "/source"
+		srcPrefix := srcDir + "/"
 		srcDiskFiles := make(map[string]diskEntry)
-		if _, err := os.Stat(srcDir); err == nil {
-			_ = filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
-				if warnWalkErr("source dir", p, err) {
-					return nil
-				}
-				if info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".dsc") {
-					return nil
-				}
-				rel, _ := filepath.Rel(srcDir, p)
-				srcDiskFiles[srcPrefix+filepath.ToSlash(rel)] = diskEntry{
-					size:  info.Size(),
-					mtime: info.ModTime().UTC().Format(time.RFC3339),
-				}
-				return nil
-			})
+		if err := repo.walk(ctx, srcDir, ".dsc", func(rel string, size int64, mtime time.Time) {
+			srcDiskFiles[srcPrefix+rel] = newDiskEntry(size, mtime)
+		}); err != nil {
+			return fmt.Errorf("walk %s: %w", srcDir, err)
 		}
 
 		var srcParas []*apt.Paragraph
 		if !force && len(srcDiskFiles) > 0 {
 			var err error
-			srcParas, err = loadState(compPath, ".debrepo-src")
+			srcParas, err = loadState(ctx, repo, compPath, ".debrepo-src")
 			if err != nil {
 				slog.Warn("load source state failed, starting fresh", "component", comp, "err", err)
 			}
@@ -267,10 +273,12 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 		srcNewCount := 0
 		for _, dscKey := range srcToProcess {
 			relPath := strings.TrimPrefix(dscKey, srcPrefix)
-			dscFile := filepath.Join(srcDir, filepath.FromSlash(relPath))
-			para, err := processDsc(dscFile, codename, comp, relPath)
+			para, err := processDsc(ctx, repo, dscKey, codename, comp, relPath)
+			if errors.Is(err, errUnreadable) {
+				return fmt.Errorf("component %s: %w", comp, err)
+			}
 			if err != nil {
-				slog.Warn("skip dsc", "file", dscFile, "err", err)
+				slog.Warn("skip dsc", "file", dscKey, "err", err)
 				continue
 			}
 			de := srcDiskFiles[dscKey]
@@ -283,7 +291,7 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 
 		if srcNewCount > 0 || srcRemovedCount > 0 || srcModifiedCount > 0 || (force && len(srcDiskFiles) > 0) {
 			slog.Info("source state updated", "component", comp, "added", srcNewCount, "removed", srcRemovedCount, "modified", srcModifiedCount)
-			if err := saveState(compPath, ".debrepo-src", srcParas); err != nil {
+			if err := saveState(ctx, repo, compPath, ".debrepo-src", srcParas); err != nil {
 				slog.Warn("save source state failed", "component", comp, "err", err)
 			}
 		}
@@ -351,7 +359,7 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 		return strings.ReplaceAll(s, "{codename}", codename)
 	}
 
-	return publish.GenerateSuite(ctx, sink, "", publish.SuiteInput{
+	return publish.GenerateSuite(ctx, repo, "", publish.SuiteInput{
 		OS:            expand(osName),
 		Codename:      codename,
 		Suite:         codename,
@@ -366,52 +374,45 @@ func processCodename(ctx context.Context, sink fsSink, codenamePath, codename st
 	}, key)
 }
 
-func processDeb(debFile, filenamePrefix, relPath string) (*apt.Paragraph, error) {
-	f, err := os.Open(debFile)
+// processDeb builds the Packages stanza for the .deb at filename, which is
+// also the stanza's Filename field. The file is read once for its control
+// paragraph and once more for its checksums. A file that cannot be read
+// is reported with errUnreadable; a file that is not a .deb is an
+// ordinary error.
+func processDeb(ctx context.Context, repo repoFS, filename string) (*apt.Paragraph, error) {
+	f, err := repo.openSeekable(ctx, filename)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %s: %w", errUnreadable, filename, err)
 	}
+	defer f.Close()
 	ctrl, err := deb.ControlParagraph(f)
-	f.Close()
 	if err != nil {
 		return nil, fmt.Errorf("control paragraph: %w", err)
 	}
-
-	sha256hex, sha512hex, size, err := computeChecksums(debFile)
-	if err != nil {
-		return nil, fmt.Errorf("checksums: %w", err)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", errUnreadable, filename, err)
 	}
-
-	return apt.BuildPackagesStanza(ctrl, filenamePrefix+relPath, size, sha256hex, sha512hex), nil
-}
-
-func computeChecksums(path string) (sha256hex, sha512hex string, size int64, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer f.Close()
 
 	h256 := sha256.New()
 	h512 := sha512.New()
-	n, err := io.Copy(io.MultiWriter(h256, h512), f)
+	size, err := io.Copy(io.MultiWriter(h256, h512), f)
 	if err != nil {
-		return "", "", 0, err
+		return nil, fmt.Errorf("%w: %s: checksums: %w", errUnreadable, filename, err)
 	}
-	return hex.EncodeToString(h256.Sum(nil)), hex.EncodeToString(h512.Sum(nil)), n, nil
+	return apt.BuildPackagesStanza(ctrl, filename, size, hex.EncodeToString(h256.Sum(nil)), hex.EncodeToString(h512.Sum(nil))), nil
 }
 
 // loadState reads the per-component state file named <name>.zst, falling back
 // to <name>.old.zst on error.
-func loadState(compPath, name string) ([]*apt.Paragraph, error) {
-	stateFile := filepath.Join(compPath, name+".zst")
-	oldFile := filepath.Join(compPath, name+".old.zst")
+func loadState(ctx context.Context, repo repoFS, compPath, name string) ([]*apt.Paragraph, error) {
+	stateFile := compPath + "/" + name + ".zst"
+	oldFile := compPath + "/" + name + ".old.zst"
 
-	paras, err := readStateFile(stateFile)
+	paras, err := readStateFile(ctx, repo, stateFile)
 	if err == nil {
 		return paras, nil
 	}
-	paras, err2 := readStateFile(oldFile)
+	paras, err2 := readStateFile(ctx, repo, oldFile)
 	if err2 == nil {
 		slog.Warn("using fallback state", "path", oldFile)
 		return paras, nil
@@ -419,8 +420,8 @@ func loadState(compPath, name string) ([]*apt.Paragraph, error) {
 	return nil, err
 }
 
-func readStateFile(path string) ([]*apt.Paragraph, error) {
-	f, err := os.Open(path)
+func readStateFile(ctx context.Context, repo repoFS, rel string) ([]*apt.Paragraph, error) {
+	f, err := repo.open(ctx, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -435,11 +436,11 @@ func readStateFile(path string) ([]*apt.Paragraph, error) {
 	return apt.ParseParagraphs(zr)
 }
 
-// saveState atomically writes the component state to <name>.zst, preserving
-// the previous file as <name>.old.zst.
-func saveState(compPath, name string, paras []*apt.Paragraph) error {
-	stateFile := filepath.Join(compPath, name+".zst")
-	oldFile := filepath.Join(compPath, name+".old.zst")
+// saveState writes the component state to <name>.zst, keeping the previous
+// file as <name>.old.zst.
+func saveState(ctx context.Context, repo repoFS, compPath, name string, paras []*apt.Paragraph) error {
+	stateFile := compPath + "/" + name + ".zst"
+	oldFile := compPath + "/" + name + ".old.zst"
 
 	var buf bytes.Buffer
 	zw, err := zstd.NewWriter(&buf)
@@ -454,29 +455,21 @@ func saveState(compPath, name string, paras []*apt.Paragraph) error {
 		return err
 	}
 
-	if _, err := os.Stat(stateFile); err == nil {
-		_ = os.Rename(stateFile, oldFile)
+	if err := repo.rotate(ctx, stateFile, oldFile); err != nil {
+		slog.Warn("keeping the previous state failed", "path", oldFile, "err", err)
 	}
-
-	tmp := stateFile + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, stateFile)
+	return repo.WriteFile(ctx, stateFile, bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 }
 
 // discoverArches returns architectures from binary-{arch} subdirectories.
-func discoverArches(compPath string) []string {
-	entries, err := os.ReadDir(compPath)
+func discoverArches(ctx context.Context, repo repoFS, compPath string) []string {
+	names, err := repo.subdirs(ctx, compPath)
 	if err != nil {
 		return nil
 	}
 	var arches []string
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		if arch, ok := strings.CutPrefix(e.Name(), "binary-"); ok && arch != "" {
+	for _, name := range names {
+		if arch, ok := strings.CutPrefix(name, "binary-"); ok && arch != "" {
 			arches = append(arches, arch)
 		}
 	}
@@ -491,21 +484,6 @@ func warnWalkErr(kind, p string, err error) bool {
 	}
 	slog.Warn("walk "+kind+": skipping entry", "path", p, "err", err)
 	return true
-}
-
-// subdirs returns names of immediate subdirectories within dir.
-func subdirs(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	return names, nil
 }
 
 func sortedKeys(m map[string]bool) []string {
@@ -528,11 +506,17 @@ func renderStanza(p *apt.Paragraph) (string, error) {
 	return apt.StanzaString(clean)
 }
 
-// processDsc builds a Sources stanza paragraph from a .dsc file.
-func processDsc(dscFile, codename, comp, relPath string) (*apt.Paragraph, error) {
-	data, err := os.ReadFile(dscFile)
+// processDsc builds a Sources stanza paragraph from the .dsc file at dscPath,
+// whose path relative to the component's source directory is relPath.
+func processDsc(ctx context.Context, repo repoFS, dscPath, codename, comp, relPath string) (*apt.Paragraph, error) {
+	rc, err := repo.open(ctx, dscPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %s: %w", errUnreadable, dscPath, err)
+	}
+	data, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", errUnreadable, dscPath, err)
 	}
 
 	paras, err := apt.ParseParagraphs(bytes.NewReader(stripPGPArmor(data)))
@@ -546,23 +530,20 @@ func processDsc(dscFile, codename, comp, relPath string) (*apt.Paragraph, error)
 
 	sourceName := ctrl.Get("Source")
 	if sourceName == "" {
-		return nil, fmt.Errorf("no Source field in %s", dscFile)
+		return nil, fmt.Errorf("no Source field in %s", dscPath)
 	}
 
-	dscMD5, dscSHA1, dscSHA256, dscSize, err := computeDscChecksums(dscFile)
-	if err != nil {
-		return nil, fmt.Errorf("checksums: %w", err)
-	}
+	dscMD5, dscSHA1, dscSHA256 := dscChecksums(data)
 
 	// Directory: path relative to webroot where all source files live.
-	dscSubdir := filepath.ToSlash(filepath.Dir(relPath))
+	dscSubdir := path.Dir(relPath)
 	directory := "dists/" + codename + "/" + comp + "/source"
 	if dscSubdir != "" && dscSubdir != "." {
 		directory += "/" + dscSubdir
 	}
 
-	basename := filepath.Base(dscFile)
-	sizeStr := strconv.FormatInt(dscSize, 10)
+	basename := path.Base(dscPath)
+	sizeStr := strconv.Itoa(len(data))
 
 	out := apt.NewParagraph()
 	out.Set("Package", sourceName)
@@ -591,21 +572,11 @@ func processDsc(dscFile, codename, comp, relPath string) (*apt.Paragraph, error)
 	return out, nil
 }
 
-func computeDscChecksums(path string) (md5hex, sha1hex, sha256hex string, size int64, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", "", "", 0, err
-	}
-	defer f.Close()
-
-	hMD5 := md5.New()
-	hSHA1 := sha1.New()
-	h256 := sha256.New()
-	n, err := io.Copy(io.MultiWriter(hMD5, hSHA1, h256), f)
-	if err != nil {
-		return "", "", "", 0, err
-	}
-	return hex.EncodeToString(hMD5.Sum(nil)), hex.EncodeToString(hSHA1.Sum(nil)), hex.EncodeToString(h256.Sum(nil)), n, nil
+func dscChecksums(data []byte) (md5hex, sha1hex, sha256hex string) {
+	sumMD5 := md5.Sum(data)
+	sumSHA1 := sha1.Sum(data)
+	sum256 := sha256.Sum256(data)
+	return hex.EncodeToString(sumMD5[:]), hex.EncodeToString(sumSHA1[:]), hex.EncodeToString(sum256[:])
 }
 
 // stripPGPArmor strips OpenPGP clear-sign armor from a .dsc file if present,
@@ -631,11 +602,11 @@ func stripPGPArmor(data []byte) []byte {
 // scanPool scans pool/<component>/ for .deb files and returns a map of
 // component name to Packages paragraphs. The pool directory is shared across
 // all codenames; its state is stored per component in pool/<component>/.debrepo.zst.
-func scanPool(poolDir string, force bool) (map[string][]*apt.Paragraph, error) {
-	if _, err := os.Stat(poolDir); os.IsNotExist(err) {
+func scanPool(ctx context.Context, repo repoFS, force bool) (map[string][]*apt.Paragraph, error) {
+	comps, err := repo.subdirs(ctx, "pool")
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
-	comps, err := subdirs(poolDir)
 	if err != nil {
 		return nil, fmt.Errorf("scan pool: %w", err)
 	}
@@ -643,29 +614,20 @@ func scanPool(poolDir string, force bool) (map[string][]*apt.Paragraph, error) {
 	result := make(map[string][]*apt.Paragraph, len(comps))
 
 	for _, comp := range comps {
-		compDir := filepath.Join(poolDir, comp)
-		prefix := "pool/" + comp + "/"
+		compDir := "pool/" + comp
+		prefix := compDir + "/"
 
 		diskFiles := make(map[string]diskEntry)
-		_ = filepath.Walk(compDir, func(p string, info os.FileInfo, err error) error {
-			if warnWalkErr("pool dir", p, err) {
-				return nil
-			}
-			if info == nil || info.IsDir() || !strings.HasSuffix(info.Name(), ".deb") {
-				return nil
-			}
-			rel, _ := filepath.Rel(compDir, p)
-			diskFiles[prefix+filepath.ToSlash(rel)] = diskEntry{
-				size:  info.Size(),
-				mtime: info.ModTime().UTC().Format(time.RFC3339),
-			}
-			return nil
-		})
+		if err := repo.walk(ctx, compDir, ".deb", func(rel string, size int64, mtime time.Time) {
+			diskFiles[prefix+rel] = newDiskEntry(size, mtime)
+		}); err != nil {
+			return nil, fmt.Errorf("walk %s: %w", compDir, err)
+		}
 
 		var paras []*apt.Paragraph
 		if !force {
 			var err error
-			paras, err = loadState(compDir, ".debrepo")
+			paras, err = loadState(ctx, repo, compDir, ".debrepo")
 			if err != nil {
 				slog.Warn("load pool state failed, starting fresh", "component", comp, "err", err)
 			}
@@ -704,11 +666,12 @@ func scanPool(poolDir string, force bool) (map[string][]*apt.Paragraph, error) {
 
 		newCount := 0
 		for _, filenameKey := range toProcess {
-			relPath := strings.TrimPrefix(filenameKey, prefix)
-			debFile := filepath.Join(compDir, filepath.FromSlash(relPath))
-			para, err := processDeb(debFile, prefix, relPath)
+			para, err := processDeb(ctx, repo, filenameKey)
+			if errors.Is(err, errUnreadable) {
+				return nil, fmt.Errorf("pool component %s: %w", comp, err)
+			}
 			if err != nil {
-				slog.Warn("skip pool deb", "file", debFile, "err", err)
+				slog.Warn("skip pool deb", "file", filenameKey, "err", err)
 				continue
 			}
 			para.Set("X-Mtime", diskFiles[filenameKey].mtime)
@@ -718,7 +681,7 @@ func scanPool(poolDir string, force bool) (map[string][]*apt.Paragraph, error) {
 
 		if newCount > 0 || removedCount > 0 || modifiedCount > 0 || force {
 			slog.Info("pool state updated", "component", comp, "added", newCount, "removed", removedCount, "modified", modifiedCount)
-			if err := saveState(compDir, ".debrepo", paras); err != nil {
+			if err := saveState(ctx, repo, compDir, ".debrepo", paras); err != nil {
 				slog.Warn("save pool state failed", "component", comp, "err", err)
 			}
 		}
@@ -729,29 +692,4 @@ func scanPool(poolDir string, force bool) (map[string][]*apt.Paragraph, error) {
 	}
 
 	return result, nil
-}
-
-// fsSink implements publish.FileSink by writing to the local filesystem.
-type fsSink struct{ base string }
-
-func (s fsSink) WriteFile(_ context.Context, relPath string, r io.Reader, _ int64) error {
-	full := filepath.Join(s.base, filepath.FromSlash(relPath))
-	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-		return err
-	}
-	tmp := full + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(f, r); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, full)
 }

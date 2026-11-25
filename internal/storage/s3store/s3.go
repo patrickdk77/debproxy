@@ -17,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -54,8 +55,24 @@ type Store struct {
 	aclDisabled atomic.Bool
 }
 
+// Option adjusts how New builds its client.
+type Option func(*options)
+
+type options struct {
+	loadOpts []func(*awsconfig.LoadOptions) error
+}
+
+// WithStaticCredentials signs every request with the given access key pair
+// instead of resolving the AWS default credential chain.
+func WithStaticCredentials(accessKey, secret string) Option {
+	return func(o *options) {
+		o.loadOpts = append(o.loadOpts, awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(accessKey, secret, "")))
+	}
+}
+
 // New returns an S3 storage backend.
-func New(cfg config.S3Config) (*Store, error) {
+func New(cfg config.S3Config, opts ...Option) (*Store, error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("s3.bucket is required")
 	}
@@ -63,9 +80,15 @@ func New(cfg config.S3Config) (*Store, error) {
 		return nil, fmt.Errorf("s3.region is required")
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	loadOpts := append([]func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
-		awsconfig.WithHTTPClient(newHTTPClient(cfg)))
+		awsconfig.WithHTTPClient(newHTTPClient(cfg)),
+	}, o.loadOpts...)
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
 	}
@@ -468,6 +491,10 @@ func s3PutAttrs(relPath string) (acl types.ObjectCannedACL, cacheControl, conten
 	acl = types.ObjectCannedACLPublicRead
 	switch {
 	case strings.HasPrefix(relPath, "current/"):
+		cacheControl = "public, max-age=720"
+	case strings.HasPrefix(relPath, "dists/"):
+		// debrepo publishes a first-party repository straight under the
+		// prefix, and its indexes change on every run.
 		cacheControl = "public, max-age=720"
 	case strings.HasPrefix(relPath, "keys/") && strings.HasPrefix(path.Base(relPath), "debproxy."):
 		cacheControl = "public, max-age=86400"
