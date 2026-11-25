@@ -326,6 +326,44 @@ upstreams:
       - /etc/debproxy/keys/ubuntu-advantage-esm-apps.gpg
     auto_update: true
 
+  # --- Repositories read from S3 ---
+  # An s3:// URL reads a repository with the usual dists/ and pool/ layout
+  # straight from a bucket. "key:secret@" in the URL is the access key
+  # pair, taken literally; write a "/" inside the secret as %2F, as in
+  # s3://AKIAEXAMPLE:wJalrXUtnFEMI%2FK7MDENG@vendor-b-apt/debian. The
+  # username and password keys set the same pair, and password takes a
+  # "$VAR" reference like the ESM entries above. With no credentials in
+  # either place the AWS default chain applies (environment, shared
+  # config, instance role), the same one the s3 storage backend uses.
+  # The credentials need s3:GetObject and s3:ListBucket on the bucket.
+  # Without ListBucket, S3 answers a missing file with 403 instead of
+  # 404, and the fallbacks from InRelease to Release and from a by-hash
+  # path to the plain one act on 404 only.
+  #
+  # The s3 map holds the connection settings. A key left unset takes the
+  # value of the same key under storage.s3 when the storage backend is s3,
+  # so a bucket next to the cache bucket needs no s3 map at all. With the
+  # filesystem backend, region falls back to AWS_REGION.
+  #
+  # vendor-a:
+  #   url: s3://vendor-a-apt/debian
+  #   s3:
+  #     region: us-east-1
+  #   keys:
+  #     - /etc/debproxy/keys/vendor-a.asc
+  #   auto_update: true
+  # vendor-b:
+  #   url: s3://vendor-b-apt/debian
+  #   username: AKIAEXAMPLE
+  #   password: $VENDOR_B_S3_SECRET
+  #   s3:
+  #     region: us-east-1
+  #     endpoint: https://s3.us-east-1.amazonaws.com
+  #     force_path_style: false
+  #   keys:
+  #     - /etc/debproxy/keys/vendor-b.asc
+  #   auto_update: true
+
 layouts:
   # Debian: deb.debian.org serves all architectures, no split needed.
   - os: debian

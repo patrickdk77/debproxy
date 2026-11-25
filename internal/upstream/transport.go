@@ -16,6 +16,7 @@ const (
 	userAgentKey contextKey = iota
 	clientWaitingKey
 	networkKey
+	s3OptionsKey
 )
 
 // withNetwork stores network ("ipv4"/"ipv6") in ctx so upstream fetches made
@@ -90,12 +91,30 @@ func UserAgentFromContext(ctx context.Context) (string, bool) {
 // per-upstream override carried in the request context (see withNetwork,
 // set by Fetcher for an UpstreamSource with its own Network value) takes
 // precedence over this default for that specific request.
+//
+// An s3:// URL is served by s3Transport through the same client, with the
+// same dial rules and the same retry policy; see s3.go.
 func NewHTTPClient(userAgent, network string) *http.Client {
+	dialContext := newDialContext(network)
+	base := newBaseTransport(dialContext)
+	base.RegisterProtocol("s3", newS3Transport(dialContext))
+	retry := &retryTransport{base: base, maxAttempts: 4, retryDelay: time.Second}
+	return &http.Client{
+		Transport: &userAgentTransport{base: retry, configured: userAgent},
+	}
+}
+
+type dialFunc func(ctx context.Context, netw, addr string) (net.Conn, error)
+
+// newDialContext returns the dialer every upstream connection goes
+// through: network is the process-wide IP family default, and a value
+// stored in ctx by withNetwork wins over it for that request.
+func newDialContext(network string) dialFunc {
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	dialContext := func(ctx context.Context, netw, addr string) (net.Conn, error) {
+	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
 		forced := network
 		if v, ok := networkFromContext(ctx); ok && v != "" {
 			forced = v
@@ -109,7 +128,12 @@ func NewHTTPClient(userAgent, network string) *http.Client {
 			return dialer.DialContext(ctx, netw, addr)
 		}
 	}
-	base := &http.Transport{
+}
+
+// newBaseTransport returns the http.Transport with the timeouts and pool
+// sizes upstream fetches use; the S3 SDK's own connections use one too.
+func newBaseTransport(dialContext dialFunc) *http.Transport {
+	return &http.Transport{
 		DialContext:           dialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
@@ -117,10 +141,6 @@ func NewHTTPClient(userAgent, network string) *http.Client {
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true, // we request pre-compressed files by URL; no auto Accept-Encoding/decompression
-	}
-	retry := &retryTransport{base: base, maxAttempts: 4, retryDelay: time.Second}
-	return &http.Client{
-		Transport: &userAgentTransport{base: retry, configured: userAgent},
 	}
 }
 
@@ -194,8 +214,18 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // isRetryableErr returns true for transient errors. Context cancellation and
 // deadline exceeded are not retried  --  the caller has already given up.
+// Neither is a permanentError, which marks a failure a retry cannot change.
 func isRetryableErr(err error) bool {
+	var perm permanentError
 	return err != nil &&
 		!errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded)
+		!errors.Is(err, context.DeadlineExceeded) &&
+		!errors.As(err, &perm)
 }
+
+// permanentError wraps an error that retrying cannot fix, such as a
+// misconfigured upstream, so retryTransport returns it at once.
+type permanentError struct{ err error }
+
+func (e permanentError) Error() string { return e.err.Error() }
+func (e permanentError) Unwrap() error { return e.err }

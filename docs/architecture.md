@@ -206,6 +206,7 @@ internal/
     fetch.go                  -- fetch + GPG-verify InRelease/Release, verify Packages and .deb by the strongest listed hash
     cache.go                  -- IndexCache: ETag/304 conditional re-fetch, Cache-Control expiry
     transport.go              -- tuned HTTP client, 3 retries on 5xx with idle-connection flush
+    s3.go                     -- s3:// upstreams: GetObject/HeadObject answered as HTTP responses through the same client
     valkey.go                 -- optional: shared upstream availability cache, distributed fetch lock
   valkeycache/                -- optional: Valkey client wrapper, distributed lock, pub/sub, key naming (see design.md)
 ```

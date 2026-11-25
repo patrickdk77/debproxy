@@ -52,6 +52,26 @@ type UpstreamSource struct {
 	// during config loading, so by the time a Fetcher sees it, it's already
 	// this upstream's final, effective value -- no further fallback needed.
 	Network string
+	// S3 holds the connection settings for an s3:// URL. Unused for http
+	// and https upstreams. For an s3:// upstream Username and Password
+	// carry the access key id and secret access key; both empty means the
+	// AWS default credential chain.
+	S3 S3Options
+}
+
+// S3Options selects the S3 endpoint an s3:// upstream is read from. Empty
+// fields take the AWS SDK's own defaults.
+type S3Options struct {
+	Region         string
+	Endpoint       string
+	ForcePathStyle bool
+}
+
+// Identity names the connection the options describe, for cache and dedup
+// keys: the same s3://bucket/prefix reached through two endpoints is two
+// repositories. Empty for an http upstream.
+func (o S3Options) Identity() string {
+	return o.Endpoint + "\x00" + o.Region
 }
 
 // ComponentKey joins Component into the single opaque string used wherever
@@ -69,7 +89,7 @@ func (u UpstreamSource) ComponentKey() string {
 // excluded: they vary per resolved UpstreamSource without changing what's
 // actually fetched from upstream.
 func (u UpstreamSource) DedupKey() string {
-	return u.URL + "\x00" + u.Suite + "\x00" + u.ComponentKey()
+	return u.URL + "\x00" + u.Suite + "\x00" + u.ComponentKey() + "\x00" + u.S3.Identity()
 }
 
 // Layout identifies a merged repository view: os / codename / component.

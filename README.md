@@ -123,6 +123,16 @@ DEBPROXY_STORAGE_BACKEND=s3
 DEBPROXY_STORAGE_FILESYSTEM_ROOT=/data/debproxy
 ```
 
+An upstream `url` is `http://`, `https://` or `s3://bucket/prefix`. An
+`s3://` URL reads a repository straight from a bucket. The access key pair
+comes from `key:secret@` in the URL, taken literally, or from the
+`username` and `password` keys, where `password` may be a `$VAR`
+reference; with neither, the AWS default credential chain applies. The
+credentials need `s3:GetObject` and `s3:ListBucket` on the bucket. Without
+`ListBucket`, S3 answers a missing file with 403 instead of 404, and the
+fallbacks from InRelease to Release and from a by-hash path to the plain
+one act on 404 only.
+
 ## Multi-replica deployments
 
 Running more than one debproxy replica requires a storage backend that

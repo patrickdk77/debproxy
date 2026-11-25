@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -444,10 +445,18 @@ type UpstreamDef struct {
 	AutoUpdate    bool     `yaml:"auto_update"`
 	Keys          []string `yaml:"keys"`
 	// Username and Password enable HTTP Basic Auth for authenticated upstreams
-	// such as Ubuntu ESM/Pro (esm.ubuntu.com). If Password starts with "$",
-	// it is treated as an environment variable name and expanded at load time.
+	// such as Ubuntu ESM/Pro (esm.ubuntu.com). For an s3:// URL they are the
+	// access key id and secret access key; leave both empty to use the AWS
+	// default credential chain. If Password starts with "$", it is treated
+	// as an environment variable name and expanded at load time. A
+	// "user:password@" part in the URL sets the same two values; the URL
+	// and these two keys must not both carry credentials.
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+	// S3 applies to an s3:// URL only. A key left unset takes the value of
+	// the same key under storage.s3 when the storage backend is s3, and the
+	// AWS SDK's default (AWS_REGION, shared config) otherwise.
+	S3 UpstreamS3 `yaml:"s3"`
 	// UpstreamNetwork overrides the top-level upstream_network for this
 	// specific upstream only: "ipv4" or "ipv6". Omit to use the global
 	// default. Set this when only one particular mirror has a broken IP
@@ -455,6 +464,13 @@ type UpstreamDef struct {
 	// mirror over a flaky IPv6 path, while other upstreams are fine on the
 	// default dual-stack behavior.
 	UpstreamNetwork string `yaml:"upstream_network"`
+}
+
+// UpstreamS3 is an upstream's s3 map. Its keys are the ones storage.s3 uses.
+type UpstreamS3 struct {
+	Region         string `yaml:"region"`
+	Endpoint       string `yaml:"endpoint"`
+	ForcePathStyle *bool  `yaml:"force_path_style"`
 }
 
 type OSLayout struct {
@@ -570,6 +586,7 @@ func (c *Config) validate() error {
 
 func (c *Config) resolveLayouts() error {
 	keyrings := make(map[string]openpgp.EntityList, len(c.Upstreams))
+	defs := make(map[string]resolvedUpstream, len(c.Upstreams))
 	for name, def := range c.Upstreams {
 		if def.URL == "" {
 			return fmt.Errorf("upstream %q: url is required", name)
@@ -587,6 +604,18 @@ func (c *Config) resolveLayouts() error {
 			return fmt.Errorf("upstream %q keys: %w", name, err)
 		}
 		keyrings[name] = kr
+
+		cleanURL, username, password, err := upstreamURL(name, def)
+		if err != nil {
+			return err
+		}
+		ru := resolvedUpstream{url: cleanURL, username: username, password: password}
+		if strings.HasPrefix(cleanURL, "s3://") {
+			ru.s3 = c.upstreamS3(def.S3)
+		} else if def.S3 != (UpstreamS3{}) {
+			return fmt.Errorf("upstream %q: s3 settings given for a url that is not s3://", name)
+		}
+		defs[name] = ru
 	}
 
 	var resolved []model.Layout
@@ -630,7 +659,8 @@ func (c *Config) resolveLayouts() error {
 						return fmt.Errorf("layout %s/%s/%s: unknown upstream %q", osLayout.OS, cn.Codename, comp.Component, upName)
 					}
 
-					url := expandPlaceholders(def.URL, osLayout.OS, cn.Codename, comp.Component)
+					ru := defs[upName]
+					url := expandPlaceholders(ru.url, osLayout.OS, cn.Codename, comp.Component)
 
 					suite := def.Suite
 					if suite == "" {
@@ -669,9 +699,10 @@ func (c *Config) resolveLayouts() error {
 						AutoUpdate:   def.AutoUpdate,
 						FetchSources: comp.Sources,
 						VerifyKeys:   keyrings[upName],
-						Username:     def.Username,
-						Password:     expandEnvRef(def.Password),
+						Username:     ru.username,
+						Password:     ru.password,
 						Network:      network,
+						S3:           ru.s3,
 					})
 				}
 
@@ -688,6 +719,100 @@ func (c *Config) resolveLayouts() error {
 	}
 	c.ResolvedLayouts = resolved
 	return nil
+}
+
+// resolvedUpstream is what resolveLayouts derives once per upstream
+// definition before expanding it into every layout that lists it.
+type resolvedUpstream struct {
+	url      string
+	username string
+	password string
+	s3       model.S3Options
+}
+
+// upstreamURL checks def.URL and moves any "user:password@" part out of it.
+// It returns the URL without that part and the credentials to use, which
+// come from the URL when it has them, taken literally, and from
+// def.Username and def.Password otherwise, with the password's "$VAR"
+// reference expanded. The URL is validated with its placeholders
+// substituted, since "{" is not a valid host character, and the credential
+// part is removed textually so the rest of the URL is kept byte for byte,
+// apart from the scheme, which is lowercased. No error message includes
+// the URL, because it may hold a secret.
+func upstreamURL(name string, def UpstreamDef) (cleanURL, username, password string, err error) {
+	u, err := url.Parse(expandPlaceholders(def.URL, "os", "codename", "component"))
+	if err != nil {
+		// The parser's reason quotes the offending part of the URL, which
+		// can be the secret, so it stays out of the message.
+		return "", "", "", fmt.Errorf("upstream %q: url does not parse", name)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	case "s3":
+		if u.Host == "" {
+			return "", "", "", fmt.Errorf("upstream %q: s3 url needs a bucket name as its host", name)
+		}
+		// A "/" inside an unescaped secret ends the authority early and
+		// leaves "key:" or "key:123" as the host, with the rest of the
+		// secret in the path. Bucket names never contain ":", so any
+		// port-like host is one of those or a misplaced endpoint.
+		if strings.Contains(u.Host, ":") {
+			return "", "", "", fmt.Errorf("upstream %q: s3 url host must be a bare bucket name: a port belongs in s3.endpoint, and a \"/\" inside the secret is written as %%2F", name)
+		}
+	default:
+		return "", "", "", fmt.Errorf("upstream %q: url scheme %q is not http, https or s3", name, u.Scheme)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", "", "", fmt.Errorf("upstream %q: url must not contain a query or fragment", name)
+	}
+	// url.Parse lowercases the scheme; the rest of def.URL is kept byte for
+	// byte so its placeholders survive.
+	cleanURL = u.Scheme + def.URL[len(u.Scheme):]
+	username, password = def.Username, expandEnvRef(def.Password)
+	if u.User != nil {
+		if def.Username != "" || def.Password != "" {
+			return "", "", "", fmt.Errorf("upstream %q: credentials given both in the url and in username/password", name)
+		}
+		username = u.User.Username()
+		password, _ = u.User.Password()
+		rest := def.URL[len(u.Scheme)+len("://"):]
+		authority := rest
+		if i := strings.Index(rest, "/"); i >= 0 {
+			authority = rest[:i]
+		}
+		at := strings.LastIndex(authority, "@")
+		cleanURL = u.Scheme + "://" + rest[at+1:]
+	}
+	if u.Scheme == "s3" && strings.Contains(cleanURL, "@") {
+		return "", "", "", fmt.Errorf("upstream %q: s3 url has an \"@\" after the credentials: a \"/\" inside the secret is written as %%2F", name)
+	}
+	if u.Scheme == "s3" && (username == "") != (password == "") {
+		return "", "", "", fmt.Errorf("upstream %q: s3 credentials need both the access key id and the secret, or neither for the default chain", name)
+	}
+	return cleanURL, username, password, nil
+}
+
+// upstreamS3 resolves an s3 upstream's connection settings: each key the
+// upstream leaves unset takes storage.s3's value when the storage backend
+// is s3, so a bucket next to the cache bucket needs no s3 map at all.
+func (c *Config) upstreamS3(def UpstreamS3) model.S3Options {
+	opts := model.S3Options{Region: def.Region, Endpoint: def.Endpoint}
+	if def.ForcePathStyle != nil {
+		opts.ForcePathStyle = *def.ForcePathStyle
+	}
+	if c.Storage.Backend != BackendS3 {
+		return opts
+	}
+	if opts.Region == "" {
+		opts.Region = c.Storage.S3.Region
+	}
+	if opts.Endpoint == "" {
+		opts.Endpoint = c.Storage.S3.Endpoint
+	}
+	if def.ForcePathStyle == nil {
+		opts.ForcePathStyle = c.Storage.S3.ForcePathStyle
+	}
+	return opts
 }
 
 // filterAll removes "all" from a list of architectures. arch-independent

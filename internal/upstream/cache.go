@@ -124,8 +124,8 @@ func (c *IndexCache) store(key string, e *indexCacheEntry) {
 	c.mu.Unlock()
 }
 
-// EvictUpstream removes the cache entry for one upstream+suite+component
-// (the same key FetchIndex/FetchSources use), if this cache is Valkey-backed
+// EvictUpstream removes the cache entry under key (see Fetcher.CacheKey,
+// the key FetchIndex/FetchSources use), if this cache is Valkey-backed
 // -- a no-op otherwise, since without Valkey this cache is the only copy of
 // the data, and evicting it would force a full re-fetch (GPG verify,
 // decompress, parse) on the next use instead of a cheap Valkey read. Called
@@ -135,12 +135,12 @@ func (c *IndexCache) store(key string, e *indexCacheEntry) {
 // durable copy, and FetchIndex/FetchSources re-adopt a fresh or
 // comparison-only copy from it on the next call (see adoptFromValkey and
 // adoptFromValkeyForComparison in valkey.go).
-func (c *IndexCache) EvictUpstream(inReleaseURL, component string) {
+func (c *IndexCache) EvictUpstream(key string) {
 	if c.valkey == nil {
 		return
 	}
 	c.mu.Lock()
-	delete(c.entries, inReleaseURL+"\x00"+component)
+	delete(c.entries, key)
 	c.mu.Unlock()
 }
 

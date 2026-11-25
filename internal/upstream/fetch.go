@@ -60,12 +60,9 @@ func (f *Fetcher) distsURL(rel string) string {
 	return fmt.Sprintf("%s/dists/%s/%s", f.base(), f.src.Suite, rel)
 }
 
-// InReleaseURL returns the InRelease URL this fetcher's cache entry is keyed
-// by (paired with f.componentKey()) -- exported so a caller holding the
-// *Fetcher, rather than the raw model.UpstreamSource, can evict this entry
-// once done with it (see IndexCache.EvictUpstream) without duplicating this
-// URL construction itself.
-func (f *Fetcher) InReleaseURL() string {
+// inReleaseURL is the InRelease URL this fetcher's cache entry is keyed by
+// (paired with componentKey and the S3 connection identity).
+func (f *Fetcher) inReleaseURL() string {
 	return f.distsURL("InRelease")
 }
 
@@ -79,15 +76,17 @@ func (f *Fetcher) componentKey() string {
 // cacheKey is the IndexCache key for this fetcher's upstream+suite+
 // component -- the single source of this formula so FetchIndex,
 // FetchSources, and the AdoptFromValkeyOutright family never drift apart.
+// For an s3 upstream the connection identity is part of it: the same
+// s3://bucket/prefix on two endpoints is two repositories.
 func (f *Fetcher) cacheKey() string {
-	return f.InReleaseURL() + "\x00" + f.componentKey()
+	return f.inReleaseURL() + "\x00" + f.componentKey() + "\x00" + f.src.S3.Identity()
 }
 
-// Component returns the configured component(s) this fetcher's upstream
-// source belongs to, joined into IndexCache.EvictUpstream's single-string
-// key form (paired with InReleaseURL) -- see componentKey.
-func (f *Fetcher) Component() string {
-	return f.componentKey()
+// CacheKey returns this fetcher's IndexCache key, for a caller holding the
+// *Fetcher that wants to evict the entry once done with it (see
+// IndexCache.EvictUpstream).
+func (f *Fetcher) CacheKey() string {
+	return f.cacheKey()
 }
 
 // acquireByHash reports whether the upstream release advertises by-hash index
@@ -1252,20 +1251,13 @@ func (f *Fetcher) fetchSourcesFile(ctx context.Context, rel *apt.Release, base s
 // isn't done here -- it can only be done against the fully-streamed content,
 // so it's the caller's responsibility (see ingest.digestVerifyingReader).
 func (f *Fetcher) FetchDebStream(ctx context.Context, filename string) (io.ReadCloser, error) {
-	if f.src.Network != "" {
-		ctx = withNetwork(ctx, f.src.Network)
-	}
 	rel, err := upstreamRelPath(filename)
 	if err != nil {
 		return nil, err
 	}
-	url := f.base() + "/" + rel
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := f.newRequest(ctx, f.base()+"/"+rel)
 	if err != nil {
 		return nil, err
-	}
-	if f.src.Username != "" {
-		req.SetBasicAuth(f.src.Username, f.src.Password)
 	}
 	resp, err := f.client.Do(req)
 	if err != nil {
@@ -1307,20 +1299,13 @@ func upstreamRelPath(p string) (string, error) {
 // "apt_2.6.1.dsc"). The caller must Close the returned body; digest
 // verification is the caller's responsibility (see ingest.digestVerifyingReader).
 func (f *Fetcher) FetchSourceFileStream(ctx context.Context, directory, filename string) (io.ReadCloser, error) {
-	if f.src.Network != "" {
-		ctx = withNetwork(ctx, f.src.Network)
-	}
 	rel, err := upstreamRelPath(strings.TrimLeft(directory, "/") + "/" + filename)
 	if err != nil {
 		return nil, err
 	}
-	url := f.base() + "/" + rel
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := f.newRequest(ctx, f.base()+"/"+rel)
 	if err != nil {
 		return nil, err
-	}
-	if f.src.Username != "" {
-		req.SetBasicAuth(f.src.Username, f.src.Password)
 	}
 	resp, err := f.client.Do(req)
 	if err != nil {
@@ -1334,18 +1319,33 @@ func (f *Fetcher) FetchSourceFileStream(ctx context.Context, directory, filename
 	return resp.Body, nil
 }
 
-// getConditional issues a GET with optional ETag/Last-Modified validators.
-// On 304 the body is empty. The response is always non-nil on nil error.
-func (f *Fetcher) getConditional(ctx context.Context, url, etag, lastMod string) ([]byte, *http.Response, error) {
+// newRequest builds a GET for url carrying everything the transport needs
+// to know about this upstream: the forced IP family (see withNetwork), the
+// S3 connection settings for an s3:// URL (see withS3), and Basic Auth
+// credentials, which the S3 transport reads back as the access key pair.
+func (f *Fetcher) newRequest(ctx context.Context, url string) (*http.Request, error) {
 	if f.src.Network != "" {
 		ctx = withNetwork(ctx, f.src.Network)
 	}
+	if strings.HasPrefix(url, "s3://") {
+		ctx = withS3(ctx, f.src.S3)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if f.src.Username != "" {
 		req.SetBasicAuth(f.src.Username, f.src.Password)
+	}
+	return req, nil
+}
+
+// getConditional issues a GET with optional ETag/Last-Modified validators.
+// On 304 the body is empty. The response is always non-nil on nil error.
+func (f *Fetcher) getConditional(ctx context.Context, url, etag, lastMod string) ([]byte, *http.Response, error) {
+	req, err := f.newRequest(ctx, url)
+	if err != nil {
+		return nil, nil, err
 	}
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)

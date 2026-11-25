@@ -259,7 +259,7 @@ func TestFetchIndexAfterEvictionReusesViaValkeyComparison(t *testing.T) {
 
 	// Simulate refreshLayoutGroup's post-cycle eviction (cmd/debproxy/main.go):
 	// the local cache no longer has anything for this upstream, only Valkey does.
-	cache.EvictUpstream(f.InReleaseURL(), f.Component())
+	cache.EvictUpstream(f.CacheKey())
 
 	idx2, err := f.FetchIndex(ctx)
 	if err != nil {

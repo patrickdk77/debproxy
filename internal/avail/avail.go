@@ -505,7 +505,7 @@ func Build(ctx context.Context, cfg *config.Config, client *http.Client, cache *
 			}
 			evicted[k] = true
 			f := upstream.NewFetcher(j.src, nil)
-			cache.EvictUpstream(f.InReleaseURL(), f.Component())
+			cache.EvictUpstream(f.CacheKey())
 		}
 		// Only mark the layout fresh if at least one real fetch happened this
 		// call AND none of them failed -- if every upstream was itself

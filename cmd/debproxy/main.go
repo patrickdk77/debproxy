@@ -1187,7 +1187,7 @@ func refreshLayoutGroup(ctx context.Context, key layoutKey, upstreams []model.Up
 	// IndexCache.EvictUpstream) rather than this process holding every
 	// layout's Packages/Sources resident for its entire lifetime.
 	for _, f := range fetchers {
-		deps.cache.EvictUpstream(f.InReleaseURL(), f.Component())
+		deps.cache.EvictUpstream(f.CacheKey())
 	}
 	// Marking the layout freshly synced (see upstream.IndexCache.
 	// MarkLayoutDataFresh) is avail.Build's own responsibility, not this
